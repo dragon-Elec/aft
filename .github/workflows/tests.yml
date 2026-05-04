@@ -1,0 +1,194 @@
+name: Tests
+
+# PR-time gate: runs Rust + plugin unit tests, Linux Docker e2e, and Windows e2e
+# before merge. Tag pushes go through `release.yml` which independently runs the
+# build matrix and publishes — this workflow exists so regressions are caught at
+# PR time, not only at release.
+#
+# IMPORTANT: any change to bridge transport, bash spawning, ONNX install,
+# locking, or platform-conditional code paths SHOULD touch the matching
+# integration test or e2e scenario in this workflow. The Linux harness has
+# caught real regressions before; the Windows e2e is here to extend that
+# coverage to issue-#26-class Windows-specific bugs (bash timeouts, lock
+# recovery, path separators).
+
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "packages/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/tests.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "crates/**"
+      - "packages/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/tests.yml"
+
+# Cancel in-flight runs for the same PR/branch when a new commit arrives.
+# Saves CI minutes and surfaces the latest result faster.
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Rust + plugin unit tests on Linux (fast inner loop)
+  # ---------------------------------------------------------------------------
+  unit:
+    name: Unit tests (Linux)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install workspace deps
+        run: bun install --frozen-lockfile
+
+      - name: Build aft-bridge dist (workspace consumers depend on it)
+        run: bun --filter "@cortexkit/aft-bridge" run build
+
+      - name: Cargo build (debug — needed by plugin e2e tests)
+        run: cargo build -p agent-file-tools
+
+      - name: Cargo test
+        run: cargo test --workspace
+
+      - name: Bun typecheck
+        run: bun run typecheck
+
+      - name: Bun lint
+        run: bun run lint
+
+      - name: Bun test (all packages)
+        run: bun run test
+        env:
+          # Tests don't need real cache locations — keep them out of the runner's
+          # ~/.cache to avoid cross-test pollution.
+          AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
+
+  # ---------------------------------------------------------------------------
+  # Rust integration tests on Windows
+  # Catches platform-conditional code paths (#[cfg(target_os = "windows")])
+  # and Windows process/path/signal differences. Same suite as Linux but on a
+  # real Windows runner — does NOT spin up OpenCode, that's the e2e job below.
+  # ---------------------------------------------------------------------------
+  rust-windows:
+    name: Cargo test (Windows)
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cargo test
+        run: cargo test --workspace
+        shell: pwsh
+
+  # ---------------------------------------------------------------------------
+  # Linux Docker e2e — exercises the full OpenCode + plugin + binary stack
+  # against a deterministic aimock LLM. Mirrors the `release.sh` SKIP_DOCKER_E2E
+  # path; the difference is this runs on every PR instead of only at tag time.
+  # ---------------------------------------------------------------------------
+  e2e-linux:
+    name: E2E (Linux Docker)
+    runs-on: ubuntu-22.04
+    needs: unit
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Linux x64 binary in Docker
+        run: |
+          docker build --platform linux/amd64 \
+            -t aft-build-linux \
+            -f tests/docker/Dockerfile.build-linux .
+
+      - name: Extract built binary
+        run: |
+          CID=$(docker create --platform linux/amd64 aft-build-linux true)
+          docker cp "$CID:/build/target/release/aft" tests/docker/fixtures/aft-linux-x64
+          docker rm "$CID"
+
+      - name: Build E2E test image
+        run: |
+          docker build --platform linux/amd64 \
+            -t aft-e2e-linux-x64 \
+            -f tests/docker/Dockerfile.linux-x64 .
+
+      - name: Run E2E test
+        run: docker run --rm --platform linux/amd64 aft-e2e-linux-x64
+
+  # ---------------------------------------------------------------------------
+  # Windows native e2e — exercises the same OpenCode + plugin + binary stack
+  # on a real Windows runner. No containers. This is the only job that catches
+  # Windows-specific bugs at the integration level (bash spawning + timeout
+  # behavior — issue #26, ONNX install via tar.exe, file URI handling, lock
+  # recovery). Does NOT use Docker — Windows containers require a Windows
+  # Docker host and add no value over running natively on `windows-latest`.
+  # ---------------------------------------------------------------------------
+  e2e-windows:
+    name: E2E (Windows native)
+    runs-on: windows-2022
+    needs: unit
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build AFT binary (Windows x64)
+        run: cargo build --release --target x86_64-pc-windows-msvc -p agent-file-tools
+        shell: pwsh
+
+      - name: Install workspace deps + build aft-bridge
+        run: |
+          bun install --frozen-lockfile
+          bun --filter "@cortexkit/aft-bridge" run build
+        shell: pwsh
+
+      - name: Build OpenCode plugin dist
+        run: bun --filter "@cortexkit/aft-opencode" run build
+        shell: pwsh
+
+      - name: Run Windows E2E suite
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tests/windows-e2e/run.ps1
+        shell: pwsh
+        env:
+          AFT_BINARY_PATH: ${{ github.workspace }}\target\x86_64-pc-windows-msvc\release\aft.exe
+          AFT_PLUGIN_DIST: ${{ github.workspace }}\packages\opencode-plugin\dist

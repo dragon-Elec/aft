@@ -38,10 +38,14 @@ describe("platformKey", () => {
     );
   });
 
-  test("win32 + arm64 is unsupported", () => {
-    expect(() => platformKey("win32", "arm64")).toThrow(
-      /Unsupported architecture: arm64 on platform win32/,
-    );
+  test("win32 + arm64 maps to win32-x64 for Prism emulation", () => {
+    // Windows ARM64 ships with Microsoft Prism, an x64 emulator that runs
+    // our x64 aft.exe transparently. We don't ship a native ARM64 binary;
+    // PLATFORM_ARCH_MAP routes win32-arm64 → win32-x64 so the resolver,
+    // downloader, and ONNX layer all pick the x64 artifacts and work
+    // under emulation. This was the fix for issue #26 / Windows ARM64
+    // bring-up — see packages/aft-bridge/src/platform.ts.
+    expect(platformKey("win32", "arm64")).toBe("win32-x64");
   });
 
   test("defaults to process.platform and process.arch when no args", () => {

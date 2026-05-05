@@ -8,14 +8,16 @@
 #     line-buffered pipes flush every status update. The wrapper sees the
 #     script terminate immediately when the workflow reaches a terminal
 #     state — no bash-tool-timeout waiting required.
-#   - Default max-wait is 15 minutes (900s). Override with --max-wait or
-#     set MAX_WAIT_SECONDS env var. The script still exits early on any
+#   - Default max-wait is 25 minutes (1500s). Healthy releases finish in
+#     ~13 min; 25 min gives headroom for slow CI runners without false-
+#     cancelling a healthy-but-slow run. Override with --max-wait or set
+#     MAX_WAIT_SECONDS env var. The script still exits early on any
 #     terminal state regardless of timeout.
 
 set -euo pipefail
 
 TAG=""
-MAX_WAIT="${MAX_WAIT_SECONDS:-900}"
+MAX_WAIT="${MAX_WAIT_SECONDS:-1500}"
 REPO="cortexkit/aft"
 INTERVAL=5
 

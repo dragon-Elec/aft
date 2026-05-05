@@ -121,9 +121,19 @@ check "aimock started" "curl -s http://127.0.0.1:4010/v1/models > /dev/null 2>&1
 
 echo "Running 8-turn OpenCode session..."
 RESULT_FILE="/tmp/result-scenario1.txt"
+# 90s timeout (was default 30s — too tight): on a cold-cache run under
+# QEMU emulation, ONNX Runtime download (~30MB) plus first-time npm
+# install of 3 LSP servers (typescript-language-server, pyright,
+# @biomejs/biome) routinely consume 25-40s before the first AFT tool
+# call can even reach the bridge. With 30s, OpenCode hits the SIGKILL
+# before any model interaction completes — the `Spawning binary` /
+# `started, pid` log lines never appear because the bridge never
+# actually got invoked. 90s gives realistic headroom for cold-cache
+# runs while still bounding total runtime.
 run_opencode_session \
     "Explore this project: outline src, read main.py, grep for functions, glob for python files, search for greeting logic, edit main.py, then undo the edit." \
     "$RESULT_FILE" \
+    90
 
 EXIT_CODE=$?
 

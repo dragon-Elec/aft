@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+#[cfg(not(windows))]
+use std::process::Command;
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -18,8 +20,6 @@ use crate::context::AppContext;
 use crate::protocol::{
     ProgressFrame, ProgressKind, RawRequest, Response, ERROR_PERMISSION_REQUIRED,
 };
-#[cfg(windows)]
-pub(crate) use crate::windows_shell::resolve_windows_shell;
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const INLINE_OUTPUT_LIMIT: usize = 30 * 1024;
@@ -253,14 +253,7 @@ fn spawn_command(
     // Background bash already null-detaches in
     // `crates/aft/src/bash_background/registry.rs`; foreground bash was
     // the asymmetric case that produced the issue #26 hang.
-    let mut child = shell_command(command)
-        .current_dir(workdir)
-        .envs(env)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("failed to spawn bash command: {e}"))?;
+    let mut child = spawn_shell_command(command, workdir, env)?;
 
     let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
     let stderr = child.stderr.take().ok_or("failed to capture stderr")?;
@@ -301,23 +294,10 @@ fn spawn_command(
     })
 }
 
-#[cfg(windows)]
-fn shell_command(command: &str) -> Command {
-    // -NonInteractive (PowerShell) / no equivalent in cmd: tells the shell
-    // that no human is at the console, so prompts (Read-Host, Get-Credential,
-    // PSGallery trust prompts, Install-Module confirmation, etc.) fail fast
-    // instead of hanging forever waiting for input. This mirrors OpenCode's
-    // native bash on Windows (packages/opencode/src/tool/bash.ts:283) and
-    // pairs with stdin=null in spawn_command above to fully detach the child
-    // from any input source.
-    //
-    // -ExecutionPolicy Bypass (PowerShell only) is intentional and not in
-    // OpenCode's flag set: it lets unsigned .ps1 scripts run, which AFT users
-    // routinely need for local dev scripts. The security tradeoff is
-    // acceptable because the bash command is already an explicit tool
-    // invocation chosen by the user or agent.
-    resolve_windows_shell().command(command)
-}
+// On Windows the `Command` is built per-candidate inside `spawn_shell_command`
+// via `WindowsShell::command()` so we can retry with the next shell on a
+// runtime NotFound. The PowerShell -NonInteractive / -ExecutionPolicy Bypass
+// contract lives in `crates/aft/src/windows_shell.rs::WindowsShell::args`.
 
 #[cfg(not(windows))]
 fn shell_command(command: &str) -> Command {
@@ -325,6 +305,97 @@ fn shell_command(command: &str) -> Command {
     cmd.args(["-c", command]);
     cmd.process_group(0);
     cmd
+}
+
+/// Spawn the user's bash command using the resolved shell, applying the
+/// detached-stdin and piped-stdout/stderr contract that `spawn_command`
+/// requires.
+///
+/// On Unix this is a single-shot spawn against `/bin/sh`. On Windows it
+/// walks the [`crate::windows_shell::shell_candidates`] priority list
+/// (pwsh.exe → powershell.exe → cmd.exe) and retries with the next shell
+/// when the previous one fails to spawn with `NotFound`. This is the
+/// runtime safety net for issue #27 follow-up: a user's `which::which`
+/// probe can succeed (the binary IS on PATH) while `Command::spawn` then
+/// fails with `NotFound` because antivirus / AppLocker / Defender ASR
+/// rules block PowerShell as a child process spawned by aft. cmd.exe is
+/// always the floor and lives in a Windows search-path location that
+/// these policies generally cannot remove.
+///
+/// Errors other than `NotFound` (permission denied, OOM, etc.) are
+/// returned immediately without retry — they indicate a problem with
+/// the resolved shell that retrying with a different shell won't fix.
+#[cfg(not(windows))]
+fn spawn_shell_command(
+    command: &str,
+    workdir: &Path,
+    env: &HashMap<String, String>,
+) -> Result<std::process::Child, String> {
+    shell_command(command)
+        .current_dir(workdir)
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn bash command: {e}"))
+}
+
+#[cfg(windows)]
+fn spawn_shell_command(
+    command: &str,
+    workdir: &Path,
+    env: &HashMap<String, String>,
+) -> Result<std::process::Child, String> {
+    use crate::windows_shell::shell_candidates;
+    let candidates = shell_candidates();
+    let mut last_error: Option<String> = None;
+    for (idx, shell) in candidates.iter().enumerate() {
+        match shell
+            .command(command)
+            .current_dir(workdir)
+            .envs(env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => {
+                if idx > 0 {
+                    log::warn!(
+                        "[aft] bash spawn fell back to {} after {} earlier candidate(s) failed; \
+                         the cached PATH probe disagreed with runtime spawn — likely PATH \
+                         inheritance, antivirus / AppLocker / Defender ASR, or sandbox policy.",
+                        shell.binary(),
+                        idx
+                    );
+                }
+                return Ok(child);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                log::warn!(
+                    "[aft] bash spawn: {} returned NotFound at runtime — trying next candidate",
+                    shell.binary()
+                );
+                last_error = Some(format!("{}: {e}", shell.binary()));
+                continue;
+            }
+            Err(e) => {
+                // Non-NotFound errors (permission denied, OOM, etc.) are not
+                // remediated by trying a different shell — return immediately.
+                return Err(format!(
+                    "failed to spawn bash command via {}: {e}",
+                    shell.binary()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "failed to spawn bash command: no Windows shell could be spawned. \
+         Last error: {}. PATH-probed candidates: {:?}",
+        last_error.unwrap_or_else(|| "no candidates were attempted".to_string()),
+        candidates.iter().map(|s| s.binary()).collect::<Vec<_>>()
+    ))
 }
 
 fn spawn_reader<R>(

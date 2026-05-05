@@ -918,7 +918,12 @@ fn detached_shell_command(command: &str, exit_path: &Path) -> Command {
 fn detached_shell_command(command: &str, exit_path: &Path) -> Command {
     let shell = resolve_windows_shell();
     let wrapper = shell.wrapper_script(command, exit_path);
-    let mut cmd = shell.command(&wrapper);
+    // bg_command() applies shell-specific invocation flags that the
+    // wrapper relies on. For Cmd, this is `/V:ON` to enable delayed
+    // expansion (`!ERRORLEVEL!`); without it, the cmd wrapper would
+    // record a stale exit code. PowerShell variants don't need extra
+    // flags. See `WindowsShell::bg_command` for details.
+    let mut cmd = shell.bg_command(&wrapper);
     // Win32 process creation flags:
     // CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB
     // https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
@@ -1095,6 +1100,13 @@ mod tests {
         assert_eq!(shell.binary(), "pwsh.exe");
     }
 
+    /// Issue #27 Oracle review P1: cmd wrapper MUST use `!ERRORLEVEL!` (not
+    /// `%ERRORLEVEL%`) to capture the user command's run-time exit code.
+    /// `%VAR%` is parse-time-expanded by cmd, so a wrapper using
+    /// `%ERRORLEVEL%` would record a stale value (typically 0 from cmd's
+    /// startup) regardless of what the user command returned. `!VAR!`
+    /// requires delayed expansion, which `WindowsShell::bg_command` enables
+    /// via `/V:ON`.
     #[cfg(windows)]
     #[test]
     fn windows_shell_cmd_wrapper_writes_exit_marker_with_move() {
@@ -1102,9 +1114,62 @@ mod tests {
         let script =
             crate::windows_shell::WindowsShell::Cmd.wrapper_script("cmd /c exit 42", exit_path);
 
-        assert!(script.contains("& echo %ERRORLEVEL% >"));
+        // MUST use !ERRORLEVEL! (delayed expansion), NOT %ERRORLEVEL%
+        // (parse-time expansion). The latter would record a stale exit
+        // code regardless of what the user command actually returned.
+        assert!(
+            script.contains("& echo !ERRORLEVEL! >"),
+            "wrapper must use delayed expansion: {script}"
+        );
+        assert!(
+            !script.contains("%ERRORLEVEL%"),
+            "wrapper must NOT use parse-time %ERRORLEVEL% expansion: {script}"
+        );
         assert!(script.contains("& move /Y"));
+        // move output should be redirected to nul to avoid polluting the
+        // user's captured stdout with "1 file(s) moved." lines.
+        assert!(
+            script.contains("> nul"),
+            "wrapper must redirect move output to nul: {script}"
+        );
         assert!(script.contains(r#""C:\Temp\bgb-test.exit.tmp""#));
         assert!(script.contains(r#""C:\Temp\bgb-test.exit""#));
+    }
+
+    /// Issue #27 Oracle review P1: `bg_command()` for Cmd MUST prepend
+    /// `/V:ON` to enable delayed expansion. Without this flag, the
+    /// wrapper's `!ERRORLEVEL!` would not be expanded and cmd would
+    /// literally write the string `!ERRORLEVEL!` into the marker file.
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_cmd_bg_command_enables_delayed_expansion() {
+        use crate::windows_shell::WindowsShell;
+        let cmd = WindowsShell::Cmd.bg_command("echo wrapped");
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        let args_strs: Vec<&str> = args.iter().filter_map(|a| a.to_str()).collect();
+        assert_eq!(
+            args_strs,
+            vec!["/V:ON", "/D", "/C", "echo wrapped"],
+            "Cmd::bg_command must prepend /V:ON for delayed expansion"
+        );
+    }
+
+    /// PowerShell variants don't need `/V:ON`-style flags; their args are
+    /// the same for foreground (`command()`) and background (`bg_command()`).
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_pwsh_bg_command_uses_standard_args() {
+        use crate::windows_shell::WindowsShell;
+        let cmd = WindowsShell::Pwsh.bg_command("Get-Date");
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        let args_strs: Vec<&str> = args.iter().filter_map(|a| a.to_str()).collect();
+        assert!(
+            args_strs.contains(&"-Command"),
+            "Pwsh::bg_command must use -Command: {args_strs:?}"
+        );
+        assert!(
+            args_strs.contains(&"Get-Date"),
+            "Pwsh::bg_command must include the user command body"
+        );
     }
 }

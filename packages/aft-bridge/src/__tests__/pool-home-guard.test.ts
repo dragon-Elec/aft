@@ -20,10 +20,10 @@
  * These tests pin both layers.
  */
 
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { BridgePool, HomeProjectRootError, isHomeDirectoryRoot } from "../pool.js";
 
 describe("isHomeDirectoryRoot", () => {

@@ -80,22 +80,46 @@ pub fn handle_status(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    // Disk cache sizes
+    // Disk cache sizes — scoped to the **current project** only.
+    //
+    // Both trigram (`<storage_dir>/index/<key>/`) and semantic
+    // (`<storage_dir>/semantic/<key>/`) caches are partitioned per project by
+    // `project_cache_key(project_root)`. Earlier this function reported the
+    // recursive size of the entire `index/` and `semantic/` directories,
+    // which summed disk usage across **every** project the user had ever
+    // opened. The TUI sidebar surfaced that total as if it were the current
+    // project's footprint, which was misleading (e.g. a 4.8 MB project with
+    // 9 sibling projects appeared to use 16+ GB).
+    //
+    // We now resolve the per-project key from `config.project_root` and
+    // size only that project's slice. When the project key can't be
+    // resolved (no project_root), fall back to zeros — the cross-project
+    // total is never the right answer to display per-session.
     let storage_dir = config.storage_dir.as_ref().map(|d| d.display().to_string());
-    let disk_info = if let Some(ref dir) = config.storage_dir {
-        let trigram_size = dir_size(&dir.join("index"));
-        let semantic_size = dir_size(&dir.join("semantic"));
-        serde_json::json!({
+    let disk_info = match (&config.storage_dir, &config.project_root) {
+        (Some(dir), Some(root)) => {
+            let key = crate::search_index::project_cache_key(root);
+            let trigram_size = dir_size(&dir.join("index").join(&key));
+            let semantic_size = dir_size(&dir.join("semantic").join(&key));
+            serde_json::json!({
+                "storage_dir": dir.display().to_string(),
+                "project_cache_key": key,
+                "trigram_disk_bytes": trigram_size,
+                "semantic_disk_bytes": semantic_size,
+            })
+        }
+        (Some(dir), None) => serde_json::json!({
             "storage_dir": dir.display().to_string(),
-            "trigram_disk_bytes": trigram_size,
-            "semantic_disk_bytes": semantic_size,
-        })
-    } else {
-        serde_json::json!({
-            "storage_dir": null,
+            "project_cache_key": null,
             "trigram_disk_bytes": 0,
             "semantic_disk_bytes": 0,
-        })
+        }),
+        _ => serde_json::json!({
+            "storage_dir": null,
+            "project_cache_key": null,
+            "trigram_disk_bytes": 0,
+            "semantic_disk_bytes": 0,
+        }),
     };
 
     // LSP servers

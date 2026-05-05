@@ -32,7 +32,7 @@ fn main() {
     log::info!("started, pid {}", std::process::id());
 
     let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
-    install_signal_detach_handler(ctx.bash_background().clone());
+    install_signal_handler(ctx.bash_background().clone(), ctx.lsp_child_registry());
     let stdout_writer = ctx.stdout_writer();
     ctx.set_progress_sender(Some(std::sync::Arc::new(Box::new(
         move |frame: PushFrame| {
@@ -101,7 +101,10 @@ fn main() {
 }
 
 #[cfg(unix)]
-fn install_signal_detach_handler(registry: BgTaskRegistry) {
+fn install_signal_handler(
+    bg_registry: BgTaskRegistry,
+    lsp_children: aft::lsp::child_registry::LspChildRegistry,
+) {
     let signals = signal_hook::iterator::Signals::new([
         signal_hook::consts::SIGINT,
         signal_hook::consts::SIGTERM,
@@ -118,17 +121,33 @@ fn install_signal_detach_handler(registry: BgTaskRegistry) {
             // Plugin restarts can SIGTERM the bridge while background bash jobs
             // are still running. Detach first so child handles are not killed by
             // Rust drop glue and can be rehydrated from disk.
-            registry.detach();
+            bg_registry.detach();
+            // Kill LSP children synchronously before exit. Without this, LSP
+            // child processes (typescript-language-server, biome lsp-proxy,
+            // etc.) get orphaned to PID 1 because process::exit bypasses the
+            // graceful shutdown path that LspManager::shutdown_all uses on
+            // the natural stdin-closed exit. Graceful shutdown takes up to
+            // 5s per server (shutdown request + exit notification + poll),
+            // which is too slow for a signal handler — we SIGKILL instead.
+            let killed = lsp_children.kill_all();
+            if killed > 0 {
+                log::info!("signal {}: killed {} LSP child process(es)", signal, killed);
+            }
             std::process::exit(128 + signal);
         }
     });
 }
 
 #[cfg(not(unix))]
-fn install_signal_detach_handler(_registry: BgTaskRegistry) {
+fn install_signal_handler(
+    _bg_registry: BgTaskRegistry,
+    _lsp_children: aft::lsp::child_registry::LspChildRegistry,
+) {
     // signal_hook::iterator is Unix-only; Windows does not have POSIX signals.
     // Background bash tasks on Windows will be cleaned up by OS process
     // termination rather than an explicit detach on SIGTERM/SIGINT.
+    // LSP children are also handled by OS process termination on Windows
+    // because Windows propagates console kill events to child processes.
 }
 
 fn attach_bg_completions(

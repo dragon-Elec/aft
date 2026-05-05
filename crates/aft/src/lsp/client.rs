@@ -12,6 +12,7 @@ use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
+use crate::lsp::child_registry::LspChildRegistry;
 use crate::lsp::jsonrpc::{
     Notification, Request, RequestId, Response as JsonRpcResponse, ServerMessage,
 };
@@ -87,6 +88,10 @@ pub struct LspClient {
     root: PathBuf,
     state: ServerState,
     child: Child,
+    /// Child PID captured at spawn time. Used by Drop to untrack the
+    /// PID from the shared registry; we capture once rather than reading
+    /// `child.id()` later because Drop ordering with the Child can race.
+    child_pid: u32,
     writer: Arc<Mutex<BufWriter<std::process::ChildStdin>>>,
 
     /// Pending request responses, keyed by request ID.
@@ -102,10 +107,18 @@ pub struct LspClient {
     /// `workspace/didChangeWatchedFiles` notifications to avoid spec violations.
     /// Intentional default: `false` (conservative — requires server opt-in).
     supports_watched_files: bool,
+    /// Shared registry that tracks live LSP child PIDs across the process
+    /// so the signal handler can SIGKILL them on SIGTERM/SIGINT before
+    /// aft exits. Cloned via `Arc` — multiple clients share the same set.
+    child_registry: LspChildRegistry,
 }
 
 impl LspClient {
     /// Spawn a new language server process and start the background reader thread.
+    ///
+    /// `child_registry` is a shared handle that records this child's PID so
+    /// the signal handler can SIGKILL it on SIGTERM/SIGINT. Tests that don't
+    /// care about signal cleanup can pass `LspChildRegistry::new()`.
     pub fn spawn(
         kind: ServerKind,
         root: PathBuf,
@@ -113,6 +126,7 @@ impl LspClient {
         args: &[String],
         env: &HashMap<String, String>,
         event_tx: Sender<LspEvent>,
+        child_registry: LspChildRegistry,
     ) -> io::Result<Self> {
         let mut command = Command::new(binary);
         command
@@ -128,6 +142,8 @@ impl LspClient {
         }
 
         let mut child = command.spawn()?;
+        let child_pid = child.id();
+        child_registry.track(child_pid);
 
         let stdout = child
             .stdout
@@ -229,11 +245,13 @@ impl LspClient {
             root,
             state: ServerState::Starting,
             child,
+            child_pid,
             writer,
             pending,
             next_id: AtomicI64::new(1),
             diagnostic_caps: None,
             supports_watched_files: false,
+            child_registry,
         })
     }
 
@@ -447,11 +465,13 @@ impl LspClient {
     /// Graceful shutdown: send shutdown request, then exit notification.
     pub fn shutdown(&mut self) -> Result<(), LspError> {
         if self.state == ServerState::Exited {
+            self.child_registry.untrack(self.child_pid);
             return Ok(());
         }
 
         if self.child.try_wait()?.is_some() {
             self.state = ServerState::Exited;
+            self.child_registry.untrack(self.child_pid);
             return Ok(());
         }
 
@@ -530,6 +550,9 @@ impl LspClient {
 
 impl Drop for LspClient {
     fn drop(&mut self) {
+        // Untrack first so the signal handler can't race with this kill and
+        // try to SIGKILL a PID that's already been reaped.
+        self.child_registry.untrack(self.child_pid);
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

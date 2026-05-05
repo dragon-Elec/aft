@@ -247,6 +247,11 @@ impl AftProcess {
         self.child.wait().expect("wait for process exit")
     }
 
+    /// Return the PID of the spawned aft process.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Read stderr contents after process exits.
     pub fn stderr_output(mut self) -> (std::process::ExitStatus, String) {
         drop(self.child.stdin.take());

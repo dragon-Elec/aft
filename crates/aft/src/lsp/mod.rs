@@ -1,3 +1,4 @@
+pub mod child_registry;
 pub mod client;
 pub mod diagnostics;
 pub mod document;

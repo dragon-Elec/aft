@@ -6,6 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use aft::config::{Config, UserServerDef};
+use aft::lsp::child_registry::LspChildRegistry;
 use aft::lsp::client::{LspEvent, ServerState};
 use aft::lsp::manager::{LspManager, ServerAttemptResult};
 use aft::lsp::registry::ServerKind;
@@ -303,4 +304,79 @@ fn failed_spawn_for_one_root_does_not_block_a_different_root() {
     let outcome_b = manager.ensure_server_for_file_detailed(&main_rs_b, &Config::default());
     assert_eq!(outcome_b.successful.len(), 1);
     assert_eq!(manager.active_client_count(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Child-PID registry tests
+//
+// Regression: before v0.19.3, LSP child processes were orphaned when aft
+// received SIGTERM/SIGINT (e.g. during e2e test cleanup or plugin restart),
+// because the signal handler called `process::exit` directly without killing
+// child processes. The shared `LspChildRegistry` exposes spawned PIDs to the
+// signal handler so it can SIGKILL them before exiting.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn spawned_lsp_child_is_tracked_in_registry() {
+    let (_temp_dir, main_rs, _lib_rs) = rust_fixture_files();
+    let registry = LspChildRegistry::new();
+    let mut manager = LspManager::new();
+    manager.set_child_registry(registry.clone());
+    manager.override_binary(ServerKind::Rust, fake_server_path());
+
+    assert!(
+        registry.pids().is_empty(),
+        "registry should start empty before any spawn"
+    );
+
+    let keys = manager.ensure_server_for_file_default(&main_rs);
+    assert_eq!(keys.len(), 1);
+    assert_eq!(manager.active_client_count(), 1);
+
+    let tracked = registry.pids();
+    assert_eq!(
+        tracked.len(),
+        1,
+        "registry should contain exactly one PID after one spawn, got {tracked:?}"
+    );
+}
+
+#[test]
+fn shutdown_all_untracks_pids_from_registry() {
+    let (_temp_dir, main_rs, _lib_rs) = rust_fixture_files();
+    let registry = LspChildRegistry::new();
+    let mut manager = LspManager::new();
+    manager.set_child_registry(registry.clone());
+    manager.override_binary(ServerKind::Rust, fake_server_path());
+
+    manager.ensure_server_for_file_default(&main_rs);
+    assert_eq!(registry.pids().len(), 1);
+
+    manager.shutdown_all();
+    assert_eq!(manager.active_client_count(), 0);
+    assert!(
+        registry.pids().is_empty(),
+        "graceful shutdown_all should untrack all PIDs"
+    );
+}
+
+#[test]
+fn dropping_manager_untracks_pids_from_registry() {
+    // The Drop impl on LspClient must untrack its PID. This guards against
+    // a subtle leak where the registry would grow unbounded across LspManager
+    // recreations even though the actual child processes died correctly.
+    let registry = LspChildRegistry::new();
+    let (_temp_dir, main_rs, _lib_rs) = rust_fixture_files();
+    {
+        let mut manager = LspManager::new();
+        manager.set_child_registry(registry.clone());
+        manager.override_binary(ServerKind::Rust, fake_server_path());
+        manager.ensure_server_for_file_default(&main_rs);
+        assert_eq!(registry.pids().len(), 1);
+    } // manager and its LspClients drop here
+
+    assert!(
+        registry.pids().is_empty(),
+        "Drop on LspClient must untrack the PID even without graceful shutdown"
+    );
 }

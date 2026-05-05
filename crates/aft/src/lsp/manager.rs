@@ -13,6 +13,7 @@ use lsp_types::{
 };
 
 use crate::config::Config;
+use crate::lsp::child_registry::LspChildRegistry;
 use crate::lsp::client::{LspClient, LspEvent, ServerState};
 use crate::lsp::diagnostics::{from_lsp_diagnostics, DiagnosticsStore, StoredDiagnostic};
 use crate::lsp::document::DocumentStore;
@@ -176,6 +177,10 @@ pub struct LspManager {
     /// modes we track here (binary not installed, init handshake failure)
     /// don't fix themselves at runtime.
     failed_spawns: HashMap<ServerKey, ServerAttemptResult>,
+    /// Tracks PIDs of spawned LSP child processes so the signal handler can
+    /// kill them on SIGTERM/SIGINT before aft exits, preventing orphans.
+    /// Defaults to empty; production wires this from `AppContext`.
+    child_registry: LspChildRegistry,
 }
 
 impl LspManager {
@@ -190,7 +195,13 @@ impl LspManager {
             binary_overrides: HashMap::new(),
             extra_env: HashMap::new(),
             failed_spawns: HashMap::new(),
+            child_registry: LspChildRegistry::new(),
         }
+    }
+
+    /// Set the child-PID registry. Must be called before any servers spawn.
+    pub fn set_child_registry(&mut self, registry: LspChildRegistry) {
+        self.child_registry = registry;
     }
 
     /// For testing: set an extra environment variable that gets passed to
@@ -1245,6 +1256,7 @@ impl LspManager {
             &def.args,
             &merged_env,
             self.event_tx.clone(),
+            self.child_registry.clone(),
         )?;
         client.initialize(root, def.initialization_options.clone())?;
         Ok(client)

@@ -237,6 +237,10 @@ pub struct AppContext {
     watcher: RefCell<Option<RecommendedWatcher>>,
     watcher_rx: RefCell<Option<mpsc::Receiver<notify::Result<notify::Event>>>>,
     lsp_manager: RefCell<LspManager>,
+    /// Shared registry of LSP child PIDs. Cloned and passed to the signal
+    /// handler so it can SIGKILL all children before aft exits, preventing
+    /// orphaned LSP processes when bridge.shutdown() SIGTERMs aft.
+    lsp_child_registry: crate::lsp::child_registry::LspChildRegistry,
     stdout_writer: SharedStdoutWriter,
     progress_sender: SharedProgressSender,
     bash_background: BgTaskRegistry,
@@ -251,6 +255,9 @@ impl AppContext {
             .downcast_ref::<crate::parser::TreeSitterProvider>()
             .map(|provider| provider.symbol_cache())
             .unwrap_or_else(|| Arc::new(std::sync::RwLock::new(SymbolCache::new())));
+        let lsp_child_registry = crate::lsp::child_registry::LspChildRegistry::new();
+        let mut lsp_manager = LspManager::new();
+        lsp_manager.set_child_registry(lsp_child_registry.clone());
         AppContext {
             provider,
             backup: RefCell::new(BackupStore::new()),
@@ -266,11 +273,18 @@ impl AppContext {
             semantic_embedding_model: RefCell::new(None),
             watcher: RefCell::new(None),
             watcher_rx: RefCell::new(None),
-            lsp_manager: RefCell::new(LspManager::new()),
+            lsp_manager: RefCell::new(lsp_manager),
+            lsp_child_registry,
             stdout_writer,
             progress_sender: Arc::clone(&progress_sender),
             bash_background: BgTaskRegistry::new(progress_sender),
         }
+    }
+
+    /// Clone the LSP child registry handle. Used by main.rs to give the
+    /// signal handler thread a way to SIGKILL LSP children on shutdown.
+    pub fn lsp_child_registry(&self) -> crate::lsp::child_registry::LspChildRegistry {
+        self.lsp_child_registry.clone()
     }
 
     pub fn stdout_writer(&self) -> SharedStdoutWriter {

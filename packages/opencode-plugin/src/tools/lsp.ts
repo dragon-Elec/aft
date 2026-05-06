@@ -37,7 +37,7 @@ export function lspTools(ctx: PluginContext): Record<string, ToolDefinition> {
       "- `lsp_servers_used: [{status: 'no_root_marker (...)'}]` → server is registered but couldn't find a workspace root marker walking up from this file. The user's project layout doesn't match what the server expects.\n" +
       "- `complete: false` (directory mode) → some files in the directory weren't checked; see `unchecked_files`.\n" +
       "\n" +
-      "**When this tool gives an unhelpful answer**, run `bunx --bun @cortexkit/aft doctor lsp <filePath>` from a terminal to get a full per-server breakdown (registered servers, binary resolution, root-marker resolution, spawn outcome).",
+      "**When this tool gives an unhelpful answer**, run `npx @cortexkit/aft doctor lsp <filePath>` from a terminal to get a full per-server breakdown (registered servers, binary resolution, root-marker resolution, spawn outcome).",
     args: {
       filePath: z
         .string()

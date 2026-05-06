@@ -192,7 +192,8 @@ export class PiAdapter implements HarnessAdapter {
     error?: string;
   }> {
     // Pi owns its extension cache — we don't touch it from here. `doctor --force`
-    // is an OpenCode-specific remedy for the bunx package cache.
+    // is an OpenCode-specific remedy for the npm/npx package cache that
+    // OpenCode populates under `~/.cache/opencode/packages/`.
     return {
       action: "not_applicable",
       path: this.getPluginCacheInfo().path,

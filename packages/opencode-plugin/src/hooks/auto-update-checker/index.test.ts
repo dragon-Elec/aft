@@ -15,7 +15,7 @@ const checkerMocks = {
 const cacheMocks = {
   preparePackageUpdate: mock(() => "/tmp/opencode"),
   resolveInstallContext: mock(() => ({ installDir: "/tmp/opencode" })),
-  runBunInstallSafe: mock(async () => true),
+  runNpmInstallSafe: mock(async () => true),
 };
 
 mock.module("../../logger.js", () => ({
@@ -75,8 +75,8 @@ describe("auto-update-checker/index", () => {
     cacheMocks.preparePackageUpdate.mockImplementation(() => "/tmp/opencode");
     cacheMocks.resolveInstallContext.mockReset();
     cacheMocks.resolveInstallContext.mockImplementation(() => ({ installDir: "/tmp/opencode" }));
-    cacheMocks.runBunInstallSafe.mockReset();
-    cacheMocks.runBunInstallSafe.mockImplementation(async () => true);
+    cacheMocks.runNpmInstallSafe.mockReset();
+    cacheMocks.runNpmInstallSafe.mockImplementation(async () => true);
   });
 
   afterEach(() => {
@@ -158,7 +158,7 @@ describe("auto-update-checker/index", () => {
       "0.17.2",
       "@cortexkit/aft-opencode",
     );
-    expect(cacheMocks.runBunInstallSafe).toHaveBeenCalledWith(
+    expect(cacheMocks.runNpmInstallSafe).toHaveBeenCalledWith(
       "/tmp/opencode",
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
@@ -203,7 +203,7 @@ describe("auto-update-checker/index", () => {
       },
     });
     expect(cacheMocks.preparePackageUpdate).not.toHaveBeenCalled();
-    expect(cacheMocks.runBunInstallSafe).not.toHaveBeenCalled();
+    expect(cacheMocks.runNpmInstallSafe).not.toHaveBeenCalled();
   });
 
   test("shows pinned-version notification without installing", async () => {
@@ -280,7 +280,7 @@ describe("auto-update-checker/index", () => {
     }));
     checkerMocks.getCachedVersion.mockImplementation(() => "0.17.1");
     checkerMocks.getLatestVersion.mockImplementation(async () => "0.17.2");
-    cacheMocks.runBunInstallSafe.mockImplementation(async () => false);
+    cacheMocks.runNpmInstallSafe.mockImplementation(async () => false);
     const { createAutoUpdateCheckerHook } = await freshIndexImport();
     const { ctx, showToast } = createCtx();
 

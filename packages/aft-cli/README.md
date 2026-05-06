@@ -5,10 +5,10 @@ Unified CLI for [Agent File Tools (AFT)](https://github.com/cortexkit/aft) — s
 ## Usage
 
 ```bash
-bunx --bun @cortexkit/aft setup            # interactive setup for one or more harnesses
-bunx --bun @cortexkit/aft doctor           # check and fix configuration issues
-bunx --bun @cortexkit/aft doctor --force   # force clear plugin cache
-bunx --bun @cortexkit/aft doctor --issue   # collect diagnostics and open a GitHub issue
+npx @cortexkit/aft setup            # interactive setup for one or more harnesses
+npx @cortexkit/aft doctor           # check and fix configuration issues
+npx @cortexkit/aft doctor --force   # force clear plugin cache
+npx @cortexkit/aft doctor --issue   # collect diagnostics and open a GitHub issue
 ```
 
 By default the CLI auto-detects which harnesses are installed on your system (OpenCode, Pi). When multiple are detected, it prompts you to choose. Use `--harness opencode` or `--harness pi` to target one explicitly.

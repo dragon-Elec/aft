@@ -29,11 +29,11 @@ function printHelp(): void {
   console.log("    (default: auto-detect, prompt if multiple detected)");
   console.log("");
   console.log("  Usage:");
-  console.log("    bunx --bun @cortexkit/aft setup");
-  console.log("    bunx --bun @cortexkit/aft doctor");
-  console.log("    bunx --bun @cortexkit/aft doctor lsp ./src/main.py");
-  console.log("    bunx --bun @cortexkit/aft doctor --clear");
-  console.log("    bunx --bun @cortexkit/aft doctor --issue");
+  console.log("    npx @cortexkit/aft setup");
+  console.log("    npx @cortexkit/aft doctor");
+  console.log("    npx @cortexkit/aft doctor lsp ./src/main.py");
+  console.log("    npx @cortexkit/aft doctor --clear");
+  console.log("    npx @cortexkit/aft doctor --issue");
   console.log("");
 }
 

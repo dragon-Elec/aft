@@ -56,7 +56,7 @@ function printNextSteps(adapter: HarnessAdapter): void {
     note(
       [
         "Restart OpenCode (or reload your session) so the plugin loads.",
-        "Verify with: `bunx --bun @cortexkit/aft doctor`.",
+        "Verify with: `npx @cortexkit/aft doctor`.",
       ].join("\n"),
       "Next steps",
     );
@@ -66,7 +66,7 @@ function printNextSteps(adapter: HarnessAdapter): void {
     note(
       [
         "Restart your Pi session so the extension registers.",
-        "Verify with: `bunx --bun @cortexkit/aft doctor`.",
+        "Verify with: `npx @cortexkit/aft doctor`.",
       ].join("\n"),
       "Next steps",
     );

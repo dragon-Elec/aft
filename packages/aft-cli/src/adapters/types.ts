@@ -78,8 +78,8 @@ export interface HarnessAdapter {
 
   /**
    * Harness-aware version of `doctor --force` cache clearing. OpenCode nukes
-   * its bunx package cache; Pi may be a no-op because Pi caches are managed by
-   * `pi install` itself.
+   * its npm/npx package cache (`~/.cache/opencode/packages/...`); Pi may be a
+   * no-op because Pi caches are managed by `pi install` itself.
    */
   clearPluginCache(force: boolean): Promise<{
     action: "cleared" | "up_to_date" | "not_found" | "not_applicable" | "error";

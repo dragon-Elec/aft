@@ -154,7 +154,7 @@ function buildBridgeError(ctx: BridgeErrorContext): Error {
       );
     }
     parts.push(
-      "\nTry: bunx --bun @cortexkit/aft doctor (full diagnostics) or check ~/.cache/aft/bin/ for the right binary.",
+      "\nTry: npx @cortexkit/aft doctor (full diagnostics) or check ~/.cache/aft/bin/ for the right binary.",
     );
   }
 

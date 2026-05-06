@@ -659,7 +659,7 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
                 };
                 return Err(format!(
                     "ONNX Runtime not found. dlopen('{}') failed: {}. \
-                     Run `bunx @cortexkit/aft-opencode@latest doctor` to diagnose.",
+                     Run `npx @cortexkit/aft doctor` to diagnose.",
                     lib_name, msg
                 ));
             }
@@ -760,14 +760,14 @@ pub(crate) fn format_ort_version_mismatch(version: &str, lib_name: &str) -> Stri
     format!(
         "ONNX Runtime version mismatch: found v{} at '{}', but AFT requires v1.20+. \
          Solutions:\n\
-         1. Auto-fix (recommended): run `bunx --bun @cortexkit/aft doctor --fix`. \
+         1. Auto-fix (recommended): run `npx @cortexkit/aft doctor --fix`. \
          This downloads AFT-managed ONNX Runtime v1.24 into AFT's storage and \
          configures the bridge to load it instead of the system library — no \
          changes to '{}'.\n\
          2. Remove the old library and restart (AFT auto-downloads the correct version on next start):\n\
          {}\n\
          3. Or install ONNX Runtime 1.24 system-wide: https://github.com/microsoft/onnxruntime/releases/tag/v1.24.0\n\
-         4. Run `bunx --bun @cortexkit/aft doctor` for full diagnostics.",
+         4. Run `npx @cortexkit/aft doctor` for full diagnostics.",
         version,
         lib_name,
         lib_name,
@@ -2884,7 +2884,7 @@ mod tests {
 
         // The auto-fix command must be runnable as-is on a fresh system.
         assert!(
-            msg.contains("bunx --bun @cortexkit/aft doctor --fix"),
+            msg.contains("npx @cortexkit/aft doctor --fix"),
             "auto-fix command must be present and copy-pasteable: {msg}"
         );
     }

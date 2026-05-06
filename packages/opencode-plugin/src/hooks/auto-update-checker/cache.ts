@@ -8,12 +8,13 @@ import { getCurrentRuntimePackageJsonPath } from "./checker.js";
 import { CACHE_DIR, PACKAGE_NAME } from "./constants.js";
 import { PackageJsonSchema } from "./types.js";
 
-interface BunLockfile {
-  workspaces?: {
-    ""?: {
-      dependencies?: Record<string, string>;
-    };
-  };
+/**
+ * package-lock.json shape (npm v7+) — minimal subset we need.
+ * Both `dependencies` (legacy v6) and `packages` (modern v7+) entry forms are
+ * present so we clean either layout if encountered.
+ */
+interface PackageLockfile {
+  dependencies?: Record<string, unknown>;
   packages?: Record<string, unknown>;
 }
 
@@ -31,27 +32,43 @@ function stripPackageNameFromPath(pathValue: string, packageName: string): strin
   return current;
 }
 
-function removeFromBunLock(installDir: string, packageName: string): boolean {
-  const lockPath = join(installDir, "bun.lock");
+/**
+ * Remove our package's entries from package-lock.json so the next `npm install`
+ * recomputes them fresh against the new version spec in package.json.
+ *
+ * Earlier this code targeted `bun.lock` because we used to spawn `bun install`.
+ * OpenCode actually installs plugins with npm under the hood, so the install dir
+ * always contains `package-lock.json`, never `bun.lock`. Keeping bun.lock
+ * handling around would have been dead code that diverged from OpenCode's
+ * installer behavior — every auto-update would either no-op (no bun.lock to
+ * clean) or generate a parallel bun.lock that drifted from npm's view.
+ */
+function removeFromPackageLock(installDir: string, packageName: string): boolean {
+  const lockPath = join(installDir, "package-lock.json");
   if (!existsSync(lockPath)) return false;
 
   try {
-    const lock = parseJsonc(readFileSync(lockPath, "utf-8")) as BunLockfile;
+    const lock = parseJsonc(readFileSync(lockPath, "utf-8")) as PackageLockfile;
     let modified = false;
 
-    if (lock.workspaces?.[""]?.dependencies?.[packageName]) {
-      delete lock.workspaces[""].dependencies[packageName];
-      modified = true;
+    // npm v7+ stores entries under `packages` keyed by `node_modules/<name>`.
+    if (lock.packages) {
+      const key = `node_modules/${packageName}`;
+      if (lock.packages[key] !== undefined) {
+        delete lock.packages[key];
+        modified = true;
+      }
     }
 
-    if (lock.packages?.[packageName]) {
-      delete lock.packages[packageName];
+    // Legacy `dependencies` map (npm v6 and older) — also clean it for safety.
+    if (lock.dependencies?.[packageName]) {
+      delete lock.dependencies[packageName];
       modified = true;
     }
 
     if (modified) {
       writeFileSync(lockPath, JSON.stringify(lock, null, 2));
-      log(`[auto-update-checker] Removed from bun.lock: ${packageName}`);
+      log(`[auto-update-checker] Removed from package-lock.json: ${packageName}`);
     }
 
     return modified;
@@ -135,7 +152,7 @@ export function preparePackageUpdate(
     if (!ensureDependencyVersion(installContext.packageJsonPath, packageName, version)) return null;
 
     const packageRemoved = removeInstalledPackage(installContext.installDir, packageName);
-    const lockRemoved = removeFromBunLock(installContext.installDir, packageName);
+    const lockRemoved = removeFromPackageLock(installContext.installDir, packageName);
 
     if (!packageRemoved && !lockRemoved) {
       log(
@@ -150,7 +167,22 @@ export function preparePackageUpdate(
   }
 }
 
-export async function runBunInstallSafe(
+/**
+ * Run `npm install` in the install dir to materialize the dependency version
+ * we just rewrote into package.json. Earlier versions used `bun install`,
+ * but OpenCode itself installs plugins via npm — the install dir always
+ * contains `package-lock.json`, never `bun.lock` — so calling npm matches
+ * the existing lockfile shape and avoids generating a parallel bun.lock
+ * that drifts from OpenCode's view.
+ *
+ * `--no-audit --no-fund --no-progress` keeps the output minimal and avoids
+ * noisy network calls during background auto-updates.
+ *
+ * The default timeout is 60s — long enough for a typical reinstall over a
+ * mediocre network, short enough that a stuck install doesn't pin the plugin
+ * process. Caller can override.
+ */
+export async function runNpmInstallSafe(
   installDir: string,
   options: { timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<boolean> {
@@ -158,7 +190,7 @@ export async function runBunInstallSafe(
 
   try {
     if (options.signal?.aborted) return false;
-    const proc = spawn("bun", ["install"], {
+    const proc = spawn("npm", ["install", "--no-audit", "--no-fund", "--no-progress"], {
       cwd: installDir,
       stdio: "pipe",
     });
@@ -189,7 +221,7 @@ export async function runBunInstallSafe(
 
     return result;
   } catch (err) {
-    warn(`[auto-update-checker] bun install error: ${String(err)}`);
+    warn(`[auto-update-checker] npm install error: ${String(err)}`);
     return false;
   } finally {
     if (timeout) clearTimeout(timeout);

@@ -36,7 +36,7 @@
 Run the unified AFT setup wizard — it auto-detects which harnesses (OpenCode, Pi) you have installed and configures each one:
 
 ```bash
-bunx --bun @cortexkit/aft setup
+npx @cortexkit/aft setup
 ```
 
 That's it. On the next session start the `aft` binary downloads if needed and all tools become available. Use `--harness opencode` or `--harness pi` to target a specific harness.
@@ -79,11 +79,11 @@ The unified `@cortexkit/aft` CLI works across every supported harness:
 
 | Command | What it does |
 |---|---|
-| `bunx --bun @cortexkit/aft setup` | Interactive first-time setup — auto-detects installed harnesses and registers AFT with each |
-| `bunx --bun @cortexkit/aft doctor` | Check configuration and auto-fix common issues across all detected harnesses |
-| `bunx --bun @cortexkit/aft doctor lsp <file>` | Show exactly which LSP servers AFT would spawn for a file, where each binary resolves, and why a server failed to start |
-| `bunx --bun @cortexkit/aft doctor --clear` | Interactive cache cleanup — pick which caches to clear (plugin packages, binary, LSP, semantic) |
-| `bunx --bun @cortexkit/aft doctor --issue` | Collect diagnostics and open a GitHub issue with sanitized logs |
+| `npx @cortexkit/aft setup` | Interactive first-time setup — auto-detects installed harnesses and registers AFT with each |
+| `npx @cortexkit/aft doctor` | Check configuration and auto-fix common issues across all detected harnesses |
+| `npx @cortexkit/aft doctor lsp <file>` | Show exactly which LSP servers AFT would spawn for a file, where each binary resolves, and why a server failed to start |
+| `npx @cortexkit/aft doctor --clear` | Interactive cache cleanup — pick which caches to clear (plugin packages, binary, LSP, semantic) |
+| `npx @cortexkit/aft doctor --issue` | Collect diagnostics and open a GitHub issue with sanitized logs |
 
 Add `--harness opencode` or `--harness pi` to any command to target one harness explicitly.
 
@@ -105,7 +105,7 @@ spawned. Pass `--harness opencode` or `--harness pi` if you have both plugins in
 need to disambiguate. Example output:
 
 ```
-$ bunx --bun @cortexkit/aft doctor lsp ./python/main.py
+$ npx @cortexkit/aft doctor lsp ./python/main.py
 
 Server attempts:
   ✗ ty
@@ -672,7 +672,7 @@ install the relevant LSP server (see warnings on plugin startup). `total: 0` wit
 `push_only` means the file is genuinely clean.
 
 When the response looks unhelpful and you can't tell which case applies, run
-`bunx --bun @cortexkit/aft doctor lsp <file>` for a per-file triage that names the binary
+`npx @cortexkit/aft doctor lsp <file>` for a per-file triage that names the binary
 resolution path, workspace root markers, and spawn outcome for every server registered for
 that extension. See [CLI Commands](#cli-commands).
 

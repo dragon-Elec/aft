@@ -19,6 +19,7 @@ function printHelp(): void {
   console.log("    setup            Interactive setup wizard");
   console.log("    doctor           Check and fix configuration issues");
   console.log("    doctor lsp <file> Inspect LSP setup for one file");
+  console.log("    doctor --fix     Auto-fix common issues (e.g. ONNX Runtime mismatch)");
   console.log("    doctor --clear   Select caches to clear with an interactive prompt");
   console.log("    doctor --issue   Collect diagnostics and open a GitHub issue");
   console.log("");
@@ -49,8 +50,9 @@ async function main(): Promise<number> {
     const { runDoctor } = await import("./commands/doctor.js");
     const force = args.includes("--force");
     const clear = args.includes("--clear");
+    const fix = args.includes("--fix");
     const issue = args.includes("--issue");
-    return runDoctor({ clear, force, issue, argv: args });
+    return runDoctor({ clear, fix, force, issue, argv: args });
   }
   printHelp();
   return command ? 1 : 0;

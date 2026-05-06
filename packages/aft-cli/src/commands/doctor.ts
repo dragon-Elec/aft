@@ -1,16 +1,19 @@
-import { writeFileSync } from "node:fs";
+import { existsSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { HarnessAdapter } from "../adapters/types.js";
+import { getBinaryCacheInfo } from "../lib/binary-cache.js";
 import { collectDiagnostics, renderDiagnosticsMarkdown, tailLogFile } from "../lib/diagnostics.js";
 import { dirSize, formatBytes } from "../lib/fs-util.js";
 import { createGitHubIssue, isGhInstalled, openBrowser } from "../lib/github.js";
 import { resolveAdaptersForCommand } from "../lib/harness-select.js";
 import { type ClearResult, clearLspCaches } from "../lib/lsp-cache.js";
+import { runOnnxFix } from "../lib/onnx-fix.js";
 import { intro, log, note, outro, selectMany, text } from "../lib/prompts.js";
 import { sanitizeContent } from "../lib/sanitize.js";
+import { getSelfVersion } from "../lib/self-version.js";
 
-export type DoctorClearTarget = "plugin-cache" | "lsp-cache";
+export type DoctorClearTarget = "plugin-cache" | "lsp-cache" | "binary-cache";
 
 export const DOCTOR_CLEAR_TARGET_OPTIONS: { label: string; value: DoctorClearTarget }[] = [
   {
@@ -21,12 +24,17 @@ export const DOCTOR_CLEAR_TARGET_OPTIONS: { label: string; value: DoctorClearTar
     label: "LSP install cache (~/.cache/aft/lsp-packages/, ~/.cache/aft/lsp-binaries/)",
     value: "lsp-cache",
   },
+  {
+    label: "Old aft binaries (~/.cache/aft/bin/v* — keeps the version matching this CLI)",
+    value: "binary-cache",
+  },
 ];
 
 export const DOCTOR_FORCE_CLEAR_TARGETS: DoctorClearTarget[] = ["plugin-cache"];
 
 export interface DoctorOptions {
   clear: boolean;
+  fix: boolean;
   force: boolean;
   issue: boolean;
   argv: string[];
@@ -44,6 +52,11 @@ export interface CacheClearSummary {
     totalBytes: number;
     errors: number;
   };
+  binaryCache?: {
+    cleared: number;
+    totalBytes: number;
+    errors: number;
+  };
 }
 
 export interface CacheClearOptions {
@@ -56,6 +69,10 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
     return runIssueFlow(options.argv);
   }
   intro("AFT doctor");
+
+  if (options.fix) {
+    return runFixFlow(options.argv);
+  }
 
   if (options.clear) {
     return runClearFlow(options.argv);
@@ -214,7 +231,126 @@ export async function clearDoctorCaches(
     };
   }
 
+  if (targets.includes("binary-cache")) {
+    const result = clearOldBinaries();
+    if (result.errors.length > 0) {
+      summary.hadErrors = true;
+    }
+    summary.binaryCache = {
+      cleared: result.cleared,
+      totalBytes: result.bytesReclaimed,
+      errors: result.errors.length,
+    };
+  }
+
   return summary;
+}
+
+/**
+ * Clear cached `aft` binaries except the version this CLI ships with.
+ *
+ * Each release of `@cortexkit/aft` bundles a matching binary version; the
+ * plugin downloads it on first use into `~/.cache/aft/bin/v<version>/aft`.
+ * Older versions are kept around for rollback and to handle the
+ * "old plugin instance still running" scenario, but they pile up over
+ * time and a single binary is ~30 MB on macOS / Linux. Clearing keeps
+ * the version that matches the running CLI so we don't yank the binary
+ * a live OpenCode/Pi process is currently executing from.
+ */
+export interface BinaryCacheClearResult {
+  cleared: number;
+  bytesReclaimed: number;
+  errors: { path: string; error: string }[];
+  keptVersion: string | null;
+}
+
+export function clearOldBinaries(): BinaryCacheClearResult {
+  // Keep the version that matches the running CLI. Different release
+  // tags share a `v` prefix; binaries on disk follow the same shape.
+  const cliVersion = getSelfVersion();
+  const keepTag = `v${cliVersion.replace(/^v/, "")}`;
+  const info = getBinaryCacheInfo(cliVersion);
+  const result: BinaryCacheClearResult = {
+    cleared: 0,
+    bytesReclaimed: 0,
+    errors: [],
+    keptVersion: keepTag,
+  };
+
+  if (!existsSync(info.path)) {
+    log.info(`Binary cache: nothing to clear at ${info.path}`);
+    return result;
+  }
+
+  const stale = info.versions.filter((v) => v !== keepTag);
+
+  if (stale.length === 0) {
+    log.info(
+      `Binary cache: only the active version (${keepTag}) is present at ${info.path}; nothing to clear`,
+    );
+    return result;
+  }
+
+  for (const version of stale) {
+    const dir = join(info.path, version);
+    let bytes = 0;
+    try {
+      bytes = statSync(dir).isDirectory() ? dirSize(dir) : 0;
+    } catch {
+      bytes = 0;
+    }
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      result.cleared += 1;
+      result.bytesReclaimed += bytes;
+      log.success(`Binary cache: cleared ${dir} (reclaimed ${formatBytes(bytes)})`);
+    } catch (err) {
+      const message = (err as Error).message ?? "unknown error";
+      log.error(`Binary cache: failed to remove ${dir}: ${message}`);
+      result.errors.push({ path: dir, error: message });
+    }
+  }
+
+  if (result.cleared > 0) {
+    log.success(
+      `Binary cache: kept ${keepTag}, removed ${result.cleared} old version(s), reclaimed ${formatBytes(result.bytesReclaimed)}`,
+    );
+  }
+
+  return result;
+}
+
+/**
+ * `aft doctor --fix` flow — detect and apply auto-fixable issues with
+ * user consent. Currently covers ONNX Runtime version mismatches by
+ * clearing AFT's managed cache; future fixes can plug in here.
+ */
+async function runFixFlow(argv: string[]): Promise<number> {
+  const adapters = await resolveAdaptersForCommand(argv, {
+    allowMulti: true,
+    verb: "auto-fix issues for",
+  });
+
+  log.info("Running diagnostics to identify auto-fixable issues…");
+  const report = await collectDiagnostics(adapters);
+
+  // ONNX Runtime fix is the only supported auto-fix today.
+  const onnxResult = await runOnnxFix(adapters, report);
+
+  if (onnxResult === null) {
+    log.info("No auto-fixable issues detected.");
+    note(
+      "If you're still seeing 'Semantic Index: failed' in the TUI sidebar, run " +
+        "`aft doctor` (without --fix) for a full diagnostic dump.",
+      "Tip",
+    );
+    outro("Done.");
+    return 0;
+  }
+
+  const hadErrors = onnxResult.errors.length > 0;
+  outro(hadErrors ? "Done — some fixes failed." : "Done.");
+  return hadErrors ? 1 : 0;
 }
 
 async function clearPluginCache(

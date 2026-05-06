@@ -330,6 +330,75 @@ function cleanupAbandonedOnnxAttempts(onnxBaseDir: string, ortDir: string): void
 }
 
 /** Check common system locations for ONNX Runtime */
+/**
+ * Minimum ONNX Runtime version compatible with AFT's bundled `ort` crate.
+ *
+ * The Rust pre-validator rejects anything below 1.20 (see
+ * `crates/aft/src/semantic_index.rs::pre_validate_onnx_runtime`). When this
+ * resolver finds a system install older than that, it MUST treat the system
+ * dir as absent and fall through to auto-download — otherwise the resolver
+ * hands Rust a path it will refuse, semantic search stays "failed" forever,
+ * and the user has to hand-edit `/usr/lib/...` to make progress.
+ */
+const REQUIRED_ORT_MAJOR = 1;
+const REQUIRED_ORT_MIN_MINOR = 20;
+
+/**
+ * Detect the version of an ONNX Runtime install by walking the directory's
+ * library-file suffixes. Microsoft ships `libonnxruntime.so.1.24.4` and
+ * symlinks the bare `libonnxruntime.so` at it; on macOS the pattern is
+ * `libonnxruntime.1.24.4.dylib`. Returns null when the version cannot be
+ * inferred (treat as compatible to avoid false negatives on unconventional
+ * installs).
+ */
+function detectOnnxVersion(libDir: string, libName: string): string | null {
+  try {
+    const entries = readdirSync(libDir);
+    // On macOS the library is `libonnxruntime.1.24.4.dylib` — the
+    // version sits between the bare name `libonnxruntime` and the
+    // `.dylib` suffix, so `entry.startsWith(libName)` (which expects
+    // `libonnxruntime.dylib`) misses it. Match by the bare prefix
+    // (libName with the platform suffix stripped) so both Linux's
+    // `libonnxruntime.so.1.24.4` and macOS's `libonnxruntime.1.24.4.dylib`
+    // are picked up.
+    const barePrefix = libName.replace(/\.(so|dylib|dll)$/, "");
+    for (const entry of entries) {
+      if (!entry.startsWith(barePrefix)) continue;
+      const match = entry.match(/\.(\d+\.\d+\.\d+)(?:\.dylib)?$/);
+      if (match) return match[1];
+    }
+    // Symlink fallback: bare libonnxruntime.so -> libonnxruntime.so.1.24.4
+    const base = join(libDir, libName);
+    if (existsSync(base)) {
+      try {
+        const real = realpathSync(base);
+        const m = real.match(/\.(\d+\.\d+\.\d+)(?:\.dylib)?$/);
+        if (m) return m[1];
+      } catch {
+        // ignore
+      }
+      try {
+        const target = readlinkSync(base);
+        const m = target.match(/\.(\d+\.\d+\.\d+)(?:\.dylib)?$/);
+        if (m) return m[1];
+      } catch {
+        // not a symlink
+      }
+    }
+  } catch {
+    // unreadable dir
+  }
+  return null;
+}
+
+function isOnnxVersionCompatible(version: string): boolean {
+  const parts = version.split(".").map((p) => Number.parseInt(p, 10));
+  const [major, minor] = parts;
+  if (!Number.isFinite(major) || !Number.isFinite(minor)) return false;
+  if (major !== REQUIRED_ORT_MAJOR) return false;
+  return minor >= REQUIRED_ORT_MIN_MINOR;
+}
+
 function findSystemOnnxRuntime(libName?: string): string | null {
   if (!libName) return null;
 
@@ -348,9 +417,22 @@ function findSystemOnnxRuntime(libName?: string): string | null {
   }
 
   for (const dir of searchPaths) {
-    if (existsSync(join(dir, libName))) {
-      return dir;
+    if (!existsSync(join(dir, libName))) continue;
+
+    // Reject system installs that the Rust pre-validator will refuse. Without
+    // this filter, a stale distro package (e.g. libonnxruntime1.9 on Ubuntu
+    // 22.04) shadows our auto-downloaded v1.24 forever and semantic search
+    // stays "failed" until the user hand-deletes the system library.
+    const version = detectOnnxVersion(dir, libName);
+    if (version && !isOnnxVersionCompatible(version)) {
+      warn(
+        `Skipping system ONNX Runtime at ${dir} (v${version}); AFT requires ` +
+          `v${REQUIRED_ORT_MAJOR}.${REQUIRED_ORT_MIN_MINOR}+. Falling through to AFT-managed download.`,
+      );
+      continue;
     }
+
+    return dir;
   }
 
   return null;
@@ -835,4 +917,9 @@ export const __test__ = {
   cleanupAbandonedOnnxAttempts,
   ORT_VERSION,
   ONNX_INSTALLED_META_FILE,
+  detectOnnxVersion,
+  isOnnxVersionCompatible,
+  findSystemOnnxRuntime,
+  REQUIRED_ORT_MAJOR,
+  REQUIRED_ORT_MIN_MINOR,
 };

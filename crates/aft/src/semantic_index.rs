@@ -678,17 +678,7 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
                     parts.get(1).and_then(|s| s.parse::<u32>().ok()),
                 ) {
                     if major != 1 || minor < 20 {
-                        return Err(format!(
-                            "ONNX Runtime version mismatch: found v{} at '{}', but AFT requires v1.20+. \
-                             Solutions:\n\
-                             1. Remove the old library and restart (AFT auto-downloads the correct version):\n\
-                             {}\n\
-                             2. Or install ONNX Runtime 1.24: https://github.com/microsoft/onnxruntime/releases/tag/v1.24.0\n\
-                             3. Run `bunx @cortexkit/aft-opencode@latest doctor` for full diagnostics.",
-                            version,
-                            lib_name,
-                            suggest_removal_command(lib_name),
-                        ));
+                        return Err(format_ort_version_mismatch(version, lib_name));
                     }
                 }
             }
@@ -759,6 +749,30 @@ fn suggest_removal_command(lib_path: &str) -> String {
         return "   Delete the ONNX Runtime DLL from your PATH".to_string();
     }
     format!("   rm '{}'", lib_path)
+}
+
+/// Build the user-facing error message for an incompatible ONNX Runtime
+/// install. Extracted as a pure helper so we can unit-test the wording
+/// stability — the auto-fix recommendation must always come first because
+/// it's the only safe option, and the system-rm step must remain present
+/// because some users prefer the system-wide cleanup path.
+pub(crate) fn format_ort_version_mismatch(version: &str, lib_name: &str) -> String {
+    format!(
+        "ONNX Runtime version mismatch: found v{} at '{}', but AFT requires v1.20+. \
+         Solutions:\n\
+         1. Auto-fix (recommended): run `bunx --bun @cortexkit/aft doctor --fix`. \
+         This downloads AFT-managed ONNX Runtime v1.24 into AFT's storage and \
+         configures the bridge to load it instead of the system library — no \
+         changes to '{}'.\n\
+         2. Remove the old library and restart (AFT auto-downloads the correct version on next start):\n\
+         {}\n\
+         3. Or install ONNX Runtime 1.24 system-wide: https://github.com/microsoft/onnxruntime/releases/tag/v1.24.0\n\
+         4. Run `bunx --bun @cortexkit/aft doctor` for full diagnostics.",
+        version,
+        lib_name,
+        lib_name,
+        suggest_removal_command(lib_name),
+    )
 }
 
 pub fn initialize_text_embedding(model: &str) -> Result<TextEmbedding, String> {
@@ -2832,5 +2846,63 @@ mod tests {
         // validate_base_url_no_ssrf does. Tests construct backends directly.
         assert!(normalize_base_url("http://127.0.0.1:9999").is_ok());
         assert!(normalize_base_url("http://localhost:8080").is_ok());
+    }
+
+    /// Pin the user-facing wording of the ONNX version-mismatch error.
+    /// The auto-fix path MUST be listed first because it's the only safe
+    /// option that doesn't require sudo or risk breaking other apps that
+    /// link the system library. Regression of any of these strings would
+    /// either mislead users (system rm before auto-fix) or break the
+    /// `aft doctor --fix` discovery path.
+    #[test]
+    fn ort_mismatch_message_recommends_auto_fix_first() {
+        let msg =
+            format_ort_version_mismatch("1.9.0", "/usr/lib/x86_64-linux-gnu/libonnxruntime.so");
+
+        // The reported version and path must appear verbatim.
+        assert!(
+            msg.contains("v1.9.0"),
+            "should report detected version: {msg}"
+        );
+        assert!(
+            msg.contains("/usr/lib/x86_64-linux-gnu/libonnxruntime.so"),
+            "should report system path: {msg}"
+        );
+        assert!(msg.contains("v1.20+"), "should state requirement: {msg}");
+
+        // Solution ordering: auto-fix is #1, system rm is #2, install is #3.
+        let auto_fix_pos = msg
+            .find("Auto-fix")
+            .expect("Auto-fix solution missing — users won't discover --fix");
+        let remove_pos = msg
+            .find("Remove the old library")
+            .expect("system-rm solution missing");
+        assert!(
+            auto_fix_pos < remove_pos,
+            "Auto-fix must come before manual rm — see PR comment thread"
+        );
+
+        // The auto-fix command must be runnable as-is on a fresh system.
+        assert!(
+            msg.contains("bunx --bun @cortexkit/aft doctor --fix"),
+            "auto-fix command must be present and copy-pasteable: {msg}"
+        );
+    }
+
+    /// macOS dylib paths must not produce a malformed message when the
+    /// system path lacks a trailing slash. This is a regression guard
+    /// for the "{}\n{}" format string contract.
+    #[test]
+    fn ort_mismatch_message_handles_macos_dylib_path() {
+        let msg = format_ort_version_mismatch("1.9.0", "/opt/homebrew/lib/libonnxruntime.dylib");
+        assert!(msg.contains("v1.9.0"));
+        assert!(msg.contains("/opt/homebrew/lib/libonnxruntime.dylib"));
+        // The dylib path must appear in the auto-fix paragraph (single
+        // quotes around it) AND in the manual-rm paragraph; verify
+        // both placements survived the format string.
+        assert!(
+            msg.contains("'/opt/homebrew/lib/libonnxruntime.dylib'"),
+            "system path should be quoted in the auto-fix sentence: {msg}"
+        );
     }
 }

@@ -59,11 +59,20 @@ describe("doctor cache clear targets", () => {
         label: "LSP install cache (~/.cache/aft/lsp-packages/, ~/.cache/aft/lsp-binaries/)",
         value: "lsp-cache",
       },
+      {
+        label: "Old aft binaries (~/.cache/aft/bin/v* — keeps the version matching this CLI)",
+        value: "binary-cache",
+      },
     ]);
   });
 
   test("keeps --force as a plugin-cache-only clear target", () => {
     expect(DOCTOR_FORCE_CLEAR_TARGETS satisfies DoctorClearTarget[]).toEqual(["plugin-cache"]);
+  });
+
+  test("binary-cache is a documented clear option (regression for the user request)", () => {
+    const values = DOCTOR_CLEAR_TARGET_OPTIONS.map((o) => o.value);
+    expect(values).toContain("binary-cache");
   });
 });
 

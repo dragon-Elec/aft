@@ -1557,6 +1557,24 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Serializes tests that mutate the global TOOL_RESOLUTION_CACHE /
+    /// TOOL_AVAILABILITY_CACHE. Cargo runs tests in parallel by default, and
+    /// `clear_tool_cache()` from one test would otherwise wipe cached entries
+    /// that another test had just written, causing flaky CI failures (the
+    /// `resolve_tool_caches_negative_result_until_clear` failure on Linux
+    /// runners had exactly this shape).
+    fn tool_cache_test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let mutex = LOCK.get_or_init(|| Mutex::new(()));
+        // Recover from poisoning so a panic in one test doesn't permanently
+        // wedge the rest of the suite.
+        match mutex.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
 
     #[test]
     fn run_external_tool_not_found() {
@@ -1723,6 +1741,7 @@ mod tests {
 
     #[test]
     fn resolve_tool_caches_positive_result_until_clear() {
+        let _guard = tool_cache_test_lock();
         clear_tool_cache();
         let dir = tempfile::tempdir().unwrap();
         let bin_dir = dir.path().join("node_modules").join(".bin");
@@ -1743,6 +1762,7 @@ mod tests {
 
     #[test]
     fn resolve_tool_caches_negative_result_until_clear() {
+        let _guard = tool_cache_test_lock();
         clear_tool_cache();
         let dir = tempfile::tempdir().unwrap();
         let bin_dir = dir.path().join("node_modules").join(".bin");

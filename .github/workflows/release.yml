@@ -19,18 +19,25 @@ env:
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
+    # Pin to ubuntu-22.04 to match tests.yml — the previous ubuntu-latest
+    # mismatch contributed to release runs that ran far longer than PR-time
+    # CI on the same code (no shared rust-cache between PR and release runs
+    # either). Keeping both workflows on the same image + cache prevents
+    # surprise behavior differences at release time.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
 
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
       - name: Rust tests
-        run: cargo test
+        run: cargo test --workspace
 
       - name: Build aft binary (needed for e2e tests)
         run: cargo build -p agent-file-tools

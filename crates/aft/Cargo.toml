@@ -44,6 +44,7 @@ tree-sitter-bash = "0.25"
 tree-sitter-html = "0.23"
 tree-sitter-md = "0.5"
 tree-sitter-solidity = "1.2"
+tree-sitter-vue = { package = "tree-sitter-vue-next", version = "0.1" }
 similar = "2"
 ast-grep-core = "0.41"
 streaming-iterator = "0.1"

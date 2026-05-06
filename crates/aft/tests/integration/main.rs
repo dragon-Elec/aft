@@ -47,3 +47,4 @@ mod status_disk_scope_test;
 mod structure_test;
 mod symbol_cache_persist_test;
 mod transaction_test;
+mod vue_test;

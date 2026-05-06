@@ -26,6 +26,7 @@ pub enum AstGrepLang {
     Zig,
     CSharp,
     Solidity,
+    Vue,
 }
 
 impl AstGrepLang {
@@ -43,6 +44,7 @@ impl AstGrepLang {
             LangId::Zig => Some(Self::Zig),
             LangId::CSharp => Some(Self::CSharp),
             LangId::Solidity => Some(Self::Solidity),
+            LangId::Vue => Some(Self::Vue),
             LangId::Bash => None, // ast-grep doesn't support Bash
             // Markdown, CSS, HTML etc. don't have meaningful AST patterns
             _ => None,
@@ -63,6 +65,7 @@ impl AstGrepLang {
             "zig" => Some(Self::Zig),
             "csharp" | "c#" | "cs" => Some(Self::CSharp),
             "solidity" | "sol" => Some(Self::Solidity),
+            "vue" => Some(Self::Vue),
             _ => None,
         }
     }
@@ -81,6 +84,7 @@ impl AstGrepLang {
             Self::Zig => &["zig"],
             Self::CSharp => &["cs"],
             Self::Solidity => &["sol"],
+            Self::Vue => &["vue"],
         }
     }
 
@@ -157,7 +161,7 @@ impl Language for AstGrepLang {
             Self::Python | Self::Rust | Self::C | Self::Cpp | Self::Zig | Self::CSharp => {
                 '\u{00B5}' // µ
             }
-            // $ is valid in TS, JS, Go, Solidity identifiers
+            // $ is valid in TS, JS, Go, Solidity, and Vue template identifiers
             _ => '$',
         }
     }
@@ -177,6 +181,7 @@ impl LanguageExt for AstGrepLang {
             Self::Zig => tree_sitter_zig::LANGUAGE.into(),
             Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
             Self::Solidity => tree_sitter_solidity::LANGUAGE.into(),
+            Self::Vue => tree_sitter_vue::LANGUAGE.into(),
         }
     }
 }
@@ -209,6 +214,7 @@ mod tests {
             Some(AstGrepLang::Solidity)
         );
         assert_eq!(AstGrepLang::from_str("sol"), Some(AstGrepLang::Solidity));
+        assert_eq!(AstGrepLang::from_str("vue"), Some(AstGrepLang::Vue));
         assert_eq!(AstGrepLang::from_str("markdown"), None);
     }
 
@@ -306,6 +312,11 @@ mod tests {
     #[test]
     fn solidity_expando_char_stays_dollar() {
         assert_eq!(AstGrepLang::Solidity.expando_char(), '$');
+    }
+
+    #[test]
+    fn vue_expando_char_stays_dollar() {
+        assert_eq!(AstGrepLang::Vue.expando_char(), '$');
     }
 
     /// Regression for the Solidity meta-var binding bug that v0.19.5 fixed.

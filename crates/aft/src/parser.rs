@@ -373,6 +373,7 @@ pub enum LangId {
     Html,
     Markdown,
     Solidity,
+    Vue,
 }
 
 /// Maps file extension to language identifier.
@@ -393,6 +394,7 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
         "html" | "htm" => Some(LangId::Html),
         "md" | "markdown" | "mdx" => Some(LangId::Markdown),
         "sol" => Some(LangId::Solidity),
+        "vue" => Some(LangId::Vue),
         _ => None,
     }
 }
@@ -414,6 +416,7 @@ pub fn grammar_for(lang: LangId) -> Language {
         LangId::Html => tree_sitter_html::LANGUAGE.into(),
         LangId::Markdown => tree_sitter_md::LANGUAGE.into(),
         LangId::Solidity => tree_sitter_solidity::LANGUAGE.into(),
+        LangId::Vue => tree_sitter_vue::LANGUAGE.into(),
     }
 }
 
@@ -433,6 +436,7 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::Html => None, // HTML uses direct tree walking like Markdown
         LangId::Markdown => None,
         LangId::Solidity => Some(SOL_QUERY),
+        LangId::Vue => None,
     }
 }
 
@@ -481,7 +485,7 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         LangId::CSharp => Some(&*CSHARP_QUERY_CACHE),
         LangId::Bash => Some(&*BASH_QUERY_CACHE),
         LangId::Solidity => Some(&*SOL_QUERY_CACHE),
-        LangId::Html | LangId::Markdown => None,
+        LangId::Html | LangId::Markdown | LangId::Vue => None,
     };
 
     query
@@ -874,6 +878,9 @@ pub fn extract_symbols_from_tree(
     if lang == LangId::Markdown {
         return extract_md_symbols(source, &root);
     }
+    if lang == LangId::Vue {
+        return extract_vue_symbols(source, &root);
+    }
 
     let query = cached_query_for(lang)?.ok_or_else(|| AftError::InvalidRequest {
         message: format!("no query patterns implemented for {:?} yet", lang),
@@ -891,7 +898,9 @@ pub fn extract_symbols_from_tree(
         LangId::CSharp => extract_csharp_symbols(source, &root, query),
         LangId::Bash => extract_bash_symbols(source, &root, query),
         LangId::Solidity => extract_solidity_symbols(source, &root, query),
-        LangId::Html | LangId::Markdown => unreachable!("handled before query lookup"),
+        LangId::Html | LangId::Markdown | LangId::Vue => {
+            unreachable!("handled before query lookup")
+        }
     }
 }
 
@@ -951,7 +960,7 @@ pub(crate) fn node_range_with_decorators(node: &Node, source: &str, lang: LangId
                 // Decorators are handled by decorated_definition capture
                 false
             }
-            LangId::Html | LangId::Markdown => false,
+            LangId::Html | LangId::Markdown | LangId::Vue => false,
         };
 
         if should_include {
@@ -3031,6 +3040,70 @@ fn extract_solidity_symbols(
 
     dedup_symbols(&mut symbols);
     Ok(symbols)
+}
+
+fn extract_vue_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
+    let mut symbols = Vec::new();
+    collect_vue_sections(source, root, &mut symbols, true);
+    dedup_symbols(&mut symbols);
+    Ok(symbols)
+}
+
+fn collect_vue_sections(
+    source: &str,
+    node: &Node,
+    symbols: &mut Vec<Symbol>,
+    allow_sections: bool,
+) {
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return;
+    }
+
+    loop {
+        let child = cursor.node();
+        if let Some(section_name) = vue_section_name(&child) {
+            if allow_sections {
+                symbols.push(Symbol {
+                    name: section_name.to_string(),
+                    kind: SymbolKind::Heading,
+                    range: node_range(&child),
+                    signature: vue_opening_tag_signature(source, &child),
+                    scope_chain: vec![],
+                    exported: false,
+                    parent: None,
+                });
+            }
+        } else {
+            collect_vue_sections(
+                source,
+                &child,
+                symbols,
+                allow_sections && child.kind() == "document",
+            );
+        }
+
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
+fn vue_section_name(node: &Node) -> Option<&'static str> {
+    match node.kind() {
+        "template_element" => Some("template"),
+        "script_element" => Some("script"),
+        "style_element" => Some("style"),
+        _ => None,
+    }
+}
+
+fn vue_opening_tag_signature(source: &str, node: &Node) -> Option<String> {
+    find_child_by_kind(*node, "start_tag")
+        .or_else(|| find_child_by_kind(*node, "script_start_tag"))
+        .or_else(|| find_child_by_kind(*node, "style_start_tag"))
+        .or_else(|| find_child_by_kind(*node, "template_start_tag"))
+        .map(|tag| node_text(source, &tag).trim().to_string())
 }
 
 fn extract_html_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {

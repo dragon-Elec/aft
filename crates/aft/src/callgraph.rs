@@ -208,6 +208,7 @@ pub fn is_entry_point(name: &str, kind: &SymbolKind, exported: bool, lang: LangI
         | LangId::CSharp
         | LangId::Bash
         | LangId::Solidity
+        | LangId::Vue
         | LangId::Html
         | LangId::Markdown => false,
     }

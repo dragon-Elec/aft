@@ -464,6 +464,7 @@ fn find_scope_container(
         | LangId::CSharp
         | LangId::Bash
         | LangId::Solidity
+        | LangId::Vue
         | LangId::Html
         | LangId::Markdown => {}
     }

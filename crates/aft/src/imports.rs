@@ -179,7 +179,8 @@ pub fn parse_imports(source: &str, tree: &Tree, lang: LangId) -> ImportBlock {
         | LangId::Zig
         | LangId::CSharp
         | LangId::Bash
-        | LangId::Solidity => ImportBlock::empty(),
+        | LangId::Solidity
+        | LangId::Vue => ImportBlock::empty(),
         LangId::Html | LangId::Markdown => ImportBlock::empty(),
     }
 }
@@ -405,7 +406,8 @@ pub fn generate_import_line(
         | LangId::Zig
         | LangId::CSharp
         | LangId::Bash
-        | LangId::Solidity => String::new(),
+        | LangId::Solidity
+        | LangId::Vue => String::new(),
         LangId::Html | LangId::Markdown => String::new(),
     }
 }
@@ -444,7 +446,8 @@ pub fn classify_group(lang: LangId, module_path: &str) -> ImportGroup {
         | LangId::Zig
         | LangId::CSharp
         | LangId::Bash
-        | LangId::Solidity => ImportGroup::External,
+        | LangId::Solidity
+        | LangId::Vue => ImportGroup::External,
         LangId::Html | LangId::Markdown => ImportGroup::External,
     }
 }

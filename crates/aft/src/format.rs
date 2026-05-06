@@ -353,6 +353,7 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::CSharp => "csharp",
         LangId::Bash => "bash",
         LangId::Solidity => "solidity",
+        LangId::Vue => "vue",
         LangId::Html => "html",
         LangId::Markdown => "markdown",
     }
@@ -492,7 +493,8 @@ fn formatter_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<To
         | LangId::Zig
         | LangId::CSharp
         | LangId::Bash
-        | LangId::Solidity => Vec::new(),
+        | LangId::Solidity
+        | LangId::Vue => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
     }
@@ -592,7 +594,8 @@ fn checker_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<Tool
         | LangId::Zig
         | LangId::CSharp
         | LangId::Bash
-        | LangId::Solidity => Vec::new(),
+        | LangId::Solidity
+        | LangId::Vue => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
     }
@@ -802,6 +805,7 @@ fn placeholder_file_for_language(project_root: &Path, lang: LangId) -> PathBuf {
         LangId::CSharp => "aft_tool_detection.cs",
         LangId::Bash => "aft_tool_detection.sh",
         LangId::Solidity => "aft_tool_detection.sol",
+        LangId::Vue => "aft-tool-detection.vue",
         LangId::Html => "aft-tool-detection.html",
         LangId::Markdown => "aft-tool-detection.md",
     };

@@ -302,6 +302,59 @@ describe("OpenCode bash adapter", () => {
       taskId: "task-xyz",
     });
   });
+
+  test("foreground running task polls to terminal status and returns inline output", async () => {
+    const { calls, tool: bash } = createHarness((command) => {
+      if (command === "bash") return { success: true, status: "running", task_id: "task-inline" };
+      return {
+        success: true,
+        status: "completed",
+        exit_code: 0,
+        duration_ms: 100,
+        output_preview: "done",
+        output_truncated: false,
+      };
+    });
+
+    const output = await bash.execute({ command: "printf done" }, createMockSdkContext());
+
+    expect(output).toBe("done");
+    expect(calls.map((call) => call.command)).toEqual(["bash", "bash_status"]);
+    expect(calls[0].params.notify_on_completion).toBe(false);
+  });
+
+  test("foreground running task promotes to background after wait timeout", async () => {
+    const { calls, tool: bash } = createHarness((command) => {
+      if (command === "bash") return { success: true, status: "running", task_id: "task-promote" };
+      if (command === "bash_status") return { success: true, status: "running" };
+      return { success: true, task_id: "task-promote", promoted: true };
+    });
+
+    const output = await bash.execute(
+      { command: "sleep 2", timeout: 0 },
+      createMockSdkContext({ sessionID: "promote-session" }),
+    );
+
+    expect(output).toContain("promoted to background: task-promote");
+    expect(calls.map((call) => call.command)).toEqual(["bash", "bash_status", "bash_promote"]);
+  });
+
+  test("explicit background spawn enables completion notifications", async () => {
+    const { calls, tool: bash } = createHarness(() => ({
+      success: true,
+      status: "running",
+      task_id: "task-notify",
+    }));
+
+    const output = await bash.execute(
+      { command: "sleep 30", background: true },
+      createMockSdkContext(),
+    );
+
+    expect(output).toContain("Background task started: task-notify");
+    expect(calls).toHaveLength(1);
+    expect(calls[0].params.notify_on_completion).toBe(true);
+  });
 });
 
 describe("bash_status tool", () => {

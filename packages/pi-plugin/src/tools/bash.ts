@@ -12,6 +12,7 @@ import { bridgeFor, callBridge, resolveSessionId } from "./_shared.js";
 
 const DEFAULT_BASH_TIMEOUT_MS = 30_000;
 const BASH_TRANSPORT_TIMEOUT_OVERHEAD_MS = 5_000;
+const FOREGROUND_POLL_INTERVAL_MS = 100;
 
 // Background task completion metadata shape (from Track D)
 interface BgCompletion {
@@ -179,6 +180,7 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
           env: spawnContext.env,
           description: params.description,
           background: params.background,
+          notify_on_completion: params.background === true,
           compressed: params.compressed,
         },
         extCtx,
@@ -214,7 +216,39 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
 
       const taskId = response.task_id as string | undefined;
       if (response.status === "running" && taskId) {
-        trackBgTask(resolveSessionId(extCtx), taskId);
+        if (params.background === true) {
+          trackBgTask(resolveSessionId(extCtx), taskId);
+          return bashResult(formatBackgroundLaunch(taskId), { task_id: taskId });
+        }
+
+        const waitTimeoutMs = params.timeout ?? DEFAULT_BASH_TIMEOUT_MS;
+        const startedAt = Date.now();
+        while (true) {
+          const status = await callBridge(bridge, "bash_status", { task_id: taskId }, extCtx);
+          if (status.success === false) {
+            throw new Error((status.message as string | undefined) ?? "bash_status failed");
+          }
+          if (isTerminalStatus(status.status)) {
+            return bashResult(formatForegroundResult(status), {
+              exit_code: status.exit_code as number | undefined,
+              duration_ms: status.duration_ms as number | undefined,
+              truncated: status.output_truncated as boolean | undefined,
+              output_path: status.output_path as string | undefined,
+              task_id: taskId,
+            });
+          }
+          if (Date.now() - startedAt >= waitTimeoutMs) {
+            const promoted = await callBridge(bridge, "bash_promote", { task_id: taskId }, extCtx);
+            if (promoted.success === false) {
+              throw new Error((promoted.message as string | undefined) ?? "bash_promote failed");
+            }
+            trackBgTask(resolveSessionId(extCtx), taskId);
+            return bashResult(formatPromotionMessage(taskId, params.command, params.timeout), {
+              task_id: taskId,
+            });
+          }
+          await sleep(FOREGROUND_POLL_INTERVAL_MS);
+        }
       }
 
       const details: BashDetails = {
@@ -224,17 +258,6 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
         output_path: response.output_path as string | undefined,
         task_id: taskId,
       };
-
-      // Background spawn path — surface a concise started line with the
-      // anti-polling reminder. Without text, agents would see Rust's empty
-      // output and not understand the background flow. The wording matches
-      // the OpenCode plugin so identical agent behavior is enforced across
-      // both harnesses. See packages/opencode-plugin/src/tools/bash.ts for
-      // the rationale on the "completion reminder" sentence.
-      if (response.status === "running" && taskId) {
-        const startedLine = `Background task started: ${taskId}. A completion reminder will be delivered automatically; don't poll bash_status.`;
-        return bashResult(startedLine, details);
-      }
 
       const output = (response.output as string | undefined) ?? "";
       return bashResult(output, details);
@@ -263,6 +286,42 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
 function bashTransportTimeoutMs(timeout: number | undefined): number {
   const bashTimeout = timeout ?? DEFAULT_BASH_TIMEOUT_MS;
   return Math.max(30_000, bashTimeout + BASH_TRANSPORT_TIMEOUT_OVERHEAD_MS);
+}
+
+function formatBackgroundLaunch(taskId: string): string {
+  return `Background task started: ${taskId}. A completion reminder will be delivered automatically; don't poll bash_status.`;
+}
+
+function formatPromotionMessage(
+  taskId: string,
+  command: string,
+  timeout: number | undefined,
+): string {
+  const waited = timeout ?? DEFAULT_BASH_TIMEOUT_MS;
+  return `Foreground bash exceeded ${waited}ms and was promoted to background: ${taskId}. A completion reminder will be delivered automatically; use bash_status({ task_id: "${taskId}" }) to inspect output or bash_kill({ task_id: "${taskId}" }) to terminate. Command: ${shortenCommand(command)}`;
+}
+
+function formatForegroundResult(data: Record<string, unknown>): string {
+  const output = (data.output_preview as string | undefined) ?? "";
+  const outputPath = data.output_path as string | undefined;
+  const truncated = data.output_truncated === true;
+  const status = data.status as string | undefined;
+  const exit = data.exit_code as number | undefined;
+  let rendered = output;
+  if (truncated && outputPath) {
+    rendered += `\n[output truncated; full output at ${outputPath}]`;
+  }
+  if (status === "timed_out") {
+    rendered += `\n[command timed out]`;
+  }
+  if (typeof exit === "number" && exit !== 0) {
+    rendered += `\n[exit code: ${exit}]`;
+  }
+  return rendered;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export function createBashStatusTool(ctx: PluginContext) {
@@ -372,7 +431,7 @@ function formatBashStatus(taskId: string, details: BashStatusDetails): string {
   return text;
 }
 
-function isTerminalStatus(status: string): boolean {
+function isTerminalStatus(status: unknown): boolean {
   return status !== "running";
 }
 

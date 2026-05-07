@@ -116,6 +116,10 @@ pub struct Config {
     pub experimental_bash_background: bool,
     /// Maximum number of background bash tasks allowed to run concurrently (default: 8).
     pub max_background_bash_tasks: usize,
+    /// Emit reminders for long-running bash tasks (default: true).
+    pub bash_long_running_reminder_enabled: bool,
+    /// Milliseconds between long-running bash reminders (default: 10 minutes).
+    pub bash_long_running_reminder_interval_ms: u64,
     /// Enable OpenCode-style bash permission prompts (default: false).
     pub bash_permissions: bool,
     /// Maximum file size to fully index in bytes (default: 1MB).
@@ -187,6 +191,8 @@ impl Default for Config {
             experimental_bash_compress: false,
             experimental_bash_background: false,
             max_background_bash_tasks: 8,
+            bash_long_running_reminder_enabled: true,
+            bash_long_running_reminder_interval_ms: 600_000,
             bash_permissions: false,
             search_index_max_file_size: 1_048_576,
             // Projects larger than this skip call-graph reverse index construction.

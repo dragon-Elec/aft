@@ -158,7 +158,7 @@ fn attach_bg_completions(
 ) {
     if matches!(
         command,
-        "configure" | "bash_status" | "bash_drain_completions"
+        "configure" | "bash_status" | "bash_promote" | "bash_drain_completions"
     ) {
         return;
     }
@@ -190,6 +190,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "bash" => aft::commands::bash::handle(&req, ctx),
         "bash_drain_completions" => aft::commands::bash_drain_completions::handle(&req, ctx),
         "bash_status" => aft::commands::bash_status::handle(&req, ctx),
+        "bash_promote" => aft::commands::bash_promote::handle(&req, ctx),
         "bash_kill" => aft::commands::bash_kill::handle(&req, ctx),
         "outline" => aft::commands::outline::handle_outline(&req, ctx),
         "zoom" => aft::commands::zoom::handle_zoom(&req, ctx),

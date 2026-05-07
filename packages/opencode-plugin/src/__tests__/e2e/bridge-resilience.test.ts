@@ -48,25 +48,26 @@ maybeDescribe("e2e bridge transport resilience (OpenCode)", () => {
     return created;
   }
 
-  test("a single timed-out request rejects without poisoning a following request", async () => {
+  test("foreground bash returns before a short transport timeout and leaves following requests healthy", async () => {
     const h = await harness();
     await h.bridge.send("ping");
     const firstPid = childPid(h.bridge);
 
-    const timedOut = h.bridge.send(
+    const launched = await h.bridge.send(
       "bash",
       { command: "sleep 1 && echo slow", timeout: 5_000, compressed: false },
       { transportTimeoutMs: 100 },
     );
 
-    await expect(timedOut).rejects.toThrow('Request "bash"');
-    expect(h.bridge.isAlive()).toBe(false);
+    expect(launched.success).toBe(true);
+    expect(launched.status).toBe("running");
+    expect(h.bridge.isAlive()).toBe(true);
 
     const after = await h.bridge.send("read", { file: h.path("sample.txt") });
     expect(after.success).toBe(true);
     expect(String(after.content ?? "")).toContain("alpha");
     expect(h.bridge.isAlive()).toBe(true);
-    expect(childPid(h.bridge)).not.toBe(firstPid);
+    expect(childPid(h.bridge)).toBe(firstPid);
   });
 
   test("recovers with a fresh bridge after external SIGKILL", async () => {
@@ -97,7 +98,18 @@ maybeDescribe("e2e bridge transport resilience (OpenCode)", () => {
       compressed: false,
     });
     expect(commandCollision.success).toBe(true);
-    expect(commandCollision.output).toBe("collision-ok");
+    expect(commandCollision.status).toBe("running");
+    let status: Record<string, unknown> = {};
+    const started = Date.now();
+    while (Date.now() - started < 5_000) {
+      status = await h.bridge.send("bash_status", {
+        task_id: commandCollision.task_id,
+        session_id: "reserved-session",
+      });
+      if (status.status !== "running") break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    expect(status.output_preview).toBe("collision-ok");
 
     const sessionSnapshot = await h.bridge.send("snapshot", {
       file: h.path("sample.txt"),

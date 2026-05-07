@@ -161,6 +161,11 @@ export interface BridgeOptions {
     completion: BashCompletedPayload,
     bridge: BinaryBridge,
   ) => void | Promise<void>;
+  /** Called for server-pushed long-running bash reminders. */
+  onBashLongRunning?: (
+    reminder: BashLongRunningPayload,
+    bridge: BinaryBridge,
+  ) => void | Promise<void>;
   /**
    * Prefix for user-facing error messages thrown by the bridge (e.g. timeout,
    * stdin-write, configure-failure errors). Hosts pass their own tag so the
@@ -172,6 +177,14 @@ export interface BridgeOptions {
 export interface BashCompletedPayload extends BgCompletion {
   type: "bash_completed";
   session_id: string;
+}
+
+export interface BashLongRunningPayload {
+  type: "bash_long_running";
+  task_id: string;
+  session_id: string;
+  command: string;
+  elapsed_ms: number;
 }
 
 export interface BridgeRequestOptions {
@@ -235,6 +248,9 @@ export class BinaryBridge {
   private onBashCompletion:
     | ((completion: BashCompletedPayload, bridge: BinaryBridge) => void | Promise<void>)
     | undefined;
+  private onBashLongRunning:
+    | ((reminder: BashLongRunningPayload, bridge: BinaryBridge) => void | Promise<void>)
+    | undefined;
   /** Notification clients keyed by session_id for async configure warning pushes. */
   private configureWarningClients = new Map<string, unknown>();
   private restartResetTimer: ReturnType<typeof setTimeout> | null = null;
@@ -255,6 +271,7 @@ export class BinaryBridge {
     this.onVersionMismatch = options?.onVersionMismatch;
     this.onConfigureWarnings = options?.onConfigureWarnings;
     this.onBashCompletion = options?.onBashCompletion;
+    this.onBashLongRunning = options?.onBashLongRunning;
     this.errorPrefix = options?.errorPrefix ?? "[aft-bridge]";
   }
 
@@ -721,6 +738,10 @@ export class BinaryBridge {
         }
         if (response.type === "bash_completed") {
           this.onBashCompletion?.(response as unknown as BashCompletedPayload, this);
+          continue;
+        }
+        if (response.type === "bash_long_running") {
+          this.onBashLongRunning?.(response as unknown as BashLongRunningPayload, this);
           continue;
         }
         if (response.type === "configure_warnings") {

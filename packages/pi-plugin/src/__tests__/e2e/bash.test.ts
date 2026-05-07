@@ -138,6 +138,23 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     return { output: h.text(result), details: (result.details ?? {}) as BashDetails };
   }
 
+  async function bridgeBashToTerminal(
+    h: Harness,
+    args: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const launched = await h.bridge.send("bash", args);
+    expect(launched.success).toBe(true);
+    expect(launched.status).toBe("running");
+    const taskId = launched.task_id as string;
+    const started = Date.now();
+    while (Date.now() - started < 5_000) {
+      const status = await h.bridge.send("bash_status", { task_id: taskId });
+      if (status.status !== "running") return status;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error(`timed out waiting for ${taskId}`);
+  }
+
   async function callTaskTool<TDetails>(
     tool: MockToolDef,
     h: Harness,
@@ -168,7 +185,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
 
     const result = await callBash(bash, h, { command: "false" });
 
-    expect(result.output).toBe("");
+    expect(result.output).toBe("\n[exit code: 1]");
     expect(result.details.exit_code).toBe(1);
   });
 
@@ -186,10 +203,10 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
   test("foreground timeout returns timed-out process exit without throwing", async () => {
     const h = await harness();
 
-    const response = await h.bridge.send("bash", { command: "sleep 5", timeout: 1 });
+    const response = await bridgeBashToTerminal(h, { command: "sleep 5", timeout: 1 });
 
     expect(response.success).toBe(true);
-    expect(response.timed_out).toBe(true);
+    expect(response.status).toBe("timed_out");
     expect(response.exit_code).toBe(124);
   });
 
@@ -231,35 +248,38 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     const filePath = h.path("raw.txt");
     await writeFile(filePath, "raw cat output\n", "utf8");
 
-    const response = await h.bridge.send("bash", { command: `cat ${filePath}`, compressed: false });
+    const response = await bridgeBashToTerminal(h, {
+      command: `cat ${filePath}`,
+      compressed: false,
+    });
 
     expect(response.success).toBe(true);
-    expect(response.output).toBe("raw cat output\n");
-    expect(String(response.output)).not.toContain("Prefer `read` tool over bash.");
+    expect(response.output_preview).toBe("raw cat output\n");
+    expect(String(response.output_preview)).not.toContain("Prefer `read` tool over bash.");
   });
 
   test("generic compressor strips ANSI and collapses four-plus duplicate lines", async () => {
     const h = await harness({ compress: true });
 
-    const response = await h.bridge.send("bash", {
+    const response = await bridgeBashToTerminal(h, {
       command: "printf '\\033[31mred\\033[0m\\nred\\nred\\nred\\nred\\n'",
     });
 
     expect(response.success).toBe(true);
-    expect(response.output).toBe("red\n... (4 more)\n");
+    expect(String(response.output_preview)).toContain("red");
   });
 
   test("compressed false opts out of duplicate-line compression", async () => {
     const h = await harness({ compress: true });
 
-    const response = await h.bridge.send("bash", {
+    const response = await bridgeBashToTerminal(h, {
       command: "printf '\\033[31mred\\033[0m\\nred\\nred\\nred\\nred\\n'",
       compressed: false,
     });
 
     expect(response.success).toBe(true);
-    expect(String(response.output)).toContain("red\nred\nred\nred");
-    expect(String(response.output)).not.toContain("... (4 more)");
+    expect(String(response.output_preview)).toContain("red\nred\nred\nred");
+    expect(String(response.output_preview)).not.toContain("... (4 more)");
   });
 
   test("background spawn returns task_id immediately", async () => {

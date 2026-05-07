@@ -53,6 +53,7 @@ pub(crate) fn start(registry: BgTaskRegistry) {
                     continue;
                 }
 
+                registry.maybe_emit_long_running_reminder(&task);
                 registry.reap_child(&task);
             }
         }

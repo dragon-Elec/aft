@@ -578,6 +578,11 @@ with `bash_kill({ "task_id": "..." })`. Completed-but-unread tasks surface in
 and spills beyond that to AFT's bash-output cache (default `~/.cache/aft/bash-output/<task_id>.log`,
 or the harness storage directory when configured).
 
+Foreground bash now also starts through the same task flow. Short commands are polled by the
+plugin and return inline output as before; commands that exceed the foreground wait budget are
+automatically promoted to background and return a `task_id` to inspect with `bash_status` or stop
+with `bash_kill`.
+
 **Permissions (OpenCode only)** — bash uses tree-sitter to parse the command into sub-commands
 and asks for permission per sub-command via `ctx.ask({ permission: "bash", patterns, always })`.
 File-touching commands (`rm`, `cp`, `mv`, etc.) also fire

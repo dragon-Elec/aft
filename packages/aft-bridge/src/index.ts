@@ -11,6 +11,7 @@
 export { setActiveLogger } from "./active-logger.js";
 export type {
   BashCompletedPayload,
+  BashLongRunningPayload,
   BridgeOptions,
   BridgeRequestOptions,
   ConfigureWarning,

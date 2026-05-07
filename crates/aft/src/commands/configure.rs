@@ -1120,6 +1120,32 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             }
         }
     }
+    if let Some(v) = params
+        .get("bash_long_running_reminder_enabled")
+        .and_then(|v| v.as_bool())
+    {
+        ctx.config_mut().bash_long_running_reminder_enabled = v;
+    }
+    if let Some(raw) = params.get("bash_long_running_reminder_interval_ms") {
+        let parsed = raw.as_u64().filter(|v| *v >= 1);
+        match parsed {
+            Some(v) => ctx.config_mut().bash_long_running_reminder_interval_ms = v,
+            None => {
+                return Response::error(
+                    &req.id,
+                    "invalid_request",
+                    format!(
+                        "bash_long_running_reminder_interval_ms must be a positive integer (>= 1); got {}",
+                        raw
+                    ),
+                );
+            }
+        }
+    }
+    ctx.bash_background().configure_long_running_reminders(
+        ctx.config().bash_long_running_reminder_enabled,
+        ctx.config().bash_long_running_reminder_interval_ms,
+    );
 
     // The full source-file walk (used to detect languages and warn about
     // missing formatter/checker/LSP binaries) used to run synchronously here

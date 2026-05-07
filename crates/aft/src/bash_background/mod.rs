@@ -58,8 +58,10 @@ pub fn spawn(
     env: Option<HashMap<String, String>>,
     timeout_ms: Option<u64>,
     ctx: &AppContext,
+    require_background_flag: bool,
+    notify_on_completion: bool,
 ) -> Response {
-    if !ctx.config().experimental_bash_background {
+    if require_background_flag && !ctx.config().experimental_bash_background {
         return Response::error(
             request_id,
             "feature_disabled",
@@ -84,6 +86,7 @@ pub fn spawn(
         timeout,
         storage_dir,
         max_running,
+        notify_on_completion,
     ) {
         Ok(task_id) => Response::success(
             request_id,

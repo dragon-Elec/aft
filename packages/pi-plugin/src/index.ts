@@ -45,6 +45,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import {
   appendToolResultBgCompletions,
   handlePushedBgCompletion,
+  handlePushedBgLongRunning,
   handleTurnEndBgCompletions,
   resetBgWake,
 } from "./bg-notifications.js";
@@ -89,6 +90,17 @@ import { registerSemanticTool } from "./tools/semantic.js";
 import { registerStructureTool } from "./tools/structure.js";
 import type { PluginContext } from "./types.js";
 import { registerWorkflowHints } from "./workflow-hints.js";
+
+type BashLongRunningPayload = {
+  session_id: string;
+  task_id: string;
+  command: string;
+  elapsed_ms: number;
+};
+
+type BridgePendingState = {
+  hasPendingRequests(): boolean;
+};
 
 /** Plugin version from package.json. */
 const PLUGIN_VERSION: string = (() => {
@@ -438,36 +450,47 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     warn(`[lsp] auto-install setup failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  const pool = new BridgePool(
-    binaryPath,
-    {
-      errorPrefix: "[aft-pi]",
-      minVersion: PLUGIN_VERSION,
-      onConfigureWarnings: async ({ projectRoot, sessionId, client, warnings }) => {
-        await handleConfigureWarningsForSession({
-          projectRoot,
-          sessionId,
-          client,
-          warnings,
-          storageDir,
-          pluginVersion: PLUGIN_VERSION,
-        });
-      },
-      onBashCompletion: (completion, bridge) => {
-        void handlePushedBgCompletion(
-          {
-            ctx,
-            directory: process.cwd(),
-            sessionID: completion.session_id,
-            runtime: pi,
-            isActive: () => bridge.hasPendingRequests(),
-          },
-          completion,
-        );
-      },
+  const poolOptions: import("@cortexkit/aft-bridge").PoolOptions & {
+    onBashLongRunning: (reminder: BashLongRunningPayload, bridge: BridgePendingState) => void;
+  } = {
+    errorPrefix: "[aft-pi]",
+    minVersion: PLUGIN_VERSION,
+    onConfigureWarnings: async ({ projectRoot, sessionId, client, warnings }) => {
+      await handleConfigureWarningsForSession({
+        projectRoot,
+        sessionId,
+        client,
+        warnings,
+        storageDir,
+        pluginVersion: PLUGIN_VERSION,
+      });
     },
-    configOverrides,
-  );
+    onBashCompletion: (completion, bridge) => {
+      void handlePushedBgCompletion(
+        {
+          ctx,
+          directory: process.cwd(),
+          sessionID: completion.session_id,
+          runtime: pi,
+          isActive: () => bridge.hasPendingRequests(),
+        },
+        completion,
+      );
+    },
+    onBashLongRunning: (reminder, bridge) => {
+      void handlePushedBgLongRunning(
+        {
+          ctx,
+          directory: process.cwd(),
+          sessionID: reminder.session_id,
+          runtime: pi,
+          isActive: () => bridge.hasPendingRequests(),
+        },
+        reminder,
+      );
+    },
+  };
+  const pool = new BridgePool(binaryPath, poolOptions, configOverrides);
   const ctx: PluginContext = { pool, config, storageDir };
 
   // Settle the ONNX runtime download promise (started above) and patch the

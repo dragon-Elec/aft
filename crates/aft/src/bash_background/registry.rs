@@ -2,14 +2,14 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
 use crate::context::SharedProgressSender;
-use crate::protocol::{BashCompletedFrame, PushFrame};
+use crate::protocol::{BashCompletedFrame, BashLongRunningFrame, PushFrame};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -98,6 +98,8 @@ pub(crate) struct RegistryInner {
     pub(crate) progress_sender: SharedProgressSender,
     watchdog_started: AtomicBool,
     pub(crate) shutdown: AtomicBool,
+    pub(crate) long_running_reminder_enabled: AtomicBool,
+    pub(crate) long_running_reminder_interval_ms: AtomicU64,
 }
 
 pub(crate) struct BgTask {
@@ -105,6 +107,7 @@ pub(crate) struct BgTask {
     pub(crate) session_id: String,
     pub(crate) paths: TaskPaths,
     pub(crate) started: Instant,
+    pub(crate) last_reminder_at: Mutex<Option<Instant>>,
     pub(crate) terminal_at: Mutex<Option<Instant>>,
     pub(crate) state: Mutex<BgTaskState>,
 }
@@ -125,8 +128,19 @@ impl BgTaskRegistry {
                 progress_sender,
                 watchdog_started: AtomicBool::new(false),
                 shutdown: AtomicBool::new(false),
+                long_running_reminder_enabled: AtomicBool::new(true),
+                long_running_reminder_interval_ms: AtomicU64::new(600_000),
             }),
         }
+    }
+
+    pub fn configure_long_running_reminders(&self, enabled: bool, interval_ms: u64) {
+        self.inner
+            .long_running_reminder_enabled
+            .store(enabled, Ordering::SeqCst);
+        self.inner
+            .long_running_reminder_interval_ms
+            .store(interval_ms, Ordering::SeqCst);
     }
 
     #[cfg(unix)]
@@ -139,6 +153,7 @@ impl BgTaskRegistry {
         timeout: Option<Duration>,
         storage_dir: PathBuf,
         max_running: usize,
+        notify_on_completion: bool,
     ) -> Result<String, String> {
         self.start_watchdog();
 
@@ -162,6 +177,7 @@ impl BgTaskRegistry {
             command.to_string(),
             workdir.clone(),
             timeout_ms,
+            notify_on_completion,
         );
         write_task(&paths.json, &metadata)
             .map_err(|e| format!("failed to persist background task metadata: {e}"))?;
@@ -186,6 +202,7 @@ impl BgTaskRegistry {
             session_id,
             paths: paths.clone(),
             started: Instant::now(),
+            last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
             state: Mutex::new(BgTaskState {
                 metadata,
@@ -214,6 +231,7 @@ impl BgTaskRegistry {
         timeout: Option<Duration>,
         storage_dir: PathBuf,
         max_running: usize,
+        notify_on_completion: bool,
     ) -> Result<String, String> {
         self.start_watchdog();
 
@@ -237,6 +255,7 @@ impl BgTaskRegistry {
             command.to_string(),
             workdir.clone(),
             timeout_ms,
+            notify_on_completion,
         );
         write_task(&paths.json, &metadata)
             .map_err(|e| format!("failed to persist background task metadata: {e}"))?;
@@ -265,6 +284,7 @@ impl BgTaskRegistry {
             session_id,
             paths: paths.clone(),
             started: Instant::now(),
+            last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
             state: Mutex::new(BgTaskState {
                 metadata,
@@ -383,6 +403,27 @@ impl BgTaskRegistry {
 
     pub fn kill(&self, task_id: &str, session_id: &str) -> Result<BgTaskSnapshot, String> {
         self.kill_with_status(task_id, session_id, BgTaskStatus::Killed)
+    }
+
+    pub fn promote(&self, task_id: &str, session_id: &str) -> Result<bool, String> {
+        let task = self
+            .task_for_session(task_id, session_id)
+            .ok_or_else(|| format!("background task not found: {task_id}"))?;
+        let mut state = task
+            .state
+            .lock()
+            .map_err(|_| "background task lock poisoned".to_string())?;
+        let updated = update_task(&task.paths.json, |metadata| {
+            metadata.notify_on_completion = true;
+            metadata.completion_delivered = false;
+        })
+        .map_err(|e| format!("failed to promote background task: {e}"))?;
+        state.metadata = updated;
+        if state.metadata.status.is_terminal() {
+            state.buffer.enforce_terminal_cap();
+            self.enqueue_completion_locked(&state.metadata, Some(&state.buffer), true);
+        }
+        Ok(true)
     }
 
     pub(crate) fn kill_for_timeout(&self, task_id: &str, session_id: &str) -> Result<(), String> {
@@ -576,6 +617,7 @@ impl BgTaskRegistry {
             session_id,
             paths: paths.clone(),
             started: Instant::now(),
+            last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(metadata.status.is_terminal().then(Instant::now)),
             state: Mutex::new(BgTaskState {
                 metadata,
@@ -759,6 +801,58 @@ impl BgTaskRegistry {
             completion.output_preview,
             completion.output_truncated,
         )));
+    }
+
+    pub(crate) fn maybe_emit_long_running_reminder(&self, task: &Arc<BgTask>) {
+        if !self
+            .inner
+            .long_running_reminder_enabled
+            .load(Ordering::SeqCst)
+        {
+            return;
+        }
+        let interval_ms = self
+            .inner
+            .long_running_reminder_interval_ms
+            .load(Ordering::SeqCst);
+        if interval_ms == 0 {
+            return;
+        }
+        let interval = Duration::from_millis(interval_ms);
+        let now = Instant::now();
+        let Ok(mut last_reminder_at) = task.last_reminder_at.lock() else {
+            return;
+        };
+        let since = last_reminder_at.unwrap_or(task.started);
+        if now.duration_since(since) < interval {
+            return;
+        }
+        let command = task
+            .state
+            .lock()
+            .map(|state| state.metadata.command.clone())
+            .unwrap_or_default();
+        *last_reminder_at = Some(now);
+        self.emit_bash_long_running(BashLongRunningFrame::new(
+            task.task_id.clone(),
+            task.session_id.clone(),
+            command,
+            task.started.elapsed().as_millis() as u64,
+        ));
+    }
+
+    fn emit_bash_long_running(&self, frame: BashLongRunningFrame) {
+        let Ok(progress_sender) = self
+            .inner
+            .progress_sender
+            .lock()
+            .map(|sender| sender.clone())
+        else {
+            return;
+        };
+        if let Some(sender) = progress_sender.as_ref() {
+            sender(PushFrame::BashLongRunning(frame));
+        }
     }
 
     fn task(&self, task_id: &str) -> Option<Arc<BgTask>> {
@@ -1236,6 +1330,7 @@ mod tests {
                 Some(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
+                true,
             )
             .unwrap();
         registry
@@ -1269,6 +1364,7 @@ mod tests {
                 Some(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
+                true,
             )
             .unwrap();
 
@@ -1362,6 +1458,7 @@ mod tests {
                 Some(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
+                true,
             )
             .unwrap();
 
@@ -1427,6 +1524,7 @@ mod tests {
                 Some(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
+                true,
             )
             .unwrap();
 

@@ -15,9 +15,17 @@ export interface BgCompletion {
   output_truncated?: boolean;
 }
 
+export interface BgLongRunningReminder {
+  task_id: string;
+  session_id: string;
+  command: string;
+  elapsed_ms: number;
+}
+
 type SessionBgState = {
   outstandingTaskIds: Set<string>;
   pendingCompletions: BgCompletion[];
+  pendingLongRunning: BgLongRunningReminder[];
   debounceTimer: NodeJS.Timeout | null;
   wakeFiredThisIdle: boolean;
   firstCompletionAt: number | null;
@@ -104,21 +112,35 @@ export async function handlePushedBgCompletion(
   await triggerWakeIfPending(drainContext, true);
 }
 
+export async function handlePushedBgLongRunning(
+  drainContext: DrainContext & { runtime: SendUserMessageRuntime },
+  reminder: BgLongRunningReminder,
+): Promise<void> {
+  stateFor(drainContext.sessionID).pendingLongRunning.push(reminder);
+  await triggerWakeIfPending(drainContext, true);
+}
+
 export async function appendToolResultBgCompletions(
   drainContext: DrainContext,
   content: ContentBlock[],
 ): Promise<ContentBlock[] | undefined> {
   const state = stateFor(drainContext.sessionID);
-  if (state.outstandingTaskIds.size === 0 && state.pendingCompletions.length === 0)
+  if (
+    state.outstandingTaskIds.size === 0 &&
+    state.pendingCompletions.length === 0 &&
+    state.pendingLongRunning.length === 0
+  )
     return undefined;
 
   if (state.outstandingTaskIds.size > 0) {
     await drainCompletions(drainContext);
   }
-  if (state.pendingCompletions.length === 0) return undefined;
+  if (state.pendingCompletions.length === 0 && state.pendingLongRunning.length === 0)
+    return undefined;
 
-  const reminder = formatSystemReminder(state.pendingCompletions);
+  const reminder = formatCombinedSystemReminder(state.pendingCompletions, state.pendingLongRunning);
   state.pendingCompletions = [];
+  state.pendingLongRunning = [];
   return [...content, { type: "text", text: reminder }];
 }
 
@@ -139,7 +161,7 @@ async function triggerWakeIfPending(
   if (!skipDrain && state.outstandingTaskIds.size > 0) {
     await drainCompletions(drainContext);
   }
-  if (state.pendingCompletions.length === 0) return;
+  if (state.pendingCompletions.length === 0 && state.pendingLongRunning.length === 0) return;
 
   scheduleWake(
     state,
@@ -189,6 +211,25 @@ export function formatSystemReminder(completions: readonly BgCompletion[]): stri
   return `<system-reminder>\n[BACKGROUND BASH COMPLETED]\n${bullets}${tail}\n</system-reminder>`;
 }
 
+export function formatLongRunningReminder(reminders: readonly BgLongRunningReminder[]): string {
+  const bullets = reminders
+    .map(
+      (reminder) =>
+        `- ${reminder.task_id} still running after ${formatDurationMs(reminder.elapsed_ms)}: ${shorten(reminder.command, 120)}`,
+    )
+    .join("\n");
+  return `<system-reminder>\n[BACKGROUND BASH STILL RUNNING]\n${bullets}\nUse bash_status({ task_id: "..." }) to inspect output or bash_kill({ task_id: "..." }) to terminate.\n</system-reminder>`;
+}
+
+function formatCombinedSystemReminder(
+  completions: readonly BgCompletion[],
+  longRunning: readonly BgLongRunningReminder[],
+): string {
+  if (completions.length === 0) return formatLongRunningReminder(longRunning);
+  if (longRunning.length === 0) return formatSystemReminder(completions);
+  return `${formatSystemReminder(completions)}\n${formatLongRunningReminder(longRunning)}`;
+}
+
 export function __resetBgNotificationStateForTests(): void {
   for (const state of sessionBgStates.values()) {
     if (state.debounceTimer) clearTimeout(state.debounceTimer);
@@ -226,7 +267,8 @@ function scheduleWake(
   // drains and during final user-message delivery. Multiple hook invocations can
   // interleave only at those awaits, so we gate timer extension on completion count.
   const now = Date.now();
-  if (state.debounceTimer && state.pendingCompletions.length <= state.scheduledCompletionCount) {
+  const pendingCount = state.pendingCompletions.length + state.pendingLongRunning.length;
+  if (state.debounceTimer && pendingCount <= state.scheduledCompletionCount) {
     return;
   }
   if (state.firstCompletionAt === null) {
@@ -239,14 +281,16 @@ function scheduleWake(
       state.firstCompletionAt + DEBOUNCE_CAP_MS,
     );
   }
-  state.scheduledCompletionCount = state.pendingCompletions.length;
+  state.scheduledCompletionCount = pendingCount;
 
   if (state.debounceTimer) clearTimeout(state.debounceTimer);
   const delay = state.retryDelayMs ?? Math.max(0, (state.scheduledFireAt ?? now) - now);
   state.debounceTimer = setTimeout(() => {
     const pending = state.pendingCompletions;
-    const reminder = formatSystemReminder(pending);
+    const pendingLongRunning = state.pendingLongRunning;
+    const reminder = formatCombinedSystemReminder(pending, pendingLongRunning);
     state.pendingCompletions = [];
+    state.pendingLongRunning = [];
     state.debounceTimer = null;
     state.firstCompletionAt = null;
     state.scheduledFireAt = null;
@@ -258,6 +302,7 @@ function scheduleWake(
       })
       .catch((err) => {
         state.pendingCompletions = [...pending, ...state.pendingCompletions];
+        state.pendingLongRunning = [...pendingLongRunning, ...state.pendingLongRunning];
         state.retryDelayMs = Math.min((delay || DEBOUNCE_STEP_MS) * 2, DEBOUNCE_CAP_MS);
         onSendFailure(err);
         scheduleWake(state, sendWake, onSendFailure);
@@ -275,6 +320,7 @@ function stateFor(sessionID: string | undefined): SessionBgState {
     state = {
       outstandingTaskIds: new Set(),
       pendingCompletions: [],
+      pendingLongRunning: [],
       debounceTimer: null,
       wakeFiredThisIdle: false,
       firstCompletionAt: null,
@@ -372,4 +418,16 @@ function formatDuration(completion: BgCompletion): string | null {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+
+function formatDurationMs(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
+  const totalSeconds = Math.round(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+
+function shorten(value: string, limit: number): string {
+  return value.length <= limit ? value : `${value.slice(0, limit - 1)}…`;
 }

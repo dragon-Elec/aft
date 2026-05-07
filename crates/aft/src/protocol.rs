@@ -59,6 +59,16 @@ pub struct BashCompletedFrame {
     pub output_truncated: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct BashLongRunningFrame {
+    #[serde(rename = "type")]
+    pub frame_type: &'static str,
+    pub task_id: String,
+    pub session_id: String,
+    pub command: String,
+    pub elapsed_ms: u64,
+}
+
 /// Pushed after configure has completed, when the deferred file walk and
 /// language detection produce warnings (missing formatter/checker/LSP binaries,
 /// or "project too large" file-count exceeded). The walk runs in a background
@@ -95,6 +105,7 @@ pub struct ConfigureWarningsFrame {
 pub enum PushFrame {
     Progress(ProgressFrame),
     BashCompleted(BashCompletedFrame),
+    BashLongRunning(BashLongRunningFrame),
     ConfigureWarnings(ConfigureWarningsFrame),
 }
 
@@ -246,6 +257,23 @@ impl BashCompletedFrame {
             command: command.into(),
             output_preview: output_preview.into(),
             output_truncated,
+        }
+    }
+}
+
+impl BashLongRunningFrame {
+    pub fn new(
+        task_id: impl Into<String>,
+        session_id: impl Into<String>,
+        command: impl Into<String>,
+        elapsed_ms: u64,
+    ) -> Self {
+        Self {
+            frame_type: "bash_long_running",
+            task_id: task_id.into(),
+            session_id: session_id.into(),
+            command: command.into(),
+            elapsed_ms,
         }
     }
 }

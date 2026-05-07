@@ -11,6 +11,7 @@ const z = tool.schema;
 const METADATA_PREVIEW_LIMIT = 30 * 1024;
 const DEFAULT_BASH_TIMEOUT_MS = 30_000;
 const BASH_TRANSPORT_TIMEOUT_OVERHEAD_MS = 5_000;
+const FOREGROUND_POLL_INTERVAL_MS = 100;
 
 const BASH_DESCRIPTION = `Hoisted bash tool with output compression, command rewriting to AFT tools, and optional background execution. By default, output is compressed; pass compressed: false for raw output. Pass background: true to spawn in the background and get a task_id for bash_status/bash_kill.`;
 
@@ -122,6 +123,7 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
           env: shellEnv?.env ?? {},
           description,
           background: args.background,
+          notify_on_completion: args.background === true,
           compressed: args.compressed,
           permissions_requested: true,
         },
@@ -145,33 +147,65 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
         throw new Error((data.message as string) || "bash failed");
       }
 
-      // Background spawn path: Rust returns { status: "running", task_id }
-      // with no output. Surface a concise status line so the agent knows the
-      // task started; details (exit, output) come back later via bg_completions
-      // appended to a future foreground call.
-      //
-      // The "completion reminder will be delivered automatically; don't poll
-      // bash_status" sentence is load-bearing: without it, agents fall back to
-      // their default training behavior (poll a status endpoint to wait for an
-      // async task) and end up calling bash_status back-to-back instead of
-      // continuing with other work or ending the turn. We tell the agent the
-      // mechanism exists and which anti-pattern to avoid; we deliberately do
-      // NOT prescribe what to do instead, because that's a context-dependent
-      // decision the agent owns.
       if (data.status === "running" && typeof data.task_id === "string") {
         const callID = getCallID(context);
         const taskId = data.task_id;
-        trackBgTask(context.sessionID, taskId);
-        const startedLine = `Background task started: ${taskId}. A completion reminder will be delivered automatically; don't poll bash_status.`;
-        const metadataPayload = { description, output: startedLine, status: "running", taskId };
-        metadata?.(metadataPayload);
-        if (callID) {
-          storeToolMetadata(context.sessionID, callID, {
-            title: description ?? shortenCommand(command),
-            metadata: metadataPayload,
-          });
+        if (args.background === true) {
+          trackBgTask(context.sessionID, taskId);
+          const startedLine = formatBackgroundLaunch(taskId);
+          const metadataPayload = { description, output: startedLine, status: "running", taskId };
+          metadata?.(metadataPayload);
+          if (callID) {
+            storeToolMetadata(context.sessionID, callID, {
+              title: description ?? shortenCommand(command),
+              metadata: metadataPayload,
+            });
+          }
+          return startedLine;
         }
-        return startedLine;
+
+        const waitTimeoutMs = (args.timeout as number | undefined) ?? DEFAULT_BASH_TIMEOUT_MS;
+        const startedAt = Date.now();
+        while (true) {
+          const status = await callBridge(ctx, context, "bash_status", { task_id: taskId });
+          if (status.success === false) {
+            throw new Error((status.message as string | undefined) ?? "bash_status failed");
+          }
+          if (isTerminalStatus(status.status)) {
+            const rendered = formatForegroundResult(status);
+            const metadataPayload = foregroundMetadata(description, status, rendered);
+            metadata?.(metadataPayload);
+            if (callID) {
+              storeToolMetadata(context.sessionID, callID, {
+                title: description ?? shortenCommand(command),
+                metadata: metadataPayload,
+              });
+            }
+            return rendered;
+          }
+          if (Date.now() - startedAt >= waitTimeoutMs) {
+            const promoted = await callBridge(ctx, context, "bash_promote", { task_id: taskId });
+            if (promoted.success === false) {
+              throw new Error((promoted.message as string | undefined) ?? "bash_promote failed");
+            }
+            trackBgTask(context.sessionID, taskId);
+            const message = formatPromotionMessage(
+              taskId,
+              command,
+              args.timeout as number | undefined,
+            );
+            const metadataPayload = { description, output: message, status: "running", taskId };
+            metadata?.(metadataPayload);
+            if (callID) {
+              storeToolMetadata(context.sessionID, callID, {
+                title: description ?? shortenCommand(command),
+                metadata: metadataPayload,
+              });
+            }
+            return message;
+          }
+          await sleep(FOREGROUND_POLL_INTERVAL_MS);
+        }
       }
 
       const output = (data.output as string | undefined) ?? "";
@@ -286,6 +320,63 @@ function bashTransportTimeoutMs(timeout: number | undefined): number {
 
 function preview(output: string): string {
   return output.length <= METADATA_PREVIEW_LIMIT ? output : output.slice(-METADATA_PREVIEW_LIMIT);
+}
+
+function isTerminalStatus(status: unknown): boolean {
+  return (
+    status === "completed" || status === "failed" || status === "killed" || status === "timed_out"
+  );
+}
+
+function formatBackgroundLaunch(taskId: string): string {
+  return `Background task started: ${taskId}. A completion reminder will be delivered automatically; don't poll bash_status.`;
+}
+
+function formatPromotionMessage(
+  taskId: string,
+  command: string,
+  timeout: number | undefined,
+): string {
+  const waited = timeout ?? DEFAULT_BASH_TIMEOUT_MS;
+  return `Foreground bash exceeded ${waited}ms and was promoted to background: ${taskId}. A completion reminder will be delivered automatically; use bash_status({ taskId: "${taskId}" }) to inspect output or bash_kill({ taskId: "${taskId}" }) to terminate. Command: ${shortenCommand(command)}`;
+}
+
+function formatForegroundResult(data: Record<string, unknown>): string {
+  const output = (data.output_preview as string | undefined) ?? "";
+  const outputPath = data.output_path as string | undefined;
+  const truncated = data.output_truncated === true;
+  const status = data.status as string | undefined;
+  const exit = data.exit_code as number | undefined;
+  let rendered = output;
+  if (truncated && outputPath) {
+    rendered += `\n[output truncated; full output at ${outputPath}]`;
+  }
+  if (status === "timed_out") {
+    rendered += `\n[command timed out]`;
+  }
+  if (typeof exit === "number" && exit !== 0) {
+    rendered += `\n[exit code: ${exit}]`;
+  }
+  return rendered;
+}
+
+function foregroundMetadata(
+  description: string | undefined,
+  data: Record<string, unknown>,
+  rendered: string,
+): Record<string, unknown> {
+  const outputPath = data.output_path as string | undefined;
+  return {
+    description,
+    output: preview(rendered),
+    exit: data.exit_code as number | undefined,
+    truncated: data.output_truncated as boolean | undefined,
+    ...(outputPath ? { outputPath } : {}),
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function getCallID(ctx: unknown): string | undefined {

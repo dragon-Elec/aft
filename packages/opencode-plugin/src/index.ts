@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import {
   BridgePool,
+  cleanupUrlCache,
   ensureBinary,
   ensureOnnxRuntime,
   findBinary,
@@ -18,6 +19,7 @@ import {
   extractSessionID,
   handleIdleBgCompletions,
   handlePushedBgCompletion,
+  handlePushedBgLongRunning,
   resetBgWake,
 } from "./bg-notifications.js";
 import {
@@ -27,13 +29,6 @@ import {
 } from "./config.js";
 import { createAutoUpdateCheckerHook } from "./hooks/auto-update-checker/index.js";
 import { bridgeLogger, error, log, warn } from "./logger.js";
-
-// Register our logger with @cortexkit/aft-bridge before any bridge code runs.
-// Module side-effect: import order matters because BridgePool / BinaryBridge
-// internals call the active-logger helpers (log/warn/error) from constructors.
-setActiveLogger(bridgeLogger);
-
-import { cleanupUrlCache } from "@cortexkit/aft-bridge";
 import { abortInFlightAutoInstalls, runAutoInstall } from "./lsp-auto-install.js";
 import {
   abortInFlightGithubInstalls,
@@ -75,6 +70,22 @@ import { semanticTools } from "./tools/semantic.js";
 import { structureTools } from "./tools/structure.js";
 import type { PluginContext } from "./types.js";
 import { buildHintsFromConfig } from "./workflow-hints.js";
+
+type BashLongRunningPayload = {
+  session_id: string;
+  task_id: string;
+  command: string;
+  elapsed_ms: number;
+};
+
+type BridgePendingState = {
+  hasPendingRequests(): boolean;
+};
+
+// Register our logger with @cortexkit/aft-bridge before any bridge code runs.
+// Module side-effect: import order matters because BridgePool / BinaryBridge
+// internals call the active-logger helpers (log/warn/error) from constructors.
+setActiveLogger(bridgeLogger);
 
 const STATUS_COMMAND = "aft-status";
 const SENTINEL_PREFIX = "__AFT_STATUS_";
@@ -374,79 +385,89 @@ const plugin: Plugin = async (input) => {
   // respawn with same binary → mismatch fires again → kills again → 3-attempt limit.
   let versionUpgradeAttempted: string | null = null;
 
-  const pool = new BridgePool(
-    binaryPath,
-    {
-      errorPrefix: "[aft-plugin]",
-      minVersion: PLUGIN_VERSION,
-      onVersionMismatch: (binaryVersion, minVersion) => {
-        if (versionUpgradeAttempted === binaryVersion) {
-          log(
-            `Version ${binaryVersion} < ${minVersion} but upgrade already attempted — continuing`,
-          );
-          return;
-        }
-        versionUpgradeAttempted = binaryVersion;
-        warn(
-          `WARNING: aft binary v${binaryVersion} is older than plugin v${minVersion}. ` +
-            "Some features may not work. Attempting to download a compatible binary...",
-        );
-        // Fire-and-forget: try to download matching version and hot-swap
-        ensureBinary(`v${minVersion}`).then(
-          (path) => {
-            if (path) {
-              log(`Found/downloaded compatible binary at ${path}. Replacing running bridges...`);
-              pool.replaceBinary(path).then(
-                () => {
-                  // Don't reset versionUpgradeAttempted here — the new binary might also be
-                  // outdated. The tracker resets naturally when a new plugin version loads
-                  // (fresh plugin init creates a new closure). This prevents re-triggering
-                  // the same upgrade attempt on subsequent tool calls.
-                  log("Binary replaced successfully. New bridges will use the updated binary.");
-                },
-                (err) => error("Failed to replace binary:", err),
-              );
-            } else {
-              warn(`Could not find or download v${minVersion}. Continuing with v${binaryVersion}.`);
-            }
-          },
-          (err) => {
-            error(
-              `Auto-download failed: ${(err as Error).message}. Install manually: cargo install agent-file-tools@${minVersion}`,
+  const poolOptions: import("@cortexkit/aft-bridge").PoolOptions & {
+    onBashLongRunning: (reminder: BashLongRunningPayload, bridge: BridgePendingState) => void;
+  } = {
+    errorPrefix: "[aft-plugin]",
+    minVersion: PLUGIN_VERSION,
+    onVersionMismatch: (binaryVersion, minVersion) => {
+      if (versionUpgradeAttempted === binaryVersion) {
+        log(`Version ${binaryVersion} < ${minVersion} but upgrade already attempted — continuing`);
+        return;
+      }
+      versionUpgradeAttempted = binaryVersion;
+      warn(
+        `WARNING: aft binary v${binaryVersion} is older than plugin v${minVersion}. ` +
+          "Some features may not work. Attempting to download a compatible binary...",
+      );
+      // Fire-and-forget: try to download matching version and hot-swap
+      ensureBinary(`v${minVersion}`).then(
+        (path) => {
+          if (path) {
+            log(`Found/downloaded compatible binary at ${path}. Replacing running bridges...`);
+            pool.replaceBinary(path).then(
+              () => {
+                // Don't reset versionUpgradeAttempted here — the new binary might also be
+                // outdated. The tracker resets naturally when a new plugin version loads
+                // (fresh plugin init creates a new closure). This prevents re-triggering
+                // the same upgrade attempt on subsequent tool calls.
+                log("Binary replaced successfully. New bridges will use the updated binary.");
+              },
+              (err) => error("Failed to replace binary:", err),
             );
-          },
-        );
-      },
-      onConfigureWarnings: async ({ projectRoot, sessionId, client, warnings }) => {
-        await handleConfigureWarningsForSession({
-          projectRoot,
-          sessionId,
-          client,
-          warnings,
-          fallbackClient: input.client,
-          storageDir: configOverrides.storage_dir as string,
-          pluginVersion: PLUGIN_VERSION,
-        });
-      },
-      onBashCompletion: (completion, bridge) => {
-        // Prefer the cached session directory; fall back to plugin-init cwd
-        // when we haven't seen this session yet (e.g. completion arriving
-        // before any tool call has populated the cache).
-        const sessionDir = getSessionDirectoryCached(completion.session_id) ?? input.directory;
-        void handlePushedBgCompletion(
-          {
-            ctx,
-            directory: sessionDir,
-            sessionID: completion.session_id,
-            client: input.client,
-            isActive: () => bridge.hasPendingRequests(),
-          },
-          completion,
-        );
-      },
+          } else {
+            warn(`Could not find or download v${minVersion}. Continuing with v${binaryVersion}.`);
+          }
+        },
+        (err) => {
+          error(
+            `Auto-download failed: ${(err as Error).message}. Install manually: cargo install agent-file-tools@${minVersion}`,
+          );
+        },
+      );
     },
-    configOverrides,
-  );
+    onConfigureWarnings: async ({ projectRoot, sessionId, client, warnings }) => {
+      await handleConfigureWarningsForSession({
+        projectRoot,
+        sessionId,
+        client,
+        warnings,
+        fallbackClient: input.client,
+        storageDir: configOverrides.storage_dir as string,
+        pluginVersion: PLUGIN_VERSION,
+      });
+    },
+    onBashCompletion: (completion, bridge) => {
+      // Prefer the cached session directory; fall back to plugin-init cwd
+      // when we haven't seen this session yet (e.g. completion arriving
+      // before any tool call has populated the cache).
+      const sessionDir = getSessionDirectoryCached(completion.session_id) ?? input.directory;
+      void handlePushedBgCompletion(
+        {
+          ctx,
+          directory: sessionDir,
+          sessionID: completion.session_id,
+          client: input.client,
+          isActive: () => bridge.hasPendingRequests(),
+        },
+        completion,
+      );
+    },
+    onBashLongRunning: (reminder, bridge) => {
+      const sessionDir = getSessionDirectoryCached(reminder.session_id) ?? input.directory;
+      void handlePushedBgLongRunning(
+        {
+          ctx,
+          directory: sessionDir,
+          sessionID: reminder.session_id,
+          client: input.client,
+          isActive: () => bridge.hasPendingRequests(),
+        },
+        reminder,
+      );
+    },
+  };
+  const pool = new BridgePool(binaryPath, poolOptions, configOverrides);
   const ctx: PluginContext = {
     pool,
     client: input.client,

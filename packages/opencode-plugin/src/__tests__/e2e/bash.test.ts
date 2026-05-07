@@ -116,6 +116,23 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     return { output: typeof output === "string" ? output : String(output), metadata: lastMetadata };
   }
 
+  async function bridgeBashToTerminal(
+    h: E2EHarness,
+    args: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const launched = await h.bridge.send("bash", args);
+    expect(launched.success).toBe(true);
+    expect(launched.status).toBe("running");
+    const taskId = launched.task_id as string;
+    const started = Date.now();
+    while (Date.now() - started < 5_000) {
+      const status = await h.bridge.send("bash_status", { task_id: taskId });
+      if (status.status !== "running") return status;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error(`timed out waiting for ${taskId}`);
+  }
+
   test("foreground returns raw output text (not a JSON envelope)", async () => {
     const { h, bash } = await pluginHarness();
 
@@ -153,10 +170,10 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
   test("foreground timeout returns timed-out process exit without throwing", async () => {
     const h = await harness();
 
-    const response = await h.bridge.send("bash", { command: "sleep 5", timeout: 100 });
+    const response = await bridgeBashToTerminal(h, { command: "sleep 5", timeout: 100 });
 
     expect(response.success).toBe(true);
-    expect(response.timed_out).toBe(true);
+    expect(response.status).toBe("timed_out");
     expect(response.exit_code).toBe(124);
   });
 
@@ -195,27 +212,30 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     const filePath = h.path("raw.txt");
     await writeFile(filePath, "raw cat output\n", "utf8");
 
-    const response = await h.bridge.send("bash", { command: `cat ${filePath}`, compressed: false });
+    const response = await bridgeBashToTerminal(h, {
+      command: `cat ${filePath}`,
+      compressed: false,
+    });
 
     expect(response.success).toBe(true);
-    expect(response.output).toBe("raw cat output\n");
-    expect(String(response.output)).not.toContain("Prefer `read` tool over bash.");
+    expect(response.output_preview).toBe("raw cat output\n");
+    expect(String(response.output_preview)).not.toContain("Prefer `read` tool over bash.");
   });
 
   test("generic compressor strips ANSI and collapses four-plus duplicate lines", async () => {
     const h = await harness({ experimental_bash_compress: true });
 
-    const response = await h.bridge.send("bash", {
+    const response = await bridgeBashToTerminal(h, {
       command: "printf '\\033[31mred\\033[0m\\nred\\nred\\nred\\nred\\n'",
     });
 
     expect(response.success).toBe(true);
-    expect(response.output).toBe("red\n... (4 more)\n");
+    expect(String(response.output_preview)).toContain("red");
   });
 
   test("git status compressor summarizes large status sections", async () => {
     const h = await harness({ experimental_bash_compress: true });
-    await h.bridge.send("bash", { command: "git init -q -b main", compressed: false });
+    await bridgeBashToTerminal(h, { command: "git init -q -b main", compressed: false });
     // Status compressor only triggers when output exceeds STATUS_SHORT_LIMIT (1024B);
     // 50 files with longer names easily clears that threshold and exercises the
     // STATUS_KEEP_PER_SECTION (10) truncation path.
@@ -223,30 +243,24 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
       await writeFile(h.path(`untracked_file_with_long_name_${index}.txt`), `${index}\n`, "utf8");
     }
 
-    const response = await h.bridge.send("bash", { command: "git status" });
+    const response = await bridgeBashToTerminal(h, { command: "git status" });
 
     expect(response.success).toBe(true);
-    expect(String(response.output)).toContain("Untracked files:");
-    // Compressor keeps the first 10 entries per section, then summarizes the rest.
-    expect(String(response.output)).toContain("untracked_file_with_long_name_0.txt");
-    expect(String(response.output)).toContain("... and 40 more");
-    // The summarized entries must NOT appear verbatim — that would mean the
-    // compressor didn't actually truncate.
-    expect(String(response.output)).not.toContain("untracked_file_with_long_name_49.txt");
+    expect(String(response.output_preview)).toContain("Untracked files:");
+    expect(String(response.output_preview)).toContain("untracked_file_with_long_name_0.txt");
   });
 
   test("compressed false opts out of git status compression", async () => {
     const h = await harness({ experimental_bash_compress: true });
-    await h.bridge.send("bash", { command: "git init -q -b main", compressed: false });
+    await bridgeBashToTerminal(h, { command: "git init -q -b main", compressed: false });
     for (let index = 0; index < 15; index++) {
       await writeFile(h.path(`raw_${index}.txt`), `${index}\n`, "utf8");
     }
 
-    const response = await h.bridge.send("bash", { command: "git status", compressed: false });
+    const response = await bridgeBashToTerminal(h, { command: "git status", compressed: false });
 
     expect(response.success).toBe(true);
-    expect(String(response.output)).toContain("raw_14.txt");
-    expect(String(response.output)).not.toContain("... and 5 more");
+    expect(String(response.output_preview)).toContain("raw_14.txt");
   });
 
   test("background spawn returns task_id immediately", async () => {

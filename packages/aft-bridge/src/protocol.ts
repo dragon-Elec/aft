@@ -47,6 +47,7 @@ export type AftResponse = AftSuccessResponse | AftErrorResponse;
  */
 export type AftPushFrame =
   | BashCompletedFrame
+  | BashLongRunningFrame
   | PermissionAskFrame
   | ProgressFrame
   | ConfigureWarningFrame;
@@ -63,6 +64,14 @@ export interface BashCompletedFrame {
   output_preview?: string;
   output_truncated?: boolean;
   session_id?: string;
+}
+
+export interface BashLongRunningFrame {
+  type: "bash_long_running";
+  task_id: string;
+  session_id: string;
+  command: string;
+  elapsed_ms: number;
 }
 
 export interface PermissionAskFrame {

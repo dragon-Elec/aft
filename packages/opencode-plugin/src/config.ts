@@ -109,6 +109,8 @@ const ExperimentalConfigSchema = z.object({
       rewrite: z.boolean().optional(),
       compress: z.boolean().optional(),
       background: z.boolean().optional(),
+      long_running_reminder_enabled: z.boolean().optional(),
+      long_running_reminder_interval_ms: z.number().int().positive().optional(),
     })
     .optional(),
   lsp_ty: z.boolean().optional(),
@@ -207,6 +209,8 @@ export interface ConfigureExperimentalOverrides {
   experimental_bash_rewrite?: boolean;
   experimental_bash_compress?: boolean;
   experimental_bash_background?: boolean;
+  bash_long_running_reminder_enabled?: boolean;
+  bash_long_running_reminder_interval_ms?: number;
   experimental_lsp_ty?: boolean;
 }
 
@@ -279,6 +283,14 @@ export function resolveExperimentalConfigForConfigure(
   }
   if (config.experimental?.bash?.background !== undefined) {
     overrides.experimental_bash_background = config.experimental.bash.background;
+  }
+  if (config.experimental?.bash?.long_running_reminder_enabled !== undefined) {
+    overrides.bash_long_running_reminder_enabled =
+      config.experimental.bash.long_running_reminder_enabled;
+  }
+  if (config.experimental?.bash?.long_running_reminder_interval_ms !== undefined) {
+    overrides.bash_long_running_reminder_interval_ms =
+      config.experimental.bash.long_running_reminder_interval_ms;
   }
   if (config.experimental?.lsp_ty !== undefined) {
     overrides.experimental_lsp_ty = config.experimental.lsp_ty;

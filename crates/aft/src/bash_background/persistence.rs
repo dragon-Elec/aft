@@ -36,7 +36,13 @@ pub struct PersistedTask {
     pub child_pid: Option<u32>,
     pub pgid: Option<i32>,
     pub completion_delivered: bool,
+    #[serde(default = "default_notify_on_completion")]
+    pub notify_on_completion: bool,
     pub status_reason: Option<String>,
+}
+
+fn default_notify_on_completion() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +58,7 @@ impl PersistedTask {
         command: String,
         workdir: PathBuf,
         timeout_ms: Option<u64>,
+        notify_on_completion: bool,
     ) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
@@ -67,7 +74,8 @@ impl PersistedTask {
             exit_code: None,
             child_pid: None,
             pgid: None,
-            completion_delivered: true,
+            completion_delivered: !notify_on_completion,
+            notify_on_completion,
             status_reason: None,
         }
     }
@@ -95,7 +103,7 @@ impl PersistedTask {
         self.duration_ms = Some(finished_at.saturating_sub(self.started_at));
         self.child_pid = None;
         self.status_reason = reason;
-        self.completion_delivered = false;
+        self.completion_delivered = !self.notify_on_completion;
     }
 }
 

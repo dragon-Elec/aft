@@ -168,12 +168,83 @@ describe("bash tool adapter", () => {
       command: "bun test",
       timeout: 40_000,
       background: true,
+      notify_on_completion: true,
       compressed: false,
     });
     expect(callArgs[2].transportTimeoutMs).toBe(45_000);
     expect(callArgs[2].keepBridgeOnTimeout).toBe(true);
     expect(result.content[0].text).toContain("Background task started: bgb-123");
     expect(result.details.task_id).toBe("bgb-123");
+  });
+
+  test("foreground running command polls to completion and returns inline output", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const calls: unknown[] = [];
+    const bridge = {
+      send: async (command: string, params: Record<string, unknown>) => {
+        calls.push([command, params]);
+        if (command === "bash") return { success: true, status: "running", task_id: "task-inline" };
+        return {
+          success: true,
+          status: "completed",
+          exit_code: 0,
+          duration_ms: 100,
+          output_preview: "done",
+          output_truncated: false,
+        };
+      },
+    } as unknown as BinaryBridge;
+    const ctx = makeMockContext(bridge);
+
+    registerBashTool(api, ctx);
+
+    const bashTool = tools.get("bash")!;
+    const result = (await bashTool.execute(
+      "test-call",
+      { command: "printf done" },
+      undefined,
+      undefined,
+      { cwd: "/test" },
+    )) as { content: Array<{ text: string }> };
+
+    expect(result.content[0].text).toBe("done");
+    expect(calls.map((call) => (call as [string])[0])).toEqual(["bash", "bash_status"]);
+    expect((calls[0] as [string, Record<string, unknown>])[1].notify_on_completion).toBe(false);
+  });
+
+  test("foreground running command promotes to background after timeout", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const calls: unknown[] = [];
+    const bridge = {
+      send: async (command: string, params: Record<string, unknown>) => {
+        calls.push([command, params]);
+        if (command === "bash")
+          return { success: true, status: "running", task_id: "task-promote" };
+        if (command === "bash_status") return { success: true, status: "running" };
+        return { success: true, task_id: "task-promote", promoted: true };
+      },
+    } as unknown as BinaryBridge;
+    const ctx = makeMockContext(bridge);
+
+    registerBashTool(api, ctx);
+
+    const bashTool = tools.get("bash")!;
+    const result = (await bashTool.execute(
+      "test-call",
+      { command: "sleep 2", timeout: 0 },
+      undefined,
+      undefined,
+      { cwd: "/test" },
+    )) as { content: Array<{ text: string }> };
+
+    expect(result.content[0].text).toContain("promoted to background: task-promote");
+    expect(calls.map((call) => (call as [string])[0])).toEqual([
+      "bash",
+      "bash_status",
+      "bash_promote",
+    ]);
   });
 
   test("BashSpawnHook modifies command before bridge call", async () => {

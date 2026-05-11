@@ -18,8 +18,9 @@ use std::os::windows::process::CommandExt;
 
 use super::buffer::BgBuffer;
 use super::persistence::{
-    create_capture_file, read_exit_marker, read_task, session_tasks_dir, task_paths, unix_millis,
-    update_task, write_kill_marker_if_absent, write_task, ExitMarker, PersistedTask, TaskPaths,
+    create_capture_file, delete_task_bundle, read_exit_marker, read_task, session_tasks_dir,
+    task_paths, unix_millis, update_task, write_kill_marker_if_absent, write_task, ExitMarker,
+    PersistedTask, TaskPaths,
 };
 use super::process::is_process_alive;
 #[cfg(unix)]
@@ -36,6 +37,7 @@ use super::{BgTaskInfo, BgTaskStatus};
 /// Agents can override per-call via the `timeout` parameter (in ms).
 const DEFAULT_BG_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const STALE_RUNNING_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+const PERSISTED_GC_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Tail-bytes captured into BashCompletedFrame and BgCompletion records so the
 /// plugin can inline a preview into the system-reminder. Sized for ~3-4 lines
@@ -100,6 +102,9 @@ pub(crate) struct RegistryInner {
     pub(crate) shutdown: AtomicBool,
     pub(crate) long_running_reminder_enabled: AtomicBool,
     pub(crate) long_running_reminder_interval_ms: AtomicU64,
+    persisted_gc_started: AtomicBool,
+    #[cfg(test)]
+    persisted_gc_runs: AtomicU64,
     /// Output compression callback. Set by `AppContext` after construction.
     /// Takes (command, raw_output) and returns compressed text. Called from
     /// the watchdog thread when a task reaches a terminal state and from
@@ -136,6 +141,9 @@ impl BgTaskRegistry {
                 shutdown: AtomicBool::new(false),
                 long_running_reminder_enabled: AtomicBool::new(true),
                 long_running_reminder_interval_ms: AtomicU64::new(600_000),
+                persisted_gc_started: AtomicBool::new(false),
+                #[cfg(test)]
+                persisted_gc_runs: AtomicU64::new(0),
                 compressor: Mutex::new(None),
             }),
         }
@@ -188,6 +196,7 @@ impl BgTaskRegistry {
         max_running: usize,
         notify_on_completion: bool,
         compressed: bool,
+        project_root: Option<PathBuf>,
     ) -> Result<String, String> {
         self.start_watchdog();
 
@@ -210,6 +219,7 @@ impl BgTaskRegistry {
             session_id.clone(),
             command.to_string(),
             workdir.clone(),
+            project_root,
             timeout_ms,
             notify_on_completion,
             compressed,
@@ -269,6 +279,7 @@ impl BgTaskRegistry {
         max_running: usize,
         notify_on_completion: bool,
         compressed: bool,
+        project_root: Option<PathBuf>,
     ) -> Result<String, String> {
         self.start_watchdog();
 
@@ -291,6 +302,7 @@ impl BgTaskRegistry {
             session_id.clone(),
             command.to_string(),
             workdir.clone(),
+            project_root,
             timeout_ms,
             notify_on_completion,
             compressed,
@@ -343,6 +355,11 @@ impl BgTaskRegistry {
 
     pub fn replay_session(&self, storage_dir: &Path, session_id: &str) -> Result<(), String> {
         self.start_watchdog();
+        if !self.inner.persisted_gc_started.swap(true, Ordering::SeqCst) {
+            if let Err(error) = self.maybe_gc_persisted(storage_dir) {
+                log::warn!("failed to GC persisted background bash tasks: {error}");
+            }
+        }
         let dir = session_tasks_dir(storage_dir, session_id);
         if !dir.exists() {
             return Ok(());
@@ -373,7 +390,7 @@ impl BgTaskRegistry {
                     let _ = write_task(&paths.json, &metadata);
                     self.enqueue_completion_if_needed(&metadata, false);
                 }
-                BgTaskStatus::Running => {
+                BgTaskStatus::Running | BgTaskStatus::Killing => {
                     if self.running_metadata_is_stale(&metadata) {
                         metadata.mark_terminal(
                             BgTaskStatus::Killed,
@@ -386,7 +403,27 @@ impl BgTaskRegistry {
                         let _ = write_task(&paths.json, &metadata);
                         self.enqueue_completion_if_needed(&metadata, false);
                     } else if let Ok(Some(marker)) = read_exit_marker(&paths.exit) {
-                        metadata = terminal_metadata_from_marker(metadata, marker, None);
+                        let reason = (metadata.status == BgTaskStatus::Killing).then(|| {
+                            "recovered from inconsistent killing state on replay".to_string()
+                        });
+                        if reason.is_some() {
+                            log::warn!(
+                                "background task {} had killing state with exit marker; preferring marker",
+                                metadata.task_id
+                            );
+                        }
+                        metadata = terminal_metadata_from_marker(metadata, marker, reason);
+                        let _ = write_task(&paths.json, &metadata);
+                        self.enqueue_completion_if_needed(&metadata, false);
+                    } else if metadata.status == BgTaskStatus::Killing {
+                        if !paths.exit.exists() {
+                            let _ = write_kill_marker_if_absent(&paths.exit);
+                        }
+                        metadata.mark_terminal(
+                            BgTaskStatus::Killed,
+                            None,
+                            Some("recovered from inconsistent killing state on replay".to_string()),
+                        );
                         let _ = write_task(&paths.json, &metadata);
                         self.enqueue_completion_if_needed(&metadata, false);
                     } else if metadata.child_pid.is_some_and(|pid| !is_process_alive(pid)) {
@@ -416,13 +453,163 @@ impl BgTaskRegistry {
         &self,
         task_id: &str,
         session_id: &str,
+        project_root: Option<&Path>,
+        storage_dir: Option<&Path>,
         preview_bytes: usize,
     ) -> Option<BgTaskSnapshot> {
-        let task = self.task_for_session(task_id, session_id)?;
+        let mut task = self.task_for_session(task_id, session_id);
+        if task.is_none() {
+            if let Some(storage_dir) = storage_dir {
+                let _ = self.replay_session(storage_dir, session_id);
+                task = self.task_for_session(task_id, session_id);
+            }
+        }
+        let Some(task) = task else {
+            return self.status_relaxed(
+                task_id,
+                session_id,
+                project_root?,
+                storage_dir?,
+                preview_bytes,
+            );
+        };
         let _ = self.poll_task(&task);
         let mut snapshot = task.snapshot(preview_bytes);
         self.maybe_compress_snapshot(&task, &mut snapshot);
         Some(snapshot)
+    }
+
+    fn status_relaxed_task(
+        &self,
+        task_id: &str,
+        project_root: &Path,
+        storage_dir: &Path,
+    ) -> Option<Arc<BgTask>> {
+        let root = storage_dir.join("bash-tasks");
+        let entries = fs::read_dir(&root).ok()?;
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let path = dir.join(format!("{task_id}.json"));
+            if !path.exists() {
+                continue;
+            }
+            let Ok(metadata) = read_task(&path) else {
+                continue;
+            };
+            if metadata.project_root.as_deref() != Some(project_root) {
+                continue;
+            }
+            if let Some(task) = self.task(task_id) {
+                let matches_project = task
+                    .state
+                    .lock()
+                    .map(|state| state.metadata.project_root.as_deref() == Some(project_root))
+                    .unwrap_or(false);
+                return matches_project.then_some(task);
+            }
+            let paths = task_paths(storage_dir, &metadata.session_id, &metadata.task_id);
+            if self.insert_rehydrated_task(metadata, paths, true).is_err() {
+                return None;
+            }
+            return self.task(task_id);
+        }
+        None
+    }
+
+    pub(super) fn status_relaxed(
+        &self,
+        task_id: &str,
+        _session_id: &str,
+        project_root: &Path,
+        storage_dir: &Path,
+        preview_bytes: usize,
+    ) -> Option<BgTaskSnapshot> {
+        let task = self.status_relaxed_task(task_id, project_root, storage_dir)?;
+        let _ = self.poll_task(&task);
+        let mut snapshot = task.snapshot(preview_bytes);
+        self.maybe_compress_snapshot(&task, &mut snapshot);
+        Some(snapshot)
+    }
+
+    pub fn maybe_gc_persisted(&self, storage_dir: &Path) -> Result<usize, String> {
+        #[cfg(test)]
+        self.inner.persisted_gc_runs.fetch_add(1, Ordering::SeqCst);
+
+        let root = storage_dir.join("bash-tasks");
+        if !root.exists() {
+            return Ok(0);
+        }
+
+        let session_dirs = fs::read_dir(&root).map_err(|e| {
+            format!(
+                "failed to read background task root {}: {e}",
+                root.display()
+            )
+        })?;
+        let mut deleted = 0usize;
+        for session_entry in session_dirs.flatten() {
+            let session_dir = session_entry.path();
+            if !session_dir.is_dir() {
+                continue;
+            }
+            let task_entries = match fs::read_dir(&session_dir) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    log::warn!(
+                        "failed to read background task session dir {}: {error}",
+                        session_dir.display()
+                    );
+                    continue;
+                }
+            };
+            for task_entry in task_entries.flatten() {
+                let json_path = task_entry.path();
+                if json_path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    != Some("json")
+                {
+                    continue;
+                }
+                if json_modified_within(&json_path, PERSISTED_GC_GRACE) {
+                    continue;
+                }
+                let metadata = match read_task(&json_path) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        log::warn!(
+                            "quarantining corrupt background task metadata {}: {error}",
+                            json_path.display()
+                        );
+                        quarantine_corrupt_task_json(storage_dir, &session_dir, &json_path)?;
+                        continue;
+                    }
+                };
+                if !(metadata.status.is_terminal() && metadata.completion_delivered) {
+                    continue;
+                }
+                let paths = task_paths(storage_dir, &metadata.session_id, &metadata.task_id);
+                match delete_task_bundle(&paths) {
+                    Ok(()) => {
+                        deleted += 1;
+                        log::debug!(
+                            "deleted persisted background task bundle {}",
+                            metadata.task_id
+                        );
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "failed to delete background task bundle {}: {error}",
+                            metadata.task_id
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(deleted)
     }
 
     pub fn list(&self, preview_bytes: usize) -> Vec<BgTaskSnapshot> {
@@ -497,23 +684,41 @@ impl BgTaskRegistry {
     pub fn cleanup_finished(&self, older_than: Duration) {
         let cutoff = Instant::now().checked_sub(older_than);
         if let Ok(mut tasks) = self.inner.tasks.lock() {
-            tasks.retain(|_, task| {
-                let is_terminal = task
-                    .state
-                    .lock()
-                    .map(|state| state.metadata.status.is_terminal())
-                    .unwrap_or(false);
-                if !is_terminal {
-                    return true;
-                }
+            let removable = tasks
+                .iter()
+                .filter_map(|(task_id, task)| {
+                    let delivered_terminal = task
+                        .state
+                        .lock()
+                        .map(|state| {
+                            state.metadata.status.is_terminal()
+                                && state.metadata.completion_delivered
+                        })
+                        .unwrap_or(false);
+                    if !delivered_terminal {
+                        return None;
+                    }
 
-                let terminal_at = task.terminal_at.lock().ok().and_then(|at| *at);
-                match (terminal_at, cutoff) {
-                    (Some(terminal_at), Some(cutoff)) => terminal_at > cutoff,
-                    (Some(_), None) => false,
-                    (None, _) => true,
+                    let terminal_at = task.terminal_at.lock().ok().and_then(|at| *at);
+                    let expired = match (terminal_at, cutoff) {
+                        (Some(terminal_at), Some(cutoff)) => terminal_at <= cutoff,
+                        (Some(_), None) => true,
+                        (None, _) => false,
+                    };
+                    expired.then(|| task_id.clone())
+                })
+                .collect::<Vec<_>>();
+
+            for task_id in removable {
+                if let Some(task) = tasks.remove(&task_id) {
+                    match delete_task_bundle(&task.paths) {
+                        Ok(()) => log::debug!("deleted persisted background task bundle {task_id}"),
+                        Err(error) => log::warn!(
+                            "failed to delete persisted background task bundle {task_id}: {error}"
+                        ),
+                    }
                 }
-            });
+            }
         }
     }
 
@@ -1005,6 +1210,54 @@ impl Default for BgTaskRegistry {
     }
 }
 
+fn json_modified_within(path: &Path, grace: Duration) -> bool {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .map(|age| age < grace)
+        .unwrap_or(false)
+}
+
+fn quarantine_corrupt_task_json(
+    storage_dir: &Path,
+    session_dir: &Path,
+    json_path: &Path,
+) -> Result<(), String> {
+    let session_hash = session_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "invalid background task session dir: {}",
+                session_dir.display()
+            )
+        })?;
+    let task_name = json_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid background task json path: {}", json_path.display()))?;
+    let unix_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let quarantine_dir = storage_dir.join("bash-tasks-quarantine").join(session_hash);
+    fs::create_dir_all(&quarantine_dir).map_err(|e| {
+        format!(
+            "failed to create background task quarantine dir {}: {e}",
+            quarantine_dir.display()
+        )
+    })?;
+    let target = quarantine_dir.join(format!("{task_name}.corrupt-{unix_ts}"));
+    fs::rename(json_path, &target).map_err(|e| {
+        format!(
+            "failed to quarantine corrupt background task metadata {} to {}: {e}",
+            json_path.display(),
+            target.display()
+        )
+    })
+}
+
 impl BgTask {
     fn snapshot(&self, preview_bytes: usize) -> BgTaskSnapshot {
         let state = self
@@ -1401,6 +1654,36 @@ mod tests {
                 10,
                 true,
                 false,
+                Some(dir.path().to_path_buf()),
+            )
+            .unwrap();
+        registry
+            .kill_with_status(&task_id, "session", BgTaskStatus::Killed)
+            .unwrap();
+        let completions = registry.drain_completions_for_session(Some("session"));
+        assert_eq!(completions.len(), 1);
+
+        registry.cleanup_finished(Duration::ZERO);
+
+        assert!(registry.inner.tasks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cleanup_finished_retains_undelivered_terminals() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn(
+                QUICK_SUCCESS_COMMAND,
+                "session".to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                dir.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.path().to_path_buf()),
             )
             .unwrap();
         registry
@@ -1409,7 +1692,7 @@ mod tests {
 
         registry.cleanup_finished(Duration::ZERO);
 
-        assert!(registry.inner.tasks.lock().unwrap().is_empty());
+        assert!(registry.inner.tasks.lock().unwrap().contains_key(&task_id));
     }
 
     /// Issue #27 Oracle review P1 + P2 test gap: verify that the live
@@ -1436,6 +1719,7 @@ mod tests {
                 10,
                 true,
                 false,
+                Some(dir.path().to_path_buf()),
             )
             .unwrap();
 
@@ -1531,6 +1815,7 @@ mod tests {
                 10,
                 true,
                 false,
+                Some(dir.path().to_path_buf()),
             )
             .unwrap();
 
@@ -1598,6 +1883,7 @@ mod tests {
                 10,
                 true,
                 false,
+                Some(dir.path().to_path_buf()),
             )
             .unwrap();
 
@@ -1640,6 +1926,7 @@ mod tests {
                 10,
                 false,
                 false,
+                Some(dir.path().to_path_buf()),
             )
             .unwrap();
         (registry, dir, task_id)

@@ -32,10 +32,14 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         return Response::error(&req.id, "invalid_request", "bash_status: missing task_id");
     };
 
-    match ctx
-        .bash_background()
-        .status(&task_id, req.session(), PREVIEW_BYTES)
-    {
+    let storage_dir = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+    match ctx.bash_background().status(
+        &task_id,
+        req.session(),
+        ctx.config().project_root.as_deref(),
+        Some(&storage_dir),
+        PREVIEW_BYTES,
+    ) {
         Some(snapshot) => Response::success(&req.id, json!(snapshot)),
         None => Response::error(
             &req.id,

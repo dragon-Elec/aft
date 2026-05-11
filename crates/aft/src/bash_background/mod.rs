@@ -79,6 +79,11 @@ pub fn spawn(
     let storage_dir = storage_dir(ctx.config().storage_dir.as_deref());
     let max_running = ctx.config().max_background_bash_tasks;
     let timeout = timeout_ms.map(Duration::from_millis);
+    let project_root = ctx
+        .config()
+        .project_root
+        .clone()
+        .or_else(|| std::env::current_dir().ok());
 
     match ctx.bash_background().spawn(
         command,
@@ -90,6 +95,7 @@ pub fn spawn(
         max_running,
         notify_on_completion,
         compressed,
+        project_root,
     ) {
         Ok(task_id) => Response::success(
             request_id,

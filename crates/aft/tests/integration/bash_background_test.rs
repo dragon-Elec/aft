@@ -454,7 +454,7 @@ fn background_status_unknown_task_returns_task_not_found() {
 }
 
 #[test]
-fn background_status_rejects_cross_session_task_as_not_found() {
+fn background_status_allows_cross_session_same_project_lookup() {
     let mut aft = AftProcess::spawn();
     let _dir = configure_background(&mut aft);
 
@@ -470,12 +470,12 @@ fn background_status_rejects_cross_session_task_as_not_found() {
     assert_eq!(spawn["success"], true, "spawn failed: {spawn:?}");
     let task_id = spawn["task_id"].as_str().unwrap().to_string();
 
-    let rejected = status_with_session(&mut aft, &task_id, "session-b");
+    let cross_session = status_with_session(&mut aft, &task_id, "session-b");
     assert_eq!(
-        rejected["success"], false,
-        "cross-session status leaked: {rejected:?}"
+        cross_session["success"], true,
+        "cross-session same-project status lookup failed: {cross_session:?}"
     );
-    assert_eq!(rejected["code"], "task_not_found");
+    assert_eq!(cross_session["status"], "running");
 
     let owned = status_with_session(&mut aft, &task_id, "session-a");
     assert_eq!(owned["success"], true, "owner status failed: {owned:?}");

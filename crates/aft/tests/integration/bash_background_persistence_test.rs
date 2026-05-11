@@ -1,10 +1,11 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use aft::bash_background::persistence::{session_tasks_dir, write_task, PersistedTask};
+use aft::bash_background::persistence::{session_tasks_dir, task_paths, write_task, PersistedTask};
 use aft::bash_background::{BgTaskRegistry, BgTaskStatus};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -105,6 +106,495 @@ fn read_json(storage: &Path, session: &str, task_id: &str) -> Value {
         .unwrap()
 }
 
+fn registry() -> BgTaskRegistry {
+    BgTaskRegistry::new(Arc::new(Mutex::new(None)))
+}
+
+fn wait_for_path(path: &Path) {
+    let started = Instant::now();
+    while !path.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timed out waiting for {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn set_mtime(path: &Path, age: Duration) {
+    let target = SystemTime::now().checked_sub(age).unwrap_or(UNIX_EPOCH);
+    let secs = target
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as libc::time_t;
+    let times = [
+        libc::timeval {
+            tv_sec: secs,
+            tv_usec: 0,
+        },
+        libc::timeval {
+            tv_sec: secs,
+            tv_usec: 0,
+        },
+    ];
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let rc = unsafe { libc::utimes(c_path.as_ptr(), times.as_ptr()) };
+    assert_eq!(rc, 0, "failed to set mtime for {}", path.display());
+}
+
+fn fake_task(
+    storage: &Path,
+    project: &Path,
+    session: &str,
+    task_id: &str,
+    status: BgTaskStatus,
+    completion_delivered: bool,
+) -> aft::bash_background::persistence::TaskPaths {
+    let paths = task_paths(storage, session, task_id);
+    let mut metadata = PersistedTask::starting(
+        task_id.to_string(),
+        session.to_string(),
+        "true".to_string(),
+        project.to_path_buf(),
+        Some(project.to_path_buf()),
+        None,
+        true,
+        true,
+    );
+    if status.is_terminal() {
+        metadata.mark_terminal(status, Some(0), None);
+    } else {
+        metadata.status = status;
+    }
+    metadata.completion_delivered = completion_delivered;
+    write_task(&paths.json, &metadata).unwrap();
+    fs::write(&paths.stdout, "stdout").unwrap();
+    fs::write(&paths.stderr, "stderr").unwrap();
+    fs::write(&paths.exit, "0").unwrap();
+    paths
+}
+
+fn write_legacy_task_json(storage: &Path, session: &str, task_id: &str, project: &Path) -> PathBuf {
+    let path = task_file(storage, session, task_id, "json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "task_id": task_id,
+            "session_id": session,
+            "command": "echo legacy",
+            "workdir": project,
+            "status": "completed",
+            "started_at": 1,
+            "finished_at": 2,
+            "duration_ms": 1,
+            "timeout_ms": null,
+            "exit_code": 0,
+            "child_pid": null,
+            "pgid": null,
+            "completion_delivered": true,
+            "notify_on_completion": true,
+            "compressed": false,
+            "status_reason": null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(task_file(storage, session, task_id, "stdout"), "legacy\n").unwrap();
+    fs::write(task_file(storage, session, task_id, "stderr"), "").unwrap();
+    path
+}
+
+#[test]
+fn bash_status_same_session_cold_bridge_replays_from_disk() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let first = registry();
+    let task_id = first
+        .spawn(
+            "true",
+            SESSION.to_string(),
+            project.path().to_path_buf(),
+            Default::default(),
+            Some(Duration::from_secs(30)),
+            storage.path().to_path_buf(),
+            10,
+            true,
+            false,
+            Some(project.path().to_path_buf()),
+        )
+        .unwrap();
+    wait_for_path(&task_file(storage.path(), SESSION, &task_id, "exit"));
+
+    let fresh = registry();
+    let snapshot = fresh
+        .status(
+            &task_id,
+            SESSION,
+            Some(project.path()),
+            Some(storage.path()),
+            1024,
+        )
+        .expect("same-session status should replay from disk");
+
+    assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
+    assert_eq!(snapshot.exit_code, Some(0));
+}
+
+#[test]
+fn bash_status_cross_session_same_project_finds_task_by_id() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let first = registry();
+    let task_id = first
+        .spawn(
+            "true",
+            "session-a".to_string(),
+            project.path().to_path_buf(),
+            Default::default(),
+            Some(Duration::from_secs(30)),
+            storage.path().to_path_buf(),
+            10,
+            true,
+            false,
+            Some(project.path().to_path_buf()),
+        )
+        .unwrap();
+    wait_for_path(&task_file(storage.path(), "session-a", &task_id, "exit"));
+
+    let fresh = registry();
+    let snapshot = fresh
+        .status(
+            &task_id,
+            "session-b",
+            Some(project.path()),
+            Some(storage.path()),
+            1024,
+        )
+        .expect("cross-session status should find same-project task");
+
+    assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
+}
+
+#[test]
+fn bash_status_cross_session_different_project_returns_not_found() {
+    let project_a = tempfile::tempdir().unwrap();
+    let project_b = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let first = registry();
+    let task_id = first
+        .spawn(
+            "true",
+            "session-a".to_string(),
+            project_a.path().to_path_buf(),
+            Default::default(),
+            Some(Duration::from_secs(30)),
+            storage.path().to_path_buf(),
+            10,
+            true,
+            false,
+            Some(project_a.path().to_path_buf()),
+        )
+        .unwrap();
+    wait_for_path(&task_file(storage.path(), "session-a", &task_id, "exit"));
+
+    let fresh = registry();
+    assert!(fresh
+        .status(
+            &task_id,
+            "session-b",
+            Some(project_b.path()),
+            Some(storage.path()),
+            1024,
+        )
+        .is_none());
+}
+
+#[test]
+fn bash_status_legacy_persisted_task_without_project_root_does_not_leak_across_sessions() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let task_id = "bash-legacy1";
+    write_legacy_task_json(storage.path(), "session-a", task_id, project.path());
+
+    let cross = registry();
+    assert!(cross
+        .status(
+            task_id,
+            "session-b",
+            Some(project.path()),
+            Some(storage.path()),
+            1024,
+        )
+        .is_none());
+
+    let same = registry();
+    let snapshot = same
+        .status(
+            task_id,
+            "session-a",
+            Some(project.path()),
+            Some(storage.path()),
+            1024,
+        )
+        .expect("same-session legacy replay should still work");
+    assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
+    assert!(snapshot.output_preview.contains("legacy"));
+}
+
+#[test]
+fn bash_kill_cross_session_still_returns_not_found() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = registry
+        .spawn(
+            "sleep 5",
+            "session-a".to_string(),
+            project.path().to_path_buf(),
+            Default::default(),
+            Some(Duration::from_secs(30)),
+            storage.path().to_path_buf(),
+            10,
+            true,
+            false,
+            Some(project.path().to_path_buf()),
+        )
+        .unwrap();
+
+    let error = registry.kill(&task_id, "session-b").unwrap_err();
+    assert!(error.contains("not found"));
+    let _ = registry.kill(&task_id, "session-a");
+}
+
+#[test]
+fn bash_promote_cross_session_still_returns_not_found() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = registry
+        .spawn(
+            "sleep 5",
+            "session-a".to_string(),
+            project.path().to_path_buf(),
+            Default::default(),
+            Some(Duration::from_secs(30)),
+            storage.path().to_path_buf(),
+            10,
+            false,
+            false,
+            Some(project.path().to_path_buf()),
+        )
+        .unwrap();
+
+    let error = registry.promote(&task_id, "session-b").unwrap_err();
+    assert!(error.contains("not found"));
+    let _ = registry.kill(&task_id, "session-a");
+}
+
+#[test]
+fn gc_persisted_deletes_delivered_terminals_older_than_grace() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    for idx in 0..5 {
+        let paths = fake_task(
+            storage.path(),
+            project.path(),
+            SESSION,
+            &format!("bash-gc{idx}"),
+            BgTaskStatus::Completed,
+            true,
+        );
+        set_mtime(&paths.json, Duration::from_secs(25 * 60 * 60));
+    }
+
+    let deleted = registry().maybe_gc_persisted(storage.path()).unwrap();
+
+    assert_eq!(deleted, 5);
+    assert!(!session_tasks_dir(storage.path(), SESSION).exists());
+}
+
+#[test]
+fn gc_persisted_keeps_undelivered_terminals() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let paths = fake_task(
+        storage.path(),
+        project.path(),
+        SESSION,
+        "bash-keep-undelivered",
+        BgTaskStatus::Completed,
+        false,
+    );
+    set_mtime(&paths.json, Duration::from_secs(25 * 60 * 60));
+
+    assert_eq!(registry().maybe_gc_persisted(storage.path()).unwrap(), 0);
+    assert!(paths.json.exists());
+}
+
+#[test]
+fn gc_persisted_keeps_recent_files() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let paths = fake_task(
+        storage.path(),
+        project.path(),
+        SESSION,
+        "bash-keep-recent",
+        BgTaskStatus::Completed,
+        true,
+    );
+    set_mtime(&paths.json, Duration::from_secs(60 * 60));
+
+    assert_eq!(registry().maybe_gc_persisted(storage.path()).unwrap(), 0);
+    assert!(paths.json.exists());
+}
+
+#[test]
+fn gc_persisted_quarantines_corrupt_json() {
+    let storage = tempfile::tempdir().unwrap();
+    let paths = task_paths(storage.path(), SESSION, "bash-corrupt");
+    fs::create_dir_all(&paths.dir).unwrap();
+    fs::write(&paths.json, "not-json").unwrap();
+    fs::write(&paths.stdout, "stdout").unwrap();
+    fs::write(&paths.stderr, "stderr").unwrap();
+    fs::write(&paths.exit, "0").unwrap();
+    set_mtime(&paths.json, Duration::from_secs(25 * 60 * 60));
+
+    assert_eq!(registry().maybe_gc_persisted(storage.path()).unwrap(), 0);
+
+    assert!(!paths.json.exists());
+    assert!(paths.stdout.exists());
+    assert!(paths.stderr.exists());
+    assert!(paths.exit.exists());
+    let quarantine_session = storage
+        .path()
+        .join("bash-tasks-quarantine")
+        .join(aft::backup::hash_session(SESSION));
+    let quarantined = fs::read_dir(quarantine_session)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(quarantined.len(), 1);
+    assert!(quarantined[0].starts_with("bash-corrupt.json.corrupt-"));
+}
+
+#[test]
+fn cleanup_finished_deletes_disk_bundle_of_delivered_terminal() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = registry
+        .spawn(
+            "sleep 5",
+            SESSION.to_string(),
+            project.path().to_path_buf(),
+            Default::default(),
+            Some(Duration::from_secs(30)),
+            storage.path().to_path_buf(),
+            10,
+            true,
+            false,
+            Some(project.path().to_path_buf()),
+        )
+        .unwrap();
+    let paths = task_paths(storage.path(), SESSION, &task_id);
+    registry.kill(&task_id, SESSION).unwrap();
+    assert_eq!(
+        registry.drain_completions_for_session(Some(SESSION)).len(),
+        1
+    );
+
+    registry.cleanup_finished(Duration::ZERO);
+
+    assert!(registry
+        .status(&task_id, SESSION, None, None, 1024)
+        .is_none());
+    assert!(!paths.json.exists());
+    assert!(!paths.stdout.exists());
+    assert!(!paths.stderr.exists());
+    assert!(!paths.exit.exists());
+}
+
+#[test]
+fn cleanup_finished_retains_undelivered_terminals() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = registry
+        .spawn(
+            "sleep 5",
+            SESSION.to_string(),
+            project.path().to_path_buf(),
+            Default::default(),
+            Some(Duration::from_secs(30)),
+            storage.path().to_path_buf(),
+            10,
+            true,
+            false,
+            Some(project.path().to_path_buf()),
+        )
+        .unwrap();
+    registry.kill(&task_id, SESSION).unwrap();
+
+    registry.cleanup_finished(Duration::ZERO);
+
+    assert!(registry
+        .status(&task_id, SESSION, None, None, 1024)
+        .is_some());
+}
+
+#[test]
+fn replay_session_recovers_killing_state() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let paths = fake_task(
+        storage.path(),
+        project.path(),
+        SESSION,
+        "bash-killing",
+        BgTaskStatus::Killing,
+        false,
+    );
+    fs::write(&paths.exit, "0").unwrap();
+
+    registry().replay_session(storage.path(), SESSION).unwrap();
+    let replayed = read_json(storage.path(), SESSION, "bash-killing");
+
+    assert_eq!(replayed["status"], "completed");
+    assert_eq!(replayed["exit_code"], 0);
+    assert_eq!(
+        replayed["status_reason"],
+        "recovered from inconsistent killing state on replay"
+    );
+}
+
+#[test]
+fn replay_runs_maybe_gc_persisted_once() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    registry.replay_session(storage.path(), SESSION).unwrap();
+
+    let paths = fake_task(
+        storage.path(),
+        project.path(),
+        SESSION,
+        "bash-after-first-gc",
+        BgTaskStatus::Completed,
+        true,
+    );
+    set_mtime(&paths.json, Duration::from_secs(25 * 60 * 60));
+    registry.replay_session(storage.path(), SESSION).unwrap();
+
+    assert!(
+        paths.json.exists(),
+        "second replay must not run persisted GC again"
+    );
+}
+
 #[test]
 fn spawn_detached_survives_parent_restart() {
     let project = tempfile::tempdir().unwrap();
@@ -172,6 +662,7 @@ fn pre_spawn_metadata_starting_replays_as_failed() {
         SESSION.to_string(),
         "true".to_string(),
         tempfile::tempdir().unwrap().path().to_path_buf(),
+        Some(tempfile::tempdir().unwrap().path().to_path_buf()),
         None,
         true,
         true,
@@ -372,6 +863,7 @@ fn watchdog_deadline_enforcement_without_status_query() {
 #[test]
 fn session_isolation_on_replay() {
     let project = tempfile::tempdir().unwrap();
+    let other_project = tempfile::tempdir().unwrap();
     let storage = spawn_storage_dir("storage");
     let mut aft_a = AftProcess::spawn();
     configure_background(&mut aft_a, project.path(), storage.path(), "session-a");
@@ -379,7 +871,12 @@ fn session_isolation_on_replay() {
     assert!(aft_a.shutdown().success());
 
     let mut aft_b = AftProcess::spawn();
-    configure_background(&mut aft_b, project.path(), storage.path(), "session-b");
+    configure_background(
+        &mut aft_b,
+        other_project.path(),
+        storage.path(),
+        "session-b",
+    );
     let missing = status(&mut aft_b, "session-b", &task_id);
     assert_eq!(missing["success"], false);
     assert!(aft_b.shutdown().success());
@@ -400,6 +897,7 @@ fn replay_stale_running_task_marks_killed_orphaned() {
         SESSION.to_string(),
         "sleep 99".to_string(),
         tempfile::tempdir().unwrap().path().to_path_buf(),
+        Some(tempfile::tempdir().unwrap().path().to_path_buf()),
         None,
         true,
         true,

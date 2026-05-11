@@ -9,7 +9,7 @@ use crate::backup::hash_session;
 
 use super::BgTaskStatus;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct TaskPaths {
@@ -27,6 +27,8 @@ pub struct PersistedTask {
     pub session_id: String,
     pub command: String,
     pub workdir: PathBuf,
+    #[serde(default)]
+    pub project_root: Option<PathBuf>,
     pub status: BgTaskStatus,
     pub started_at: u64,
     pub finished_at: Option<u64>,
@@ -67,6 +69,7 @@ impl PersistedTask {
         session_id: String,
         command: String,
         workdir: PathBuf,
+        project_root: Option<PathBuf>,
         timeout_ms: Option<u64>,
         notify_on_completion: bool,
         compressed: bool,
@@ -77,6 +80,7 @@ impl PersistedTask {
             session_id,
             command,
             workdir,
+            project_root,
             status: BgTaskStatus::Starting,
             started_at: unix_millis(),
             finished_at: None,
@@ -147,6 +151,54 @@ pub fn write_task(path: &Path, task: &PersistedTask) -> io::Result<()> {
     }
     let content = serde_json::to_vec_pretty(task).map_err(io::Error::other)?;
     atomic_write(path, &content, &task.task_id)
+}
+
+pub(super) fn delete_task_bundle(paths: &TaskPaths) -> io::Result<()> {
+    let mut first_error = None;
+    for path in task_bundle_files(paths) {
+        if let Err(error) = remove_file_if_present(&path) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+
+    match fs::remove_dir(&paths.dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn task_bundle_files(paths: &TaskPaths) -> Vec<PathBuf> {
+    let mut files = vec![
+        paths.json.clone(),
+        paths.stdout.clone(),
+        paths.stderr.clone(),
+        paths.exit.clone(),
+    ];
+    if let Some(stem) = paths.json.file_stem().and_then(|stem| stem.to_str()) {
+        // Windows background bash writes per-task wrapper scripts next to the
+        // capture files as `<task-id>.ps1`, `<task-id>.bat`, or `<task-id>.sh`
+        // depending on the shell selected in `detached_shell_command_for`.
+        for extension in ["ps1", "bat", "sh"] {
+            files.push(paths.dir.join(format!("{stem}.{extension}")));
+        }
+    }
+    files
+}
+
+fn remove_file_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn update_task<F>(path: &Path, update: F) -> io::Result<PersistedTask>

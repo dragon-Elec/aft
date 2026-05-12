@@ -5,7 +5,6 @@
 
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
 
-use std::cell::Cell;
 use std::path::Path;
 
 use crate::config::Config;
@@ -13,10 +12,6 @@ use crate::context::AppContext;
 use crate::error::AftError;
 use crate::format;
 use crate::parser::{detect_language, grammar_for, FileParser};
-
-thread_local! {
-    static LAST_WRITE_ROLLED_BACK: Cell<bool> = Cell::new(false);
-}
 
 /// Convert 0-indexed line/col to a byte offset within `source`.
 ///
@@ -268,6 +263,11 @@ pub struct WriteResult {
     /// Why validation was skipped, if it was. Values: "unsupported_language",
     /// "no_checker_configured", "checker_not_installed", "timeout", "error".
     pub validate_skipped_reason: Option<String>,
+    /// True when the write+format+validate pipeline detected post-write
+    /// invalid syntax against a previously-valid file and restored the
+    /// pre-write content. The on-disk file is the original; `syntax_valid`
+    /// reports the would-have-been-written status (Some(false)).
+    pub rolled_back: bool,
     /// Per-edit LSP diagnostics outcome (v0.17.3). Carries the verified-fresh
     /// diagnostics PLUS per-server status (pending/exited) so the response
     /// can report `complete: bool` honestly.
@@ -295,8 +295,7 @@ impl WriteResult {
     /// nothing is added — keeps the no-LSP edit path's response shape
     /// unchanged.
     pub fn append_lsp_diagnostics_to(&self, result: &mut serde_json::Value) {
-        let rolled_back = LAST_WRITE_ROLLED_BACK.with(|cell| cell.replace(false));
-        result["rolled_back"] = serde_json::json!(rolled_back);
+        result["rolled_back"] = serde_json::json!(self.rolled_back);
 
         let Some(outcome) = self.lsp_outcome.as_ref() else {
             return;
@@ -399,7 +398,6 @@ pub fn write_format_validate(
     } else {
         false
     };
-    LAST_WRITE_ROLLED_BACK.with(|cell| cell.set(rolled_back));
 
     // Step 4: Full validation (type checker) — only when requested
     let param_validate = params.get("validate").and_then(|v| v.as_str());
@@ -420,6 +418,7 @@ pub fn write_format_validate(
         validate_requested,
         validation_errors,
         validate_skipped_reason,
+        rolled_back,
         lsp_outcome: None,
     })
 }

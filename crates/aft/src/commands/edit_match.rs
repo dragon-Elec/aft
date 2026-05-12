@@ -268,6 +268,10 @@ fn handle_append(req: &RawRequest, ctx: &AppContext) -> Response {
             validate_requested: false,
             validation_errors: Vec::new(),
             validate_skipped_reason: None,
+            // Append-mode does not currently snapshot pre-write validity for
+            // rollback (handled by the shared write pipeline only). Surface
+            // false until/unless append gains the same rollback flow.
+            rolled_back: false,
             lsp_outcome,
         };
         write_result.append_lsp_diagnostics_to(&mut result);

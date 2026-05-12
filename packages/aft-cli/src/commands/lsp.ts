@@ -282,8 +282,7 @@ function resolveCustomServers(servers: unknown): Record<string, unknown>[] {
     .filter((server) => typeof server.binary === "string" && server.binary.length > 0);
 }
 
-function inferLspPathsExtra(lsp: Record<string, unknown>): string[] {
-  if (lsp.auto_install === false) return [];
+function inferLspPathsExtra(_lsp: Record<string, unknown>): string[] {
   const paths = new Set<string>();
   for (const entry of childDirs(getAftLspPackagesDir())) {
     paths.add(join(entry, "node_modules", ".bin"));

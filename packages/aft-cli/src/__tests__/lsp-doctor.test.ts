@@ -1,6 +1,9 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { HarnessAdapter, HarnessConfigPaths } from "../adapters/types.js";
 import { printLspDoctorHelp, renderLspInspection, runLspDoctor } from "../commands/lsp.js";
 import type { AftRequest, AftResponse } from "../lib/aft-bridge.js";
@@ -56,6 +59,22 @@ function captureConsole(fn: () => void): string[] {
   }
   return lines;
 }
+
+const tempRoots = new Set<string>();
+const originalCwd = process.cwd();
+
+function tempRoot(prefix: string): string {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  tempRoots.add(root);
+  return root;
+}
+
+afterEach(() => {
+  process.chdir(originalCwd);
+  delete process.env.AFT_CACHE_DIR;
+  for (const root of tempRoots) rmSync(root, { recursive: true, force: true });
+  tempRoots.clear();
+});
 
 describe("doctor lsp", () => {
   test("renders help text when no file is passed", () => {
@@ -173,5 +192,46 @@ describe("doctor lsp", () => {
     expect(code).toBe(0);
     expect(requests[0][0].command).toBe("configure");
     expect(requests[0][1].command).toBe("lsp_inspect");
+  });
+
+  test("infers cached lsp_paths_extra even when lsp.auto_install is false", async () => {
+    const cacheRoot = tempRoot("aft-lsp-cache-");
+    process.env.AFT_CACHE_DIR = cacheRoot;
+    const cachedBinDir = join(cacheRoot, "lsp-packages", "pyright", "node_modules", ".bin");
+    mkdirSync(cachedBinDir, { recursive: true });
+
+    const projectRoot = tempRoot("aft-lsp-project-");
+    mkdirSync(join(projectRoot, ".opencode"), { recursive: true });
+    writeFileSync(
+      join(projectRoot, ".opencode", "aft.json"),
+      JSON.stringify({ lsp: { auto_install: false } }),
+    );
+    process.chdir(projectRoot);
+
+    let configure: AftRequest | undefined;
+    const code = await runLspDoctor({
+      argv: ["./main.py", "--harness", "opencode"],
+      findBinary: () => "/tmp/aft-bin",
+      resolveAdapters: async () => [makeAdapter()],
+      sendRequests: async (_binary, batch) => {
+        configure = batch[0];
+        return [
+          { id: "doctor-lsp-configure", success: true },
+          {
+            id: "doctor-lsp-inspect",
+            success: true,
+            file: join(projectRoot, "main.py"),
+            extension: "py",
+            project_root: projectRoot,
+            matching_servers: [],
+            diagnostics_count: 0,
+            diagnostics: [],
+          },
+        ];
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(configure?.lsp_paths_extra).toContain(cachedBinDir);
   });
 });

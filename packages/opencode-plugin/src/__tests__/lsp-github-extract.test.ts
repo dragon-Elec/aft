@@ -10,7 +10,10 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { validateExtraction } from "../lsp-github-install.js";
+import {
+  _precheckArchiveSizeForTesting as precheckArchiveSize,
+  validateExtraction,
+} from "../lsp-github-install.js";
 
 const tempRoots = new Set<string>();
 
@@ -24,6 +27,44 @@ afterEach(() => {
   for (const root of tempRoots) rmSync(root, { recursive: true, force: true });
   tempRoots.clear();
 });
+
+describe("precheckArchiveSize", () => {
+  test("rejects an archive TOC with a sparse-sized member before extraction", () => {
+    const root = createStagingFixture();
+    const archivePath = join(root, "bomb.zip");
+    writeFakeZipWithUncompressedSize(archivePath, 1024 * 1024 * 1024 + 1);
+
+    expect(() => precheckArchiveSize(archivePath, "zip")).toThrow(/archive uncompressed size/);
+  });
+});
+
+function writeFakeZipWithUncompressedSize(path: string, uncompressedSize: number): void {
+  const name = Buffer.from("sparse.bin");
+  const local = Buffer.alloc(30 + name.length);
+  local.writeUInt32LE(0x04034b50, 0);
+  local.writeUInt16LE(20, 4);
+  local.writeUInt32LE(0, 14);
+  local.writeUInt32LE(uncompressedSize, 22);
+  local.writeUInt16LE(name.length, 26);
+  name.copy(local, 30);
+
+  const central = Buffer.alloc(46 + name.length);
+  central.writeUInt32LE(0x02014b50, 0);
+  central.writeUInt16LE(20, 4);
+  central.writeUInt16LE(20, 6);
+  central.writeUInt32LE(0, 16);
+  central.writeUInt32LE(uncompressedSize, 24);
+  central.writeUInt16LE(name.length, 28);
+  name.copy(central, 46);
+
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(1, 8);
+  end.writeUInt16LE(1, 10);
+  end.writeUInt32LE(central.length, 12);
+  end.writeUInt32LE(local.length, 16);
+  writeFileSync(path, Buffer.concat([local, central, end]));
+}
 
 describe("validateExtraction", () => {
   test("accepts a normal extraction with regular files only", () => {

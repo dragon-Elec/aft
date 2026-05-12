@@ -30,12 +30,14 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createReadStream, statSync } from "node:fs";
+import { createReadStream, mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { error, log, warn } from "./logger.js";
 import {
   isInstalled,
   lspBinaryPath,
   lspBinDir,
+  lspPackageDir,
   readInstalledMeta,
   readVersionCheck,
   shouldRecheckVersion,
@@ -456,6 +458,56 @@ function hashInstalledBinary(spec: NpmServerSpec): Promise<string> {
   });
 }
 
+function installedBinaryPath(spec: NpmServerSpec): string | null {
+  const candidates =
+    process.platform === "win32"
+      ? [
+          lspBinaryPath(spec.npm, spec.binary),
+          lspBinaryPath(spec.npm, `${spec.binary}.cmd`),
+          lspBinaryPath(spec.npm, `${spec.binary}.exe`),
+          lspBinaryPath(spec.npm, `${spec.binary}.bat`),
+        ]
+      : [lspBinaryPath(spec.npm, spec.binary)];
+  for (const candidate of candidates) {
+    try {
+      if (statSync(candidate).isFile()) return candidate;
+    } catch {}
+  }
+  return null;
+}
+
+function sha256OfFileSync(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function quarantineCachedNpmInstall(spec: NpmServerSpec, reason: string): void {
+  const packageDir = lspPackageDir(spec.npm);
+  const dest = join(packageDir, "..", ".quarantine", encodeURIComponent(spec.npm), `${Date.now()}`);
+  warn(`[lsp] tofu_mismatch ${spec.npm}: ${reason}; quarantining ${packageDir} -> ${dest}`);
+  try {
+    mkdirSync(join(dest, ".."), { recursive: true });
+    rmSync(dest, { recursive: true, force: true });
+    renameSync(packageDir, dest);
+  } catch (err) {
+    warn(`[lsp] tofu_mismatch ${spec.npm}: failed to quarantine cache entry: ${err}`);
+  }
+}
+
+function validateCachedNpmInstall(spec: NpmServerSpec): boolean {
+  const meta = readInstalledMeta(spec.npm);
+  const binaryPath = installedBinaryPath(spec);
+  if (!meta?.sha256 || !meta.version || !isSafeVersion(meta.version) || !binaryPath) {
+    quarantineCachedNpmInstall(spec, "missing/unsafe metadata or binary");
+    return false;
+  }
+  const currentHash = sha256OfFileSync(binaryPath);
+  if (currentHash !== meta.sha256) {
+    quarantineCachedNpmInstall(spec, `recorded ${meta.sha256}, current ${currentHash}`);
+    return false;
+  }
+  return true;
+}
+
 /**
  * Top-level entry point. Returns the list of bin directories that already
  * have an installed binary AND kicks off background installs for missing
@@ -483,7 +535,7 @@ export function runAutoInstall(
 
   for (const spec of NPM_LSP_TABLE) {
     // 1. Always include cached bin dirs the Rust resolver can use right now.
-    if (isInstalled(spec.npm, spec.binary)) {
+    if (isInstalled(spec.npm, spec.binary) && validateCachedNpmInstall(spec)) {
       cachedBinDirs.push(lspBinDir(spec.npm));
     }
 

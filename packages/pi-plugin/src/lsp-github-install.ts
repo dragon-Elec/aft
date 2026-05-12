@@ -39,6 +39,7 @@ import {
   lstatSync,
   mkdirSync,
   readdirSync,
+  readFileSync,
   readlinkSync,
   realpathSync,
   renameSync,
@@ -165,6 +166,10 @@ function sha256OfFile(path: string): Promise<string> {
   });
 }
 
+function sha256OfFileSync(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
 /* ─────────────────────────── pin resolution (audit #5) ─────────────────────────── */
 
 /**
@@ -211,11 +216,7 @@ async function fetchReleaseByTag(
     const url = `https://api.github.com/repos/${githubRepo}/releases/tags/${encodeURIComponent(candidate)}`;
     const timeout = controlledTimeoutSignal(15_000, signal);
     try {
-      const res = await fetchImpl(url, {
-        headers,
-        redirect: "follow",
-        signal: timeout.signal,
-      });
+      const res = await fetchJsonFollowingRedirects(url, headers, fetchImpl, timeout.signal);
       if (res.status === 404) continue; // try next candidate
       if (!res.ok) {
         warn(`[lsp] github release-by-tag ${githubRepo}@${candidate}: HTTP ${res.status}`);
@@ -249,6 +250,28 @@ async function fetchReleaseByTag(
     }
   }
   return null;
+}
+
+async function fetchJsonFollowingRedirects(
+  url: string,
+  headers: Record<string, string>,
+  fetchImpl: typeof fetch,
+  signal?: AbortSignal,
+): Promise<Response> {
+  const maxRedirects = 5;
+  let currentUrl = url;
+  for (let i = 0; i <= maxRedirects; i += 1) {
+    assertAllowedDownloadUrl(currentUrl);
+    const res = await fetchImpl(currentUrl, { headers, redirect: "manual", signal });
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers.get("location");
+      if (!location) throw new Error(`redirect status ${res.status} without Location`);
+      currentUrl = new URL(location, currentUrl).toString();
+      continue;
+    }
+    return res;
+  }
+  throw new Error(`too many redirects (>${maxRedirects})`);
 }
 
 /* ─────────────────────────── orchestrator ─────────────────────────── */
@@ -425,8 +448,6 @@ async function downloadFile(
   signal?: AbortSignal,
 ): Promise<void> {
   // Audit-3 v0.17 #5: enforce hostname allowlist before any network I/O.
-  assertAllowedDownloadUrl(url);
-
   if (assetSize !== undefined && assetSize > MAX_DOWNLOAD_BYTES) {
     throw new Error(
       `asset size ${assetSize} exceeds max ${MAX_DOWNLOAD_BYTES} (set lsp.versions to pin a smaller release if this is wrong)`,
@@ -435,11 +456,7 @@ async function downloadFile(
 
   const timeout = controlledTimeoutSignal(120_000, signal);
   try {
-    const res = await fetchImpl(url, {
-      headers: { accept: "application/octet-stream" },
-      redirect: "follow",
-      signal: timeout.signal,
-    });
+    const res = await fetchFollowingRedirects(url, fetchImpl, timeout.signal);
     if (!res.ok || !res.body) {
       throw new Error(`download failed (${res.status})`);
     }
@@ -485,6 +502,31 @@ async function downloadFile(
   } finally {
     timeout.cleanup();
   }
+}
+
+async function fetchFollowingRedirects(
+  url: string,
+  fetchImpl: typeof fetch,
+  signal?: AbortSignal,
+): Promise<Response> {
+  const maxRedirects = 5;
+  let currentUrl = url;
+  for (let i = 0; i <= maxRedirects; i += 1) {
+    assertAllowedDownloadUrl(currentUrl);
+    const res = await fetchImpl(currentUrl, {
+      headers: { accept: "application/octet-stream" },
+      redirect: "manual",
+      signal,
+    });
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers.get("location");
+      if (!location) throw new Error(`redirect status ${res.status} without Location`);
+      currentUrl = new URL(location, currentUrl).toString();
+      continue;
+    }
+    return res;
+  }
+  throw new Error(`too many redirects (>${maxRedirects})`);
 }
 
 /* ─────────────────────────── extraction (audit #3) ─────────────────────────── */
@@ -591,6 +633,29 @@ export function validateExtraction(stagingRoot: string): void {
  *   4. Atomic rename: `staging → destDir`. Any prior `destDir` is removed first.
  *   5. Always cleanup staging on any failure.
  */
+function precheckArchiveSize(archivePath: string, archiveType: string): void {
+  let totalBytes = 0;
+  if (archiveType === "zip") {
+    const out = execFileSync("unzip", ["-l", archivePath], { encoding: "utf8" });
+    const match = out.match(/^\s*(\d+)\s+\d+\s+files?\s*$/m);
+    if (match) totalBytes = Number.parseInt(match[1] ?? "0", 10);
+  } else {
+    const out = execFileSync("tar", ["-tvf", archivePath], { encoding: "utf8" });
+    for (const line of out.split("\n")) {
+      const parts = line.trim().split(/\s+/);
+      if (parts.length >= 6) {
+        const numeric = parts
+          .map((part) => Number.parseInt(part, 10))
+          .filter((value) => Number.isFinite(value) && value >= 0);
+        if (numeric.length > 0) totalBytes += Math.max(...numeric);
+      }
+    }
+  }
+  if (totalBytes > MAX_EXTRACT_BYTES) {
+    throw new Error(`archive uncompressed size ${totalBytes} exceeds ${MAX_EXTRACT_BYTES}`);
+  }
+}
+
 function extractArchiveSafely(archivePath: string, destDir: string, archiveType: string): void {
   // Per-process random suffix avoids collisions if two installs of the
   // same package somehow race past the install lock (defense in depth).
@@ -607,6 +672,7 @@ function extractArchiveSafely(archivePath: string, destDir: string, archiveType:
   mkdirSync(stagingDir, { recursive: true });
 
   try {
+    precheckArchiveSize(archivePath, archiveType);
     runPlatformExtractor(archivePath, stagingDir, archiveType);
     validateExtraction(stagingDir);
 
@@ -627,6 +693,42 @@ function extractArchiveSafely(archivePath: string, destDir: string, archiveType:
     }
     throw err;
   }
+}
+
+function quarantineCachedGithubInstall(spec: GithubServerSpec, reason: string): void {
+  const packageDir = ghPackageDir(spec);
+  const dest = join(ghCacheRoot(), ".quarantine", encodeURIComponent(spec.id), `${Date.now()}`);
+  warn(`[lsp] tofu_mismatch ${spec.id}: ${reason}; quarantining ${packageDir} -> ${dest}`);
+  try {
+    mkdirSync(dirname(dest), { recursive: true });
+    rmSync(dest, { recursive: true, force: true });
+    renameSync(packageDir, dest);
+  } catch (err) {
+    warn(`[lsp] tofu_mismatch ${spec.id}: failed to quarantine cache entry: ${err}`);
+  }
+}
+
+function validateCachedGithubInstall(spec: GithubServerSpec, platform: Platform): boolean {
+  const meta = readInstalledMetaIn(ghPackageDir(spec));
+  const binaryPath = ghBinaryCandidates(spec, platform)
+    .map((candidate) => join(ghBinDir(spec), candidate))
+    .find((candidate) => {
+      try {
+        return statSync(candidate).isFile();
+      } catch {
+        return false;
+      }
+    });
+  if (!meta?.sha256 || !meta.version || !isSafeVersion(meta.version) || !binaryPath) {
+    quarantineCachedGithubInstall(spec, "missing/unsafe metadata or binary");
+    return false;
+  }
+  const currentHash = sha256OfFileSync(binaryPath);
+  if (currentHash !== meta.sha256) {
+    quarantineCachedGithubInstall(spec, `recorded ${meta.sha256}, current ${currentHash}`);
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -954,7 +1056,10 @@ export function runGithubAutoInstall(
   }
 
   for (const spec of GITHUB_LSP_TABLE) {
-    if (isGithubInstalled(spec, host.platform)) {
+    if (
+      isGithubInstalled(spec, host.platform) &&
+      validateCachedGithubInstall(spec, host.platform)
+    ) {
       cachedBinDirs.push(ghBinDir(spec));
     }
 
@@ -1067,6 +1172,8 @@ export function discoverRelevantGithubServers(projectRoot: string): Set<string> 
 export {
   type Arch,
   assertAllowedDownloadUrl as _assertAllowedDownloadUrlForTesting,
+  downloadFile as _downloadFileForTesting,
+  precheckArchiveSize as _precheckArchiveSizeForTesting,
   detectHostPlatform,
   findGithubServerById,
   GITHUB_LSP_TABLE,

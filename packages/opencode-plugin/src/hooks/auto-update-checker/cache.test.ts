@@ -9,6 +9,23 @@ mock.module("../../logger.js", () => ({
   error: mock(() => {}),
 }));
 
+/**
+ * Lane G's auto-update-snapshot path (createAutoUpdateSnapshot in
+ * cache.ts) calls `mkdtempSync` + `cpSync` to stage the installed
+ * package directory before mutating it. Tests don't have a real
+ * filesystem for those paths, so we stub both to no-op. Without these
+ * stubs, `cpSync` throws ENOENT inside preparePackageUpdate's try
+ * block and the function returns null (looking like a regression).
+ */
+function stubSnapshotFs() {
+  const mkdtempSpy = spyOn(fs, "mkdtempSync").mockReturnValue("/tmp/aft-test-snapshot");
+  const cpSpy = spyOn(fs, "cpSync").mockReturnValue(undefined);
+  return () => {
+    mkdtempSpy.mockRestore();
+    cpSpy.mockRestore();
+  };
+}
+
 let importCounter = 0;
 
 function freshCacheImport() {
@@ -88,6 +105,7 @@ describe("auto-update-checker/cache", () => {
         },
       );
       const rmSpy = spyOn(fs, "rmSync").mockReturnValue(undefined);
+      const restoreSnapshotFs = stubSnapshotFs();
       const { preparePackageUpdate } = await freshCacheImport();
 
       expect(
@@ -109,6 +127,7 @@ describe("auto-update-checker/cache", () => {
       readSpy.mockRestore();
       writeSpy.mockRestore();
       rmSpy.mockRestore();
+      restoreSnapshotFs();
     });
 
     test("does not rewrite package.json when dependency is already target version", async () => {
@@ -125,6 +144,7 @@ describe("auto-update-checker/cache", () => {
       );
       const writeSpy = spyOn(fs, "writeFileSync").mockImplementation(() => {});
       const rmSpy = spyOn(fs, "rmSync").mockReturnValue(undefined);
+      const restoreSnapshotFs = stubSnapshotFs();
       const { preparePackageUpdate } = await freshCacheImport();
 
       expect(
@@ -141,6 +161,7 @@ describe("auto-update-checker/cache", () => {
       readSpy.mockRestore();
       writeSpy.mockRestore();
       rmSpy.mockRestore();
+      restoreSnapshotFs();
     });
   });
 
@@ -163,7 +184,9 @@ describe("auto-update-checker/cache", () => {
         ["install", "--no-audit", "--no-fund", "--no-progress"],
         {
           cwd: "/tmp/opencode",
-          stdio: "pipe",
+          // Lane G F6: stdio:"ignore" so spawned npm doesn't keep file
+          // descriptors open and prevent the plugin host from exiting.
+          stdio: "ignore",
         },
       );
 
@@ -232,6 +255,7 @@ describe("auto-update-checker/cache", () => {
         },
       );
       const rmSpy = spyOn(fs, "rmSync").mockReturnValue(undefined);
+      const restoreSnapshotFs = stubSnapshotFs();
 
       const { preparePackageUpdate } = await freshCacheImport();
       preparePackageUpdate(
@@ -255,6 +279,7 @@ describe("auto-update-checker/cache", () => {
       readSpy.mockRestore();
       writeSpy.mockRestore();
       rmSpy.mockRestore();
+      restoreSnapshotFs();
     });
 
     test("cleans legacy npm v6 dependencies map alongside packages map", async () => {
@@ -291,6 +316,7 @@ describe("auto-update-checker/cache", () => {
         },
       );
       const rmSpy = spyOn(fs, "rmSync").mockReturnValue(undefined);
+      const restoreSnapshotFs = stubSnapshotFs();
 
       const { preparePackageUpdate } = await freshCacheImport();
       preparePackageUpdate(
@@ -309,6 +335,7 @@ describe("auto-update-checker/cache", () => {
       readSpy.mockRestore();
       writeSpy.mockRestore();
       rmSpy.mockRestore();
+      restoreSnapshotFs();
     });
 
     test("does not touch a stale bun.lock file (no longer the install target)", async () => {

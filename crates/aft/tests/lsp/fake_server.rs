@@ -206,13 +206,19 @@ fn main() -> io::Result<()> {
                 "initialize" => {
                     // Capability variants controlled by env vars so tests
                     // can exercise different code paths:
-                    //   AFT_FAKE_LSP_PULL=1         → declare diagnosticProvider
-                    //   AFT_FAKE_LSP_WORKSPACE=1    → also support workspace/diagnostic
-                    //   (no env)                    → push-only (legacy behavior)
+                    //   AFT_FAKE_LSP_PULL=1                → declare diagnosticProvider
+                    //   AFT_FAKE_LSP_WORKSPACE=1           → also support workspace/diagnostic
+                    //   AFT_FAKE_LSP_NO_WATCHED_FILES=1    → OMIT workspace.didChangeWatchedFiles
+                    //                                        (exercises the F5 capability-gate skip path)
+                    //   (no env)                           → push-only with watched-files support
                     let pull_enabled =
                         std::env::var("AFT_FAKE_LSP_PULL").ok().as_deref() == Some("1");
                     let workspace_pull =
                         std::env::var("AFT_FAKE_LSP_WORKSPACE").ok().as_deref() == Some("1");
+                    let no_watched_files = std::env::var("AFT_FAKE_LSP_NO_WATCHED_FILES")
+                        .ok()
+                        .as_deref()
+                        == Some("1");
 
                     let mut capabilities = json!({
                         "textDocumentSync": 1,
@@ -221,16 +227,19 @@ fn main() -> io::Result<()> {
                         "referencesProvider": true,
                         "renameProvider": {
                             "prepareProvider": true
-                        },
-                        // Advertise didChangeWatchedFiles so the capability gate
+                        }
+                    });
+
+                    if !no_watched_files {
+                        // Default: advertise didChangeWatchedFiles so the capability gate
                         // in notify_files_watched_changed (#32) allows notifications
                         // to reach the fake server during integration tests.
-                        "workspace": {
+                        capabilities["workspace"] = json!({
                             "didChangeWatchedFiles": {
                                 "dynamicRegistration": true
                             }
-                        }
-                    });
+                        });
+                    }
 
                     if pull_enabled {
                         capabilities["diagnosticProvider"] = json!({

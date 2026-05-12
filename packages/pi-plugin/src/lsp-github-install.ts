@@ -1172,11 +1172,11 @@ export function discoverRelevantGithubServers(projectRoot: string): Set<string> 
 export {
   type Arch,
   assertAllowedDownloadUrl as _assertAllowedDownloadUrlForTesting,
-  downloadFile as _downloadFileForTesting,
-  precheckArchiveSize as _precheckArchiveSizeForTesting,
   detectHostPlatform,
+  downloadFile as _downloadFileForTesting,
   findGithubServerById,
   GITHUB_LSP_TABLE,
   type GithubServerSpec,
   type Platform,
+  precheckArchiveSize as _precheckArchiveSizeForTesting,
 };

@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type AutoInstallConfig, runAutoInstall } from "../lsp-auto-install";
-import { lspBinaryPath } from "../lsp-cache";
+import { lspBinaryPath, writeInstalledMeta } from "../lsp-cache";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -66,12 +67,17 @@ function defaultConfig(overrides: Partial<AutoInstallConfig> = {}): AutoInstallC
 
 /**
  * Pre-populate the cache as if a binary were already installed for the
- * given npm package.
+ * given npm package. Writes the binary AND a valid installed-metadata
+ * record so Lane F's TOFU sha256 validation accepts the cache entry.
  */
 function fakeInstalled(npmPackage: string, binary: string): string {
   const path = lspBinaryPath(npmPackage, binary);
   mkdirSync(join(path, ".."), { recursive: true });
-  writeFileSync(path, "#!/bin/sh\nexit 0\n");
+  const content = "#!/bin/sh\nexit 0\n";
+  writeFileSync(path, content);
+  const sha256 = createHash("sha256").update(content).digest("hex");
+  // Version is arbitrary but must pass isSafeVersion (semver-ish).
+  writeInstalledMeta(npmPackage, "1.0.0", sha256);
   return path;
 }
 

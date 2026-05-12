@@ -10,6 +10,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -143,7 +144,19 @@ describe("runGithubAutoInstall", () => {
     }
     const bin = ghBinaryPath(clangd, platform as "darwin" | "linux" | "win32");
     mkdirSync(join(bin, ".."), { recursive: true });
-    writeFileSync(bin, "fake");
+    const binContent = "fake";
+    writeFileSync(bin, binContent);
+    // Lane F's TOFU validation needs a valid `.aft-installed` whose
+    // recorded sha256 matches the binary, otherwise the cached entry is
+    // quarantined and won't appear in cachedBinDirs.
+    const sha256 = createHash("sha256").update(binContent).digest("hex");
+    // ghPackageDir is not exported, but the layout is <pkg>/bin/<binary>,
+    // so dirname twice from the binary path gives us the package dir.
+    const packageDir = join(bin, "..", "..");
+    writeFileSync(
+      join(packageDir, ".aft-installed"),
+      JSON.stringify({ version: "21.1.0", installedAt: "now", sha256 }),
+    );
 
     const fakeFetch = (async () => {
       throw new Error("should not be called when auto_install is false");

@@ -195,6 +195,9 @@ fn watched_file_capability_defaults_false_when_initialize_has_no_field() {
     let config = Config::default();
     let mut manager = LspManager::new();
     manager.override_binary(ServerKind::Rust, fake_server_path());
+    // Drive the fake server to OMIT workspace.didChangeWatchedFiles from its
+    // initialize result so the client's capability tracker defaults to false.
+    manager.set_extra_env("AFT_FAKE_LSP_NO_WATCHED_FILES", "1");
 
     let keys = manager.ensure_server_for_file(&main_rs, &config);
     assert_eq!(keys.len(), 1);

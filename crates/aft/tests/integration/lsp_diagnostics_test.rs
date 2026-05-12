@@ -823,7 +823,16 @@ fn test_lsp_diagnostics_command_response_format() {
     let (_temp_dir, root, files) = rust_workspace_with_files(&["main.rs"]);
     let file = &files[0];
     let fake_server = fake_server_path();
-    let mut aft = AftProcess::spawn_with_env(&[("AFT_LSP_RUST_BINARY", fake_server.as_os_str())]);
+    // Run the fake in pull mode (LSP 3.17 textDocument/diagnostic). After
+    // v0.21.1's F2 freshness fix, push-only servers only prove freshness for
+    // publishes that arrive AFTER push_wait_started_at — an open-time publish
+    // that lands before the lsp_diagnostics call is correctly classified
+    // unfresh. Pull mode is protocol-fresh by design, so it stays a stable
+    // testbed for the response-format contract.
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("AFT_LSP_RUST_BINARY", fake_server.as_os_str()),
+        ("AFT_FAKE_LSP_PULL", "1".as_ref()),
+    ]);
 
     let configure = aft.send(&format!(
         r#"{{"id":"cfg","command":"configure","project_root":"{}"}}"#,
@@ -844,22 +853,23 @@ fn test_lsp_diagnostics_command_response_format() {
 
     assert_eq!(resp["id"], "diag-1");
     assert_eq!(resp["success"], true, "response: {resp:?}");
-    assert_eq!(resp["total"], 2);
+    // Pull mode returns exactly one diagnostic (see fake_server.rs's
+    // textDocument/diagnostic handler).
+    assert_eq!(resp["total"], 1);
     assert_eq!(resp["files_with_errors"], 1);
 
     let diagnostics = resp["diagnostics"].as_array().expect("diagnostics array");
-    assert_eq!(diagnostics.len(), 2);
+    assert_eq!(diagnostics.len(), 1);
     let canonical_file = fs::canonicalize(file).expect("canonical file");
     assert_eq!(diagnostics[0]["file"], canonical_file.display().to_string());
-    assert_eq!(diagnostics[0]["line"], 1);
+    assert_eq!(diagnostics[0]["line"], 5);
     assert_eq!(diagnostics[0]["column"], 1);
-    assert_eq!(diagnostics[0]["end_line"], 1);
-    assert_eq!(diagnostics[0]["end_column"], 6);
+    assert_eq!(diagnostics[0]["end_line"], 5);
+    assert_eq!(diagnostics[0]["end_column"], 9);
     assert_eq!(diagnostics[0]["severity"], "error");
-    assert_eq!(diagnostics[0]["message"], "test diagnostic error");
-    assert_eq!(diagnostics[0]["code"], "E0001");
+    assert_eq!(diagnostics[0]["message"], "test pull diagnostic");
+    assert_eq!(diagnostics[0]["code"], "E0PULL");
     assert_eq!(diagnostics[0]["source"], "fake-lsp");
-    assert_eq!(diagnostics[1]["severity"], "warning");
 
     let status = aft.shutdown();
     assert!(status.success());
@@ -1505,6 +1515,9 @@ fn did_change_watched_files_skipped_when_unsupported() {
         ..Config::default()
     };
     let mut manager = manager_with_fake_typescript_server();
+    // Drive the fake server to OMIT workspace.didChangeWatchedFiles from its
+    // initialize result so we exercise the F5 capability-gate skip path.
+    manager.set_extra_env("AFT_FAKE_LSP_NO_WATCHED_FILES", "1");
 
     manager
         .notify_file_changed(source, "export const value = 2;\n", &config)

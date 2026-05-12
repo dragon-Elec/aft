@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runAutoInstall } from "../lsp-auto-install.js";
@@ -26,7 +26,10 @@ describe("cached LSP validation before lsp_paths_extra", () => {
     const pkgDir = join(root, "lsp-packages", "pyright");
     const binDir = join(pkgDir, "node_modules", ".bin");
     mkdirSync(binDir, { recursive: true });
-    writeFileSync(join(binDir, "pyright"), "tampered");
+    // pyright's binary in NPM_LSP_TABLE is `pyright-langserver` (the LSP),
+    // not the `pyright` CLI. isInstalled only fires when the actual spec.binary
+    // exists, so write that exact name.
+    writeFileSync(join(binDir, "pyright-langserver"), "tampered");
     writeFileSync(
       join(pkgDir, ".aft-installed"),
       JSON.stringify({ version: "1.1.300", installedAt: "now", sha256: "0".repeat(64) }),

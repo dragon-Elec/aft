@@ -176,6 +176,101 @@ fn write_syntax_invalid() {
         resp["syntax_valid"], false,
         "broken TS should have syntax_valid: false"
     );
+    assert_eq!(resp["rolled_back"], false);
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn single_file_write_rolls_back_on_invalid_syntax() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_edit_tests");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("write_rollback_valid_to_invalid.ts");
+    let original = "export function ok(): string { return \"ok\"; }\n";
+    fs::write(&target, original).unwrap();
+
+    let req = serde_json::json!({
+        "id": "w-rb-1",
+        "command": "write",
+        "file": target.display().to_string(),
+        "content": "export function { broken syntax",
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(
+        resp["success"], true,
+        "write should report syntax failure: {:?}",
+        resp
+    );
+    assert_eq!(resp["syntax_valid"], false);
+    assert_eq!(resp["rolled_back"], true);
+    assert_eq!(fs::read_to_string(&target).unwrap(), original);
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn single_file_write_does_not_rollback_when_pre_was_invalid() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_edit_tests");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("write_no_rollback_pre_invalid.ts");
+    fs::write(&target, "export function { already broken\n").unwrap();
+    let replacement = "export const = still_broken\n";
+
+    let req = serde_json::json!({
+        "id": "w-rb-2",
+        "command": "write",
+        "file": target.display().to_string(),
+        "content": replacement,
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(
+        resp["success"], true,
+        "write should preserve invalid replacement: {:?}",
+        resp
+    );
+    assert_eq!(resp["syntax_valid"], false);
+    assert_eq!(resp["rolled_back"], false);
+    assert_eq!(fs::read_to_string(&target).unwrap(), replacement);
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn single_file_write_does_not_rollback_when_new_file() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_edit_tests");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("write_no_rollback_new_invalid.ts");
+    let _ = fs::remove_file(&target);
+
+    let req = serde_json::json!({
+        "id": "w-rb-3",
+        "command": "write",
+        "file": target.display().to_string(),
+        "content": "export function { broken syntax",
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(
+        resp["success"], true,
+        "new invalid file should be written: {:?}",
+        resp
+    );
+    assert_eq!(resp["syntax_valid"], false);
+    assert_eq!(resp["rolled_back"], false);
+    assert!(fs::read_to_string(&target)
+        .unwrap()
+        .contains("broken syntax"));
 
     let _ = fs::remove_file(&target);
     let status = aft.shutdown();

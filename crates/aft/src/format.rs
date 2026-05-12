@@ -4,9 +4,9 @@
 //! mapping, and the `auto_format` entry point used by `write_format_validate`.
 
 use std::collections::{HashMap, HashSet};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -20,6 +20,12 @@ pub struct ExternalToolResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+}
+
+struct SubprocessOutcome {
+    stdout: String,
+    stderr: String,
+    status: ExitStatus,
 }
 
 /// Errors from external tool execution.
@@ -107,42 +113,58 @@ pub fn run_external_tool(
         }
     };
 
+    let outcome = wait_with_timeout(child, command, timeout_secs)?;
+    let exit_code = outcome.status.code().unwrap_or(-1);
+    if exit_code != 0 {
+        return Err(FormatError::Failed {
+            tool: command.to_string(),
+            stderr: outcome.stderr,
+        });
+    }
+
+    Ok(ExternalToolResult {
+        stdout: outcome.stdout,
+        stderr: outcome.stderr,
+        exit_code,
+    })
+}
+
+fn wait_with_timeout(
+    mut child: Child,
+    command: &str,
+    timeout_secs: u32,
+) -> Result<SubprocessOutcome, FormatError> {
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let stdout_thread = thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout_pipe.read_to_string(&mut buf);
+        buf
+    });
+    let stderr_thread = thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stderr_pipe.read_to_string(&mut buf);
+        buf
+    });
     let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
 
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let stdout = child
-                    .stdout
-                    .take()
-                    .map(|s| std::io::read_to_string(s).unwrap_or_default())
-                    .unwrap_or_default();
-                let stderr = child
-                    .stderr
-                    .take()
-                    .map(|s| std::io::read_to_string(s).unwrap_or_default())
-                    .unwrap_or_default();
-
-                let exit_code = status.code().unwrap_or(-1);
-                if exit_code != 0 {
-                    return Err(FormatError::Failed {
-                        tool: command.to_string(),
-                        stderr,
-                    });
-                }
-
-                return Ok(ExternalToolResult {
+                let stdout = stdout_thread.join().unwrap_or_default();
+                let stderr = stderr_thread.join().unwrap_or_default();
+                return Ok(SubprocessOutcome {
                     stdout,
                     stderr,
-                    exit_code,
+                    status,
                 });
             }
             Ok(None) => {
-                // Still running
                 if Instant::now() >= deadline {
-                    // Kill the process and reap it
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = stdout_thread.join().unwrap_or_default();
+                    let _ = stderr_thread.join().unwrap_or_default();
                     return Err(FormatError::Timeout {
                         tool: command.to_string(),
                         timeout_secs,
@@ -151,9 +173,17 @@ pub fn run_external_tool(
                 thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_thread.join().unwrap_or_default();
+                let stderr = stderr_thread.join().unwrap_or_default();
                 return Err(FormatError::Failed {
                     tool: command.to_string(),
-                    stderr: format!("try_wait error: {}", e),
+                    stderr: if stderr.is_empty() {
+                        format!("try_wait error: {}", e)
+                    } else {
+                        format!("try_wait error: {}; stderr: {}", e, stderr)
+                    },
                 });
             }
         }
@@ -1147,47 +1177,12 @@ pub fn run_external_tool_capture(
         }
     };
 
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stdout = child
-                    .stdout
-                    .take()
-                    .map(|s| std::io::read_to_string(s).unwrap_or_default())
-                    .unwrap_or_default();
-                let stderr = child
-                    .stderr
-                    .take()
-                    .map(|s| std::io::read_to_string(s).unwrap_or_default())
-                    .unwrap_or_default();
-
-                return Ok(ExternalToolResult {
-                    stdout,
-                    stderr,
-                    exit_code: status.code().unwrap_or(-1),
-                });
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(FormatError::Timeout {
-                        tool: command.to_string(),
-                        timeout_secs,
-                    });
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                return Err(FormatError::Failed {
-                    tool: command.to_string(),
-                    stderr: format!("try_wait error: {}", e),
-                });
-            }
-        }
-    }
+    let outcome = wait_with_timeout(child, command, timeout_secs)?;
+    Ok(ExternalToolResult {
+        stdout: outcome.stdout,
+        stderr: outcome.stderr,
+        exit_code: outcome.status.code().unwrap_or(-1),
+    })
 }
 
 // ============================================================================
@@ -1613,6 +1608,30 @@ mod tests {
         let res = result.unwrap();
         assert_eq!(res.exit_code, 0);
         assert!(res.stdout.contains("hello"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn format_helper_handles_large_stderr_without_deadlock() {
+        let start = Instant::now();
+        let result = run_external_tool_capture(
+            "sh",
+            &[
+                "-c",
+                "i=0; while [ $i -lt 1024 ]; do printf '%1024s\\n' x >&2; i=$((i+1)); done",
+            ],
+            None,
+            2,
+        )
+        .expect("large stderr command should complete");
+
+        assert_eq!(result.exit_code, 0);
+        assert!(
+            result.stderr.len() >= 1024 * 1024,
+            "expected full stderr capture, got {} bytes",
+            result.stderr.len()
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

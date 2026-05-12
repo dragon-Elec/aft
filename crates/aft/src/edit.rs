@@ -5,6 +5,7 @@
 
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
 
+use std::cell::Cell;
 use std::path::Path;
 
 use crate::config::Config;
@@ -12,6 +13,10 @@ use crate::context::AppContext;
 use crate::error::AftError;
 use crate::format;
 use crate::parser::{detect_language, grammar_for, FileParser};
+
+thread_local! {
+    static LAST_WRITE_ROLLED_BACK: Cell<bool> = Cell::new(false);
+}
 
 /// Convert 0-indexed line/col to a byte offset within `source`.
 ///
@@ -290,6 +295,9 @@ impl WriteResult {
     /// nothing is added — keeps the no-LSP edit path's response shape
     /// unchanged.
     pub fn append_lsp_diagnostics_to(&self, result: &mut serde_json::Value) {
+        let rolled_back = LAST_WRITE_ROLLED_BACK.with(|cell| cell.replace(false));
+        result["rolled_back"] = serde_json::json!(rolled_back);
+
         let Some(outcome) = self.lsp_outcome.as_ref() else {
             return;
         };
@@ -349,6 +357,23 @@ pub fn write_format_validate(
     config: &Config,
     params: &serde_json::Value,
 ) -> Result<WriteResult, AftError> {
+    let pre_write_content = if path.exists() {
+        std::fs::read_to_string(path).ok()
+    } else {
+        None
+    };
+    // Existing clean files are protected from invalid mutations. New files have
+    // no safe prior content to restore, so their pre-write validity remains None
+    // and invalid syntax is reported without rollback.
+    let was_syntax_valid = if pre_write_content.is_some() {
+        match validate_syntax(path) {
+            Ok(valid) => valid,
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
     // Step 1: Write
     std::fs::write(path, content).map_err(|e| AftError::InvalidRequest {
         message: format!("failed to write file: {}", e),
@@ -362,6 +387,19 @@ pub fn write_format_validate(
         Ok(sv) => sv,
         Err(_) => None,
     };
+    let rolled_back = if was_syntax_valid == Some(true) && syntax_valid == Some(false) {
+        if let Some(original) = pre_write_content.as_ref() {
+            std::fs::write(path, original).map_err(|e| AftError::InvalidRequest {
+                message: format!("failed to roll back invalid edit: {}", e),
+            })?;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    LAST_WRITE_ROLLED_BACK.with(|cell| cell.set(rolled_back));
 
     // Step 4: Full validation (type checker) — only when requested
     let param_validate = params.get("validate").and_then(|v| v.as_str());

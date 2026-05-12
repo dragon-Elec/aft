@@ -140,10 +140,10 @@ impl CheckpointStore {
     /// Restore a checkpoint by overwriting files with stored content.
     pub fn restore(&self, session: &str, name: &str) -> Result<CheckpointInfo, AftError> {
         let checkpoint = self.get(session, name)?;
+        let mut paths = checkpoint.file_contents.keys().cloned().collect::<Vec<_>>();
+        paths.sort();
 
-        for (path, content) in &checkpoint.file_contents {
-            write_restored_file(path, content)?;
-        }
+        restore_paths_atomically(checkpoint, &paths)?;
 
         log::info!("checkpoint restored: {}", name);
 
@@ -165,15 +165,14 @@ impl CheckpointStore {
         let checkpoint = self.get(session, name)?;
 
         for path in validated_paths {
-            let content =
-                checkpoint
-                    .file_contents
-                    .get(path)
-                    .ok_or_else(|| AftError::FileNotFound {
-                        path: path.display().to_string(),
-                    })?;
-            write_restored_file(path, content)?;
+            checkpoint
+                .file_contents
+                .get(path)
+                .ok_or_else(|| AftError::FileNotFound {
+                    path: path.display().to_string(),
+                })?;
         }
+        restore_paths_atomically(checkpoint, validated_paths)?;
 
         log::info!("checkpoint restored: {}", name);
 
@@ -243,6 +242,56 @@ impl CheckpointStore {
             .ok_or_else(|| AftError::CheckpointNotFound {
                 name: name.to_string(),
             })
+    }
+}
+
+fn restore_paths_atomically(checkpoint: &Checkpoint, paths: &[PathBuf]) -> Result<(), AftError> {
+    let mut pre_restore_snapshot: HashMap<PathBuf, Option<String>> = HashMap::new();
+    for path in paths {
+        let current = if path.exists() {
+            Some(
+                std::fs::read_to_string(path).map_err(|_| AftError::FileNotFound {
+                    path: path.display().to_string(),
+                })?,
+            )
+        } else {
+            None
+        };
+        pre_restore_snapshot.insert(path.clone(), current);
+    }
+
+    let mut restored_paths: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        let content = checkpoint
+            .file_contents
+            .get(path)
+            .ok_or_else(|| AftError::FileNotFound {
+                path: path.display().to_string(),
+            })?;
+        if let Err(e) = write_restored_file(path, content) {
+            for restored_path in restored_paths.iter().rev() {
+                if let Some(snapshot) = pre_restore_snapshot.get(restored_path) {
+                    let _ = restore_snapshot_file(restored_path, snapshot.as_deref());
+                }
+            }
+            return Err(e);
+        }
+        restored_paths.push(path.clone());
+    }
+
+    Ok(())
+}
+
+fn restore_snapshot_file(path: &Path, content: Option<&str>) -> Result<(), AftError> {
+    match content {
+        Some(content) => write_restored_file(path, content),
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(AftError::FileNotFound {
+                path: path.display().to_string(),
+            }),
+        },
     }
 }
 
@@ -576,5 +625,43 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             "original nested content"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_restore_rolls_back_on_partial_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("a.txt");
+        let path_b = dir.path().join("b.txt");
+        fs::write(&path_a, "checkpoint-a").unwrap();
+        fs::write(&path_b, "checkpoint-b").unwrap();
+
+        let backup_store = BackupStore::new();
+        let mut store = CheckpointStore::new();
+        store
+            .create(
+                DEFAULT_SESSION_ID,
+                "partial_failure",
+                vec![path_a.clone(), path_b.clone()],
+                &backup_store,
+            )
+            .unwrap();
+
+        fs::write(&path_a, "pre-restore-a").unwrap();
+        fs::write(&path_b, "pre-restore-b").unwrap();
+        let mut readonly = fs::metadata(&path_b).unwrap().permissions();
+        readonly.set_mode(0o444);
+        fs::set_permissions(&path_b, readonly).unwrap();
+
+        let result = store.restore(DEFAULT_SESSION_ID, "partial_failure");
+        let mut writable = fs::metadata(&path_b).unwrap().permissions();
+        writable.set_mode(0o644);
+        fs::set_permissions(&path_b, writable).unwrap();
+
+        assert!(result.is_err(), "restore should surface write failure");
+        assert_eq!(fs::read_to_string(&path_a).unwrap(), "pre-restore-a");
+        assert_eq!(fs::read_to_string(&path_b).unwrap(), "pre-restore-b");
     }
 }

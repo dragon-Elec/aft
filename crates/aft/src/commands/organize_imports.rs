@@ -119,10 +119,19 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
     let (grouped, removed_duplicates) = organize(&block.imports, lang);
 
     // --- Generate new import block ---
-    let new_import_text = generate_organized_block(&grouped, lang);
+    let grouped_go_range = if matches!(lang, LangId::Go) {
+        imports::go_has_grouped_import(&source, &_tree)
+    } else {
+        None
+    };
+    let new_import_text = if matches!(lang, LangId::Go) && grouped_go_range.is_some() {
+        generate_go_grouped_block(&grouped)
+    } else {
+        generate_organized_block(&grouped, lang)
+    };
 
     // --- Replace import region ---
-    let import_range = match block.byte_range.as_ref() {
+    let import_range = match grouped_go_range.as_ref().or(block.byte_range.as_ref()) {
         Some(range) => range,
         None => {
             return Response::error(
@@ -262,11 +271,21 @@ fn organize_generic_group(
     let mut organized: Vec<OrganizedImport> = Vec::new();
     let mut removed = 0;
 
-    // Sort by module path first
-    let mut sorted: Vec<&&ImportStatement> = imps.iter().collect();
+    let mut side_effects: Vec<&&ImportStatement> = imps
+        .iter()
+        .filter(|imp| imp.kind == ImportKind::SideEffect)
+        .collect();
+    let mut sorted: Vec<&&ImportStatement> = imps
+        .iter()
+        .filter(|imp| imp.kind != ImportKind::SideEffect)
+        .collect();
     sorted.sort_by(|a, b| a.module_path.cmp(&b.module_path));
 
-    for imp in sorted {
+    // Side-effect imports are evaluation-order sensitive. Keep their original
+    // relative source order as a pinned subgroup before value/type imports.
+    side_effects.extend(sorted);
+
+    for imp in side_effects {
         // Build dedup key: module_path + kind + sorted names + default + namespace.
         // Namespace imports introduce local bindings, so different aliases are
         // distinct and side-effect imports are not duplicates of namespace
@@ -500,6 +519,25 @@ fn generate_organized_block(
     }
 
     parts.join("\n\n")
+}
+
+fn generate_go_grouped_block(grouped: &[(ImportGroup, Vec<OrganizedImport>)]) -> String {
+    let mut lines = Vec::new();
+    lines.push("import (".to_string());
+    for (group_idx, (_, imps)) in grouped.iter().enumerate() {
+        if group_idx > 0 {
+            lines.push(String::new());
+        }
+        for imp in imps {
+            if let Some(ref alias) = imp.default_import {
+                lines.push(format!("\t{} \"{}\"", alias, imp.module_path));
+            } else {
+                lines.push(format!("\t\"{}\"", imp.module_path));
+            }
+        }
+    }
+    lines.push(")".to_string());
+    lines.join("\n")
 }
 
 /// Generate a single import line from an OrganizedImport.

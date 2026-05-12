@@ -922,6 +922,14 @@ pub(crate) fn node_range(node: &Node) -> Range {
 /// This ensures that when agents edit/replace a symbol, they get the full
 /// declaration including `#[test]`, `#[derive(...)]`, `/// doc`, `@decorator`, etc.
 pub(crate) fn node_range_with_decorators(node: &Node, source: &str, lang: LangId) -> Range {
+    if matches!(lang, LangId::Python) {
+        if let Some(parent) = node.parent() {
+            if parent.kind() == "decorated_definition" {
+                return node_range(&parent);
+            }
+        }
+    }
+
     let mut range = node_range(node);
 
     let mut current = *node;

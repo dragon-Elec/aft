@@ -1462,7 +1462,7 @@ fn generate_go_import_line(module_path: &str, alias: Option<&str>, in_group: boo
 }
 
 /// Check if a Go import block has a grouped import declaration.
-/// Returns the byte range of the import_spec_list if found.
+/// Returns the byte range of the full import_declaration if found.
 pub fn go_has_grouped_import(_source: &str, tree: &Tree) -> Option<Range<usize>> {
     let root = tree.root_node();
     let mut cursor = root.walk();
@@ -1477,7 +1477,7 @@ pub fn go_has_grouped_import(_source: &str, tree: &Tree) -> Option<Range<usize>>
             if c.goto_first_child() {
                 loop {
                     if c.node().kind() == "import_spec_list" {
-                        return Some(c.node().byte_range());
+                        return Some(node.byte_range());
                     }
                     if !c.goto_next_sibling() {
                         break;

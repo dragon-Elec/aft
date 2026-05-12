@@ -835,6 +835,46 @@ fn remove_import_missing_module_reports_not_removed() {
     aft.shutdown();
 }
 
+#[test]
+fn remove_import_preserves_default_when_named_removed() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_import_tests");
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join(format!(
+        "remove_default_named_{}.ts",
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::write(
+        &file,
+        "import React, { useState } from 'react';\n\nexport const App = React.Fragment;\n",
+    )
+    .unwrap();
+
+    let resp = send_remove_import(
+        &mut aft,
+        "rm-preserve-default",
+        &file.display().to_string(),
+        "react",
+        Some("useState"),
+    );
+    assert_eq!(resp["success"], true, "remove should succeed: {resp:?}");
+    let content = fs::read_to_string(&file).unwrap();
+    assert!(
+        content.contains("import React from 'react';"),
+        "default import should remain:\n{content}"
+    );
+    assert!(
+        !content.contains("useState"),
+        "named import should be removed"
+    );
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
 // ===========================================================================
 // organize_imports tests
 // ===========================================================================
@@ -894,6 +934,86 @@ export function App() {}
     );
 
     assert_eq!(resp["syntax_valid"], true);
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn organize_imports_preserves_side_effect_order() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_import_tests");
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join(format!(
+        "organize_side_effects_{}.ts",
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::write(
+        &file,
+        "import './b';\nimport z from 'zod';\nimport './a';\nimport React from 'react';\n\nexport const x = 1;\n",
+    )
+    .unwrap();
+
+    let resp = send_organize_imports(&mut aft, "org-side-effects", &file.display().to_string());
+    assert_eq!(resp["success"], true, "organize should succeed: {resp:?}");
+    let content = fs::read_to_string(&file).unwrap();
+    let b_pos = content.find("import './b';").unwrap();
+    let a_pos = content.find("import './a';").unwrap();
+    let react_pos = content.find("import React from 'react';").unwrap();
+    let zod_pos = content.find("import z from 'zod';").unwrap();
+    assert!(
+        b_pos < a_pos,
+        "side effects keep original order:\n{content}"
+    );
+    assert!(
+        a_pos < react_pos,
+        "side effects precede value imports:\n{content}"
+    );
+    assert!(
+        react_pos < zod_pos,
+        "value imports alphabetized:\n{content}"
+    );
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn organize_imports_go_grouped_block_parses() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_import_tests");
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join(format!(
+        "organize_go_grouped_{}.go",
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::write(
+        &file,
+        "package main\n\nimport (\n\t\"os\"\n\t\"fmt\"\n)\n\nfunc main() {}\n",
+    )
+    .unwrap();
+
+    let resp = send_organize_imports(&mut aft, "org-go-grouped", &file.display().to_string());
+    assert_eq!(resp["success"], true, "organize should succeed: {resp:?}");
+    let content = fs::read_to_string(&file).unwrap();
+    assert!(
+        content.contains("import (\n\t\"fmt\"\n\t\"os\"\n)"),
+        "grouped block should be regenerated and sorted:\n{content}"
+    );
+    let mut parser = tree_sitter::Parser::new();
+    let language: tree_sitter::Language = tree_sitter_go::LANGUAGE.into();
+    parser.set_language(&language).expect("set go grammar");
+    let tree = parser.parse(&content, None).expect("parse go");
+    assert!(
+        !tree.root_node().has_error(),
+        "Go output should parse:\n{content}"
+    );
 
     fs::remove_file(&file).ok();
     aft.shutdown();

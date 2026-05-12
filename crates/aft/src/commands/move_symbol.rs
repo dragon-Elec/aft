@@ -12,7 +12,7 @@ use crate::edit;
 use crate::error::AftError;
 use crate::imports;
 use crate::lsp_hints;
-use crate::parser::{detect_language, LangId};
+use crate::parser::{detect_language, grammar_for, LangId};
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::SymbolKind;
 
@@ -106,6 +106,48 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             "invalid_request",
             "move_symbol: source and destination are the same file",
         );
+    }
+
+    let source_lang = match detect_language(source_path) {
+        Some(lang @ (LangId::TypeScript | LangId::Tsx | LangId::JavaScript)) => lang,
+        Some(lang) => {
+            return Response::error(
+                &req.id,
+                "unsupported_language",
+                format!(
+                    "move_symbol currently supports TypeScript/JavaScript only; got {:?}",
+                    lang
+                ),
+            );
+        }
+        None => {
+            return Response::error(
+                &req.id,
+                "unsupported_language",
+                "move_symbol currently supports TypeScript/JavaScript only; got unknown",
+            );
+        }
+    };
+
+    match detect_language(dest_path) {
+        Some(LangId::TypeScript | LangId::Tsx | LangId::JavaScript) => {}
+        Some(lang) => {
+            return Response::error(
+                &req.id,
+                "unsupported_language",
+                format!(
+                    "move_symbol currently supports TypeScript/JavaScript only; got {:?}",
+                    lang
+                ),
+            );
+        }
+        None => {
+            return Response::error(
+                &req.id,
+                "unsupported_language",
+                "move_symbol currently supports TypeScript/JavaScript only; got unknown",
+            );
+        }
     }
 
     // --- Call graph guard (D089) ---
@@ -241,11 +283,10 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     // whitespace then look for the literal token, which is robust because the
     // parser already told us this declaration IS exported — there must be an
     // `export` keyword somewhere immediately before it.
-    let lang = detect_language(source_path);
     let start_byte = if target.exported
         && matches!(
-            lang,
-            Some(LangId::TypeScript) | Some(LangId::Tsx) | Some(LangId::JavaScript)
+            source_lang,
+            LangId::TypeScript | LangId::Tsx | LangId::JavaScript
         ) {
         find_export_keyword_start(&source_content, raw_start_byte).unwrap_or(raw_start_byte)
     } else {
@@ -315,7 +356,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     // Collect consumer files that need import rewriting
     // CallerGroup.file is relative to project root — resolve to absolute
     let project_root = graph.project_root().to_path_buf();
-    let consumer_files: Vec<PathBuf> = consumers
+    let mut consumer_files: Vec<PathBuf> = consumers
         .iter()
         .map(|cg| {
             let p = PathBuf::from(&cg.file);
@@ -327,6 +368,9 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         })
         .filter(|p| p != source_path && p != dest_path)
         .collect();
+    collect_ts_js_files(&project_root, &mut consumer_files, source_path, dest_path);
+    consumer_files.sort();
+    consumer_files.dedup();
 
     // `lang` already detected above for the export-keyword extension.
 
@@ -347,7 +391,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             source_path,
             dest_path,
             symbol_name,
-            lang,
+            Some(source_lang),
         );
 
         if let Some(rewritten) = new_consumer {
@@ -826,6 +870,29 @@ fn append_symbol_to_dest(dest_content: &str, symbol_text: &str) -> String {
     }
 }
 
+fn collect_ts_js_files(root: &Path, out: &mut Vec<PathBuf>, source_path: &Path, dest_path: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().and_then(|n| n.to_str()) == Some("node_modules") {
+                continue;
+            }
+            collect_ts_js_files(&path, out, source_path, dest_path);
+        } else if matches!(
+            detect_language(&path),
+            Some(LangId::TypeScript | LangId::Tsx | LangId::JavaScript)
+        ) {
+            let canon = std::fs::canonicalize(&path).unwrap_or(path);
+            if canon != source_path && canon != dest_path {
+                out.push(canon);
+            }
+        }
+    }
+}
+
 /// Rewrite a consumer file's imports to point to the new destination.
 ///
 /// Finds imports from the source file that include the moved symbol,
@@ -856,8 +923,7 @@ fn rewrite_consumer_imports(
     let content = consumer_content;
 
     // Find imports from the source file that reference the moved symbol
-    let mut result = content.to_string();
-    let mut offset_delta: isize = 0; // track byte shifts from prior edits
+    let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
 
     // Process imports in reverse order to maintain byte offsets
     let mut matching_imports: Vec<(usize, &imports::ImportStatement)> = block
@@ -904,15 +970,6 @@ fn rewrite_consumer_imports(
         let type_only = imp.kind == imports::ImportKind::Type;
 
         // Build the replacement text
-        let start = match (imp.byte_range.start as isize).checked_add(offset_delta) {
-            Some(v) if v >= 0 => v as usize,
-            _ => return None, // offset overflow — skip rewrite
-        };
-        let end = match (imp.byte_range.end as isize).checked_add(offset_delta) {
-            Some(v) if v >= 0 => v as usize,
-            _ => return None, // offset overflow — skip rewrite
-        };
-
         if remaining_names.is_empty() && remaining_default.is_none() {
             // All symbols in this import are moving — replace entire import with new path
             // Preserve the original import structure but change the path
@@ -923,9 +980,7 @@ fn rewrite_consumer_imports(
                 type_only,
                 lang,
             );
-            let old_len = end - start;
-            result = format!("{}{}{}", &result[..start], new_import, &result[end..]);
-            offset_delta += new_import.len() as isize - old_len as isize;
+            edits.push((imp.byte_range.clone(), new_import));
         } else {
             // Some symbols remain — keep old import for remaining, add new import for moved
             let kept_import = imports::generate_import_line(
@@ -946,11 +1001,79 @@ fn rewrite_consumer_imports(
             );
 
             let replacement = format!("{}\n{}", kept_import, moved_import);
-            let old_len = end - start;
-            result = format!("{}{}{}", &result[..start], replacement, &result[end..]);
-            offset_delta += replacement.len() as isize - old_len as isize;
+            edits.push((imp.byte_range.clone(), replacement));
         }
+    }
 
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&grammar_for(lang)).is_ok() {
+        if let Some(tree) = parser.parse(content, None) {
+            let root = tree.root_node();
+            let mut exports = Vec::new();
+            let mut cursor = root.walk();
+            if cursor.goto_first_child() {
+                loop {
+                    let node = cursor.node();
+                    if node.kind() == "export_statement"
+                        && export_path_matches_file(content, &node, consumer_file, source_file)
+                    {
+                        exports.push(node);
+                    }
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
+                }
+            }
+
+            exports.sort_by(|a, b| b.byte_range().start.cmp(&a.byte_range().start));
+            for node in exports {
+                if export_statement_has_wildcard(content, &node) {
+                    // TODO: safely rewrite `export * from "..."` once moved-symbol
+                    // provenance can distinguish which names are provided by the star.
+                    log::warn!(
+                        "move_symbol: leaving wildcard re-export unchanged in {}",
+                        consumer_file.display()
+                    );
+                    continue;
+                }
+                if !export_statement_contains_name(content, &node, symbol_name) {
+                    continue;
+                }
+                let Some(module_range) = export_module_string_range(content, &node) else {
+                    continue;
+                };
+                let Some((moved_specs, remaining_specs)) =
+                    partition_export_specifiers(content, &node, symbol_name)
+                else {
+                    continue;
+                };
+                let new_import_path = compute_relative_import_path(consumer_file, dest_file);
+                if remaining_specs.is_empty() {
+                    edits.push((module_range, new_import_path));
+                } else {
+                    let old_path = &content[module_range];
+                    let replacement = format!(
+                        "export {{ {} }} from '{}';\nexport {{ {} }} from '{}';",
+                        remaining_specs.join(", "),
+                        old_path,
+                        moved_specs.join(", "),
+                        new_import_path
+                    );
+                    edits.push((node.byte_range(), replacement));
+                }
+            }
+        }
+    }
+
+    edits.sort_by(|a, b| b.0.start.cmp(&a.0.start));
+    let mut result = content.to_string();
+    for (range, replacement) in edits {
+        result = format!(
+            "{}{}{}",
+            &result[..range.start],
+            replacement,
+            &result[range.end..]
+        );
         made_changes = true;
     }
 
@@ -959,6 +1082,86 @@ fn rewrite_consumer_imports(
     } else {
         None
     }
+}
+
+fn export_path_matches_file(
+    source: &str,
+    node: &tree_sitter::Node,
+    consumer_file: &Path,
+    source_file: &Path,
+) -> bool {
+    export_module_path(source, node)
+        .as_deref()
+        .is_some_and(|path| import_path_matches_file(path, consumer_file, source_file))
+}
+
+fn export_module_path(source: &str, node: &tree_sitter::Node) -> Option<String> {
+    export_module_string_range(source, node).map(|range| source[range].to_string())
+}
+
+fn export_module_string_range(
+    source: &str,
+    node: &tree_sitter::Node,
+) -> Option<std::ops::Range<usize>> {
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+    loop {
+        let child = cursor.node();
+        if child.kind() == "string" {
+            let raw = &source[child.byte_range()];
+            let start = child.byte_range().start + 1;
+            let end = child.byte_range().end.saturating_sub(1);
+            if (raw.starts_with('\'') || raw.starts_with('"'))
+                && (raw.ends_with('\'') || raw.ends_with('"'))
+                && start <= end
+            {
+                return Some(start..end);
+            }
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+    None
+}
+
+fn export_statement_has_wildcard(source: &str, node: &tree_sitter::Node) -> bool {
+    source[node.byte_range()].contains("export *")
+}
+
+fn export_statement_contains_name(
+    source: &str,
+    node: &tree_sitter::Node,
+    symbol_name: &str,
+) -> bool {
+    partition_export_specifiers(source, node, symbol_name)
+        .is_some_and(|(moved, _)| !moved.is_empty())
+}
+
+fn partition_export_specifiers(
+    source: &str,
+    node: &tree_sitter::Node,
+    symbol_name: &str,
+) -> Option<(Vec<String>, Vec<String>)> {
+    let text = &source[node.byte_range()];
+    let open = text.find('{')?;
+    let close = text[open + 1..].find('}').map(|idx| open + 1 + idx)?;
+    let mut moved = Vec::new();
+    let mut remaining = Vec::new();
+    for spec in text[open + 1..close]
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if imports::specifier_matches(spec, symbol_name) {
+            moved.push(spec.to_string());
+        } else {
+            remaining.push(spec.to_string());
+        }
+    }
+    Some((moved, remaining))
 }
 
 /// Generate an import statement preserving any alias from the original import text.

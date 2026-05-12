@@ -55,6 +55,75 @@ fn configure(aft: &mut AftProcess, root: &str) {
     );
 }
 
+fn write_file(path: &std::path::Path, content: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).expect("create parent");
+    std::fs::write(path, content).expect("write file");
+}
+
+fn assert_move_symbol_unsupported(ext: &str, source: &str, dest: &str) {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let src = tmp.path().join(format!("source.{ext}"));
+    let dst = tmp.path().join(format!("dest.{ext}"));
+    write_file(&src, source);
+    write_file(&dst, dest);
+
+    let mut aft = AftProcess::spawn();
+    let resp = aft.send(&format!(
+        r#"{{"id":"unsupported-{ext}","command":"move_symbol","file":"{}","symbol":"Foo","destination":"{}"}}"#,
+        src.display(),
+        dst.display()
+    ));
+    assert_eq!(resp["success"], false, "move should fail: {resp:?}");
+    assert_eq!(
+        resp["code"], "unsupported_language",
+        "wrong error: {resp:?}"
+    );
+    aft.shutdown();
+}
+
+#[test]
+fn move_symbol_rejects_python_source() {
+    assert_move_symbol_unsupported("py", "def Foo():\n    pass\n", "\n");
+}
+
+#[test]
+fn move_symbol_rejects_rust_source() {
+    assert_move_symbol_unsupported("rs", "pub fn Foo() {}\n", "\n");
+}
+
+#[test]
+fn move_symbol_rejects_go_source() {
+    assert_move_symbol_unsupported("go", "package main\n\nfunc Foo() {}\n", "package main\n");
+}
+
+#[test]
+fn move_symbol_rewrites_barrel_named_reexport() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().display().to_string();
+    let src_dir = tmp.path().join("src");
+    let foo = src_dir.join("foo.ts");
+    let bar = src_dir.join("bar.ts");
+    let index = src_dir.join("index.ts");
+    write_file(&foo, "export function Foo() { return 1; }\n");
+    write_file(&bar, "export const Bar = 2;\n");
+    write_file(&index, "export { Foo } from './foo';\n");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"barrel","command":"move_symbol","file":"{}","symbol":"Foo","destination":"{}"}}"#,
+        foo.display(),
+        bar.display()
+    ));
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
+    let index_content = std::fs::read_to_string(index).expect("read index");
+    assert!(
+        index_content.contains("export { Foo } from './bar';"),
+        "barrel should point at ./bar:\n{index_content}"
+    );
+    aft.shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // Success path tests
 // ---------------------------------------------------------------------------

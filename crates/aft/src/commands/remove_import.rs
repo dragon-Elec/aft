@@ -242,18 +242,21 @@ fn remove_name_from_imports(
             .iter()
             .any(|n| imports::specifier_matches(n, target_name));
         if any_match {
-            if imp.names.len() == 1 {
-                // Only one named import — remove entire statement
+            let new_names: Vec<String> = imp
+                .names
+                .iter()
+                .filter(|n| !imports::specifier_matches(n, target_name))
+                .cloned()
+                .collect();
+            let has_other = imp.default_import.is_some()
+                || imp.namespace_import.is_some()
+                || !new_names.is_empty();
+            if !has_other {
+                // No bindings remain — remove entire statement
                 let range = line_range(source, &imp.byte_range);
                 edits.push((range, String::new()));
             } else {
-                // Multiple names — regenerate without target
-                let new_names: Vec<String> = imp
-                    .names
-                    .iter()
-                    .filter(|n| !imports::specifier_matches(n, target_name))
-                    .cloned()
-                    .collect();
+                // Other bindings remain — regenerate without target
                 let new_line = imports::generate_import_line(
                     lang,
                     &imp.module_path,

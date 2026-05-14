@@ -13,10 +13,11 @@
 //! cmd.exe takes `/D /C`.
 //!
 //! Compiled on all platforms so the cross-platform retry-decision unit
-//! tests in `commands::bash::try_spawn_with_fallback` can run on macOS/Linux
-//! dev machines. Production callers (`commands::bash::spawn_shell_command`
-//! and `bash_background::registry::detached_shell_command_for`) are
-//! `#[cfg(windows)]`.
+//! tests in `commands::bash::try_spawn_with_fallback` (test-only — see the
+//! Windows foreground bash path in `crate::commands::bash`) can run on
+//! macOS/Linux dev machines. The production Windows background spawn path
+//! at `bash_background::registry::detached_shell_command_for` is the live
+//! caller.
 
 #![cfg_attr(not(windows), allow(dead_code))]
 

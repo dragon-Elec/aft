@@ -193,15 +193,25 @@ fn format_semantic_text(results: &[SemanticResult], project_root: &Path) -> Stri
             let mut section = file;
 
             for result in file_results {
-                section.push_str(&format!(
-                    "\n{} [{}] lines {}-{} score {:.3} source {}",
-                    result.name,
-                    symbol_kind_label(&result.kind),
-                    display_line_number(result.start_line),
-                    display_line_number(result.end_line),
-                    result.score,
-                    result.source
-                ));
+                if matches!(result.kind, SymbolKind::FileSummary) {
+                    section.push_str(&format!(
+                        "\n{} [{}] [file summary] score {:.3} source {}",
+                        result.name,
+                        symbol_kind_label(&result.kind),
+                        result.score,
+                        result.source
+                    ));
+                } else {
+                    section.push_str(&format!(
+                        "\n{} [{}] lines {}-{} score {:.3} source {}",
+                        result.name,
+                        symbol_kind_label(&result.kind),
+                        display_line_number(result.start_line),
+                        display_line_number(result.end_line),
+                        result.score,
+                        result.source
+                    ));
+                }
 
                 if !result.snippet.trim().is_empty() {
                     for line in result.snippet.lines() {
@@ -223,12 +233,22 @@ fn format_semantic_text(results: &[SemanticResult], project_root: &Path) -> Stri
 }
 
 fn result_to_json(result: &SemanticResult) -> serde_json::Value {
+    let (start_line, end_line) = if matches!(result.kind, SymbolKind::FileSummary) {
+        (serde_json::Value::Null, serde_json::Value::Null)
+    } else {
+        (
+            serde_json::json!(display_line_number(result.start_line)),
+            serde_json::json!(display_line_number(result.end_line)),
+        )
+    };
+
     serde_json::json!({
         "file": result.file.display().to_string(),
         "name": result.name,
         "kind": result.kind,
-        "start_line": display_line_number(result.start_line),
-        "end_line": display_line_number(result.end_line),
+        "start_line": start_line,
+        "end_line": end_line,
+        "location": if matches!(result.kind, SymbolKind::FileSummary) { "[file summary]" } else { "line range" },
         "score": result.score,
         "source": result.source,
         "snippet": result.snippet,
@@ -250,5 +270,55 @@ fn symbol_kind_label(kind: &SymbolKind) -> &'static str {
         SymbolKind::TypeAlias => "type_alias",
         SymbolKind::Variable => "variable",
         SymbolKind::Heading => "heading",
+        SymbolKind::FileSummary => "file-summary",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn file_summary_text_uses_summary_location_instead_of_line_range() {
+        let project_root = Path::new("/project");
+        let results = vec![SemanticResult {
+            file: PathBuf::from("/project/src/index.ts"),
+            name: "index".to_string(),
+            kind: SymbolKind::FileSummary,
+            start_line: 0,
+            end_line: 0,
+            exported: false,
+            snippet: String::new(),
+            score: 0.75,
+            source: "semantic",
+        }];
+
+        let text = format_semantic_text(&results, project_root);
+
+        assert!(text.contains("index [file-summary] [file summary] score 0.750 source semantic"));
+        assert!(!text.contains("lines 1-1"));
+    }
+
+    #[test]
+    fn file_summary_json_uses_summary_location_instead_of_line_numbers() {
+        let result = SemanticResult {
+            file: PathBuf::from("/project/src/index.ts"),
+            name: "index".to_string(),
+            kind: SymbolKind::FileSummary,
+            start_line: 0,
+            end_line: 0,
+            exported: false,
+            snippet: String::new(),
+            score: 0.75,
+            source: "semantic",
+        };
+
+        let json = result_to_json(&result);
+
+        assert_eq!(json["kind"], "file_summary");
+        assert_eq!(json["location"], "[file summary]");
+        assert!(json["start_line"].is_null());
+        assert!(json["end_line"].is_null());
     }
 }

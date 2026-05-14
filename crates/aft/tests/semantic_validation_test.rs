@@ -48,7 +48,7 @@ fn build_returns_error_when_embedding_backend_returns_no_vectors() {
         Ok(_) => panic!("expected empty-vector validation error"),
     };
 
-    assert_eq!(error, "embedding backend returned no vectors for 2 inputs");
+    assert_eq!(error, "embedding backend returned no vectors for 3 inputs");
 }
 
 #[test]
@@ -98,5 +98,5 @@ fn build_returns_error_when_embedding_backend_returns_too_few_vectors() {
         Ok(_) => panic!("expected vector count validation error"),
     };
 
-    assert_eq!(error, "embedding backend returned 1 vectors for 2 inputs");
+    assert_eq!(error, "embedding backend returned 2 vectors for 3 inputs");
 }

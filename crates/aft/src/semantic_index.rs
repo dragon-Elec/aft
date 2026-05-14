@@ -60,7 +60,7 @@ pub struct SemanticIndexFingerprint {
 }
 
 fn default_chunking_version() -> u32 {
-    1
+    2
 }
 
 impl SemanticIndexFingerprint {
@@ -1860,10 +1860,15 @@ fn build_embed_text(symbol: &Symbol, source: &str, file: &Path, project_root: &P
         SymbolKind::TypeAlias => "type",
         SymbolKind::Variable => "variable",
         SymbolKind::Heading => "heading",
+        SymbolKind::FileSummary => "file-summary",
     };
 
     // Build: "file:relative/path kind:function name:validateAuth signature:fn validateAuth(token: &str) -> bool"
-    let mut text = format!("file:{} kind:{} name:{}", relative, kind_label, symbol.name);
+    let name = &symbol.name;
+    let mut text = format!(
+        "name:{name} file:{} kind:{} name:{name}",
+        relative, kind_label
+    );
 
     if let Some(sig) = &symbol.signature {
         text.push_str(&format!(" signature:{}", sig));
@@ -1890,6 +1895,100 @@ fn build_embed_text(symbol: &Symbol, source: &str, file: &Path, project_root: &P
     }
 
     text
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn first_leading_doc_comment(source: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let Some((start, first)) = lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| !line.trim().is_empty())
+    else {
+        return String::new();
+    };
+
+    let trimmed = first.trim_start();
+    if trimmed.starts_with("/**") {
+        let mut comment = Vec::new();
+        for line in lines.iter().skip(start) {
+            comment.push(*line);
+            if line.contains("*/") {
+                break;
+            }
+        }
+        return truncate_chars(&comment.join("\n"), 200);
+    }
+
+    if trimmed.starts_with("///") || trimmed.starts_with("//!") {
+        let comment = lines
+            .iter()
+            .skip(start)
+            .take_while(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("///") || trimmed.starts_with("//!")
+            })
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        return truncate_chars(&comment, 200);
+    }
+
+    String::new()
+}
+
+pub fn build_file_summary_chunk(
+    file: &Path,
+    project_root: &Path,
+    source: &str,
+    top_exports: &[&str],
+    top_export_signatures: &[Option<&str>],
+) -> SemanticChunk {
+    let relative = file.strip_prefix(project_root).unwrap_or(file);
+    let rel_path = relative.to_string_lossy();
+    let parent_dir = relative
+        .parent()
+        .map(|parent| parent.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let name = file
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let doc = first_leading_doc_comment(source);
+    let exports = top_exports
+        .iter()
+        .take(5)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(",");
+    let snippet = if doc.is_empty() {
+        top_export_signatures
+            .first()
+            .and_then(|signature| signature.as_deref())
+            .map(|signature| truncate_chars(signature, 200))
+            .unwrap_or_default()
+    } else {
+        doc.clone()
+    };
+
+    SemanticChunk {
+        file: file.to_path_buf(),
+        name,
+        kind: SymbolKind::FileSummary,
+        start_line: 0,
+        end_line: 0,
+        exported: false,
+        embed_text: format!(
+            "file:{rel_path} kind:file-summary name:{} parent:{parent_dir} doc:{doc} exports:{exports}",
+            file.file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+                .unwrap_or_default()
+        ),
+        snippet,
+    }
 }
 
 fn parser_for(
@@ -1965,6 +2064,37 @@ fn symbols_to_chunks(
     project_root: &Path,
 ) -> Vec<SemanticChunk> {
     let mut chunks = Vec::new();
+    let top_exports_with_signatures = symbols
+        .iter()
+        .filter(|symbol| {
+            symbol.exported
+                && symbol.parent.is_none()
+                && !matches!(symbol.kind, SymbolKind::Heading)
+        })
+        .map(|symbol| (symbol.name.as_str(), symbol.signature.as_deref()))
+        .collect::<Vec<_>>();
+
+    let has_only_headings = !symbols.is_empty()
+        && symbols
+            .iter()
+            .all(|symbol| matches!(symbol.kind, SymbolKind::Heading));
+    if top_exports_with_signatures.len() <= 2 && !has_only_headings {
+        let top_exports = top_exports_with_signatures
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>();
+        let top_export_signatures = top_exports_with_signatures
+            .iter()
+            .map(|(_, signature)| *signature)
+            .collect::<Vec<_>>();
+        chunks.push(build_file_summary_chunk(
+            file,
+            project_root,
+            source,
+            &top_exports,
+            &top_export_signatures,
+        ));
+    }
 
     for symbol in symbols {
         // Skip Markdown / HTML heading chunks: empirically they dominate result
@@ -2042,6 +2172,7 @@ fn symbol_kind_to_u8(kind: &SymbolKind) -> u8 {
         SymbolKind::TypeAlias => 6,
         SymbolKind::Variable => 7,
         SymbolKind::Heading => 8,
+        SymbolKind::FileSummary => 9,
     }
 }
 
@@ -2055,6 +2186,8 @@ fn u8_to_symbol_kind(v: u8) -> SymbolKind {
         5 => SymbolKind::Enum,
         6 => SymbolKind::TypeAlias,
         7 => SymbolKind::Variable,
+        8 => SymbolKind::Heading,
+        9 => SymbolKind::FileSummary,
         _ => SymbolKind::Heading,
     }
 }
@@ -2237,6 +2370,27 @@ mod tests {
         assert_eq!(restored.dimension, 4);
         assert_eq!(restored.backend_label(), Some("fastembed"));
         assert_eq!(restored.model_label(), Some("all-MiniLM-L6-v2"));
+    }
+
+    #[test]
+    fn symbol_kind_serialization_roundtrip_includes_file_summary_variant() {
+        let cases = [
+            (SymbolKind::Function, 0),
+            (SymbolKind::Class, 1),
+            (SymbolKind::Method, 2),
+            (SymbolKind::Struct, 3),
+            (SymbolKind::Interface, 4),
+            (SymbolKind::Enum, 5),
+            (SymbolKind::TypeAlias, 6),
+            (SymbolKind::Variable, 7),
+            (SymbolKind::Heading, 8),
+            (SymbolKind::FileSummary, 9),
+        ];
+
+        for (kind, encoded) in cases {
+            assert_eq!(symbol_kind_to_u8(&kind), encoded);
+            assert_eq!(u8_to_symbol_kind(encoded), kind);
+        }
     }
 
     #[test]
@@ -2424,7 +2578,10 @@ mod tests {
         assert_eq!(summary.added, 0);
         assert_eq!(summary.deleted, 0);
         assert_eq!(index.entries.len(), original_entry_count);
-        assert_eq!(index.entries[0].chunk.name, "kept_symbol");
+        assert!(index
+            .entries
+            .iter()
+            .any(|entry| entry.chunk.name == "kept_symbol"));
         assert_eq!(index.file_mtimes.get(&file), Some(&stale_mtime));
         assert_ne!(index.file_mtimes.get(&file), Some(&original_mtime));
         assert_eq!(index.file_sizes.get(&file), Some(&(original_size + 1)));
@@ -2903,11 +3060,14 @@ mod tests {
         let chunks = symbols_to_chunks(&file, &symbols, source, &project_root);
         assert_eq!(
             chunks.len(),
-            2,
-            "Expected 2 code chunks (Function + Struct), got {}",
+            3,
+            "Expected file-summary + 2 code chunks (Function + Struct), got {}",
             chunks.len()
         );
         let names: Vec<&str> = chunks.iter().map(|c| c.name.as_str()).collect();
+        assert!(chunks
+            .iter()
+            .any(|chunk| matches!(chunk.kind, SymbolKind::FileSummary)));
         assert!(names.contains(&"handle_request"));
         assert!(names.contains(&"AuthService"));
         assert!(

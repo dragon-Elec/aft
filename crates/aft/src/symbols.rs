@@ -15,6 +15,8 @@ pub enum SymbolKind {
     Variable,
     /// Markdown heading (h1, h2, h3, etc.)
     Heading,
+    /// Synthetic file-level summary chunk for generic entry-point files.
+    FileSummary,
 }
 
 /// Location range within a source file (line/column, 0-indexed internally).

@@ -319,7 +319,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // ~/.cache/aft/bin/vX.Y.Z/aft. Failures bubble up as an error to Pi's loader.
   let binaryPath: string;
   try {
-    binaryPath = await findBinary();
+    binaryPath = await findBinary(PLUGIN_VERSION);
   } catch (err) {
     warn(
       `Failed to resolve AFT binary: ${err instanceof Error ? err.message : String(err)}. ` +

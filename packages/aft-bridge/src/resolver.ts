@@ -8,23 +8,42 @@ import { ensureBinary, getCacheDir, getCachedBinaryPath } from "./downloader.js"
 import { PLATFORM_ARCH_MAP } from "./platform.js";
 
 /**
- * Copy an npm platform binary to the versioned cache so we never run from
- * node_modules directly. This prevents corruption when npm updates the
- * package while a bridge process is running the binary.
+ * Read the version string from an `aft` binary by invoking it with
+ * `--version`. Returns the bare version (e.g. `"0.22.1"`) without the
+ * leading `v` or the `aft` prefix, or `null` if the invocation fails.
+ *
+ * Exported so tests and the resolver can use it for version-match checks
+ * before deciding to return a candidate binary.
  */
-function copyToVersionedCache(npmBinaryPath: string): string | null {
+export function readBinaryVersion(binaryPath: string): string | null {
   try {
-    // Get the version from the binary
-    const result = spawnSync(npmBinaryPath, ["--version"], {
+    const result = spawnSync(binaryPath, ["--version"], {
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
       timeout: 5000,
     });
     const rawVersion = result.stdout?.trim();
     if (!rawVersion) return null;
-
     // `aft --version` outputs "aft 0.9.0" — extract just the version number
-    const version = rawVersion.replace(/^aft\s+/, "");
+    return rawVersion.replace(/^aft\s+/, "");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Copy an npm platform binary to the versioned cache so we never run from
+ * node_modules directly. This prevents corruption when npm updates the
+ * package while a bridge process is running the binary.
+ *
+ * @param npmBinaryPath Absolute path to the npm-installed `aft` binary.
+ * @param knownVersion Optional pre-resolved version string to skip the extra
+ *   `--version` invocation (the caller often has it already).
+ */
+function copyToVersionedCache(npmBinaryPath: string, knownVersion?: string): string | null {
+  try {
+    const version = knownVersion ?? readBinaryVersion(npmBinaryPath);
+    if (!version) return null;
     const tag = version.startsWith("v") ? version : `v${version}`;
     const cacheDir = getCacheDir();
     const versionedDir = join(cacheDir, tag);
@@ -117,15 +136,29 @@ export function findBinarySync(expectedVersion?: string): string | null {
   }
 
   // 2. Check npm platform package — copy to versioned cache to avoid
-  // corruption when npm updates the package while a bridge is running
+  // corruption when npm updates the package while a bridge is running.
+  //
+  // IMPORTANT: when `pluginVersion` is known, REJECT npm binaries whose
+  // version does not match. A workspace with bun-cached older versions of
+  // `@cortexkit/aft-<platform>` (e.g. v0.19.5 left over after upgrading the
+  // plugin to v0.22.x) can otherwise hijack resolution and produce stale
+  // task-id slugs / outdated protocol behavior. Skip to step 3 (PATH) so a
+  // freshly built local binary can take over.
   try {
     const key = platformKey();
     const packageBin = `@cortexkit/aft-${key}/bin/aft${ext}`;
     const req = createRequire(import.meta.url);
     const resolved = req.resolve(packageBin);
     if (existsSync(resolved)) {
-      const copied = copyToVersionedCache(resolved);
-      return copied ?? resolved;
+      const npmVersion = readBinaryVersion(resolved);
+      if (pluginVersion && npmVersion && npmVersion !== pluginVersion) {
+        warn(
+          `npm platform package binary v${npmVersion} does not match plugin v${pluginVersion}; skipping (continuing to PATH lookup)`,
+        );
+      } else {
+        const copied = copyToVersionedCache(resolved, npmVersion ?? undefined);
+        return copied ?? resolved;
+      }
     }
   } catch {
     // npm package not installed or resolution failed

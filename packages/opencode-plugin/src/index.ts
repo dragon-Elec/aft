@@ -200,7 +200,7 @@ const ANNOUNCEMENT_FEATURES: string[] = [
 const plugin: Plugin = async (input) => initializePluginForDirectory(input);
 
 async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
-  const binaryPath = await findBinary();
+  const binaryPath = await findBinary(PLUGIN_VERSION);
 
   // Load config: ~/.config/opencode/aft.jsonc → <project>/.opencode/aft.jsonc
   const aftConfig = loadAftConfig(input.directory);

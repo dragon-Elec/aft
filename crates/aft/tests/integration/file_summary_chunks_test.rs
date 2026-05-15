@@ -136,6 +136,8 @@ fn reindex_roundtrip_after_chunking_version_bump_is_deterministic() {
     let restored = SemanticIndex::read_from_disk(
         storage.path(),
         "file-summary-roundtrip",
+        project.path(),
+        false,
         Some(&fingerprint.as_string()),
     )
     .expect("read persisted index");

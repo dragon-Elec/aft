@@ -1,6 +1,8 @@
 export interface AftStatusSnapshot {
   version: string;
   project_root: string | null;
+  canonical_root: string | null;
+  cache_role: string;
   features: {
     format_on_edit: boolean;
     validate_on_edit: string;
@@ -108,6 +110,8 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
   return {
     version: readString(response.version, "unknown"),
     project_root: readNullableString(response.project_root),
+    canonical_root: readNullableString(response.canonical_root),
+    cache_role: readString(response.cache_role, "not_initialized"),
     features: {
       format_on_edit: readBoolean(features.format_on_edit),
       validate_on_edit: readString(features.validate_on_edit, "off"),
@@ -158,6 +162,8 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
   const lines = [
     `AFT version: ${status.version}`,
     `Project root: ${status.project_root ?? "(not configured)"}`,
+    `Canonical root: ${status.canonical_root ?? "(not configured)"}`,
+    `Cache role: ${status.cache_role}`,
     "",
     "Enabled features",
     `- format_on_edit: ${formatFlag(status.features.format_on_edit)}`,
@@ -232,6 +238,8 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
     "",
     `- **Version:** \`${status.version}\``,
     `- **Project root:** \`${status.project_root ?? "(not configured)"}\``,
+    `- **Canonical root:** \`${status.canonical_root ?? "(not configured)"}\``,
+    `- **Cache role:** \`${status.cache_role}\``,
     "",
     "### Enabled features",
     `- \`format_on_edit\`: ${formatFlag(status.features.format_on_edit)}`,

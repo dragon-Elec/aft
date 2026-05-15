@@ -129,8 +129,14 @@ fn write_and_read_roundtrip_preserves_semantic_entries() {
 
     index.write_to_disk(storage.path(), "roundtrip-project");
 
-    let restored = SemanticIndex::read_from_disk(storage.path(), "roundtrip-project", None)
-        .expect("restore semantic index from disk");
+    let restored = SemanticIndex::read_from_disk(
+        storage.path(),
+        "roundtrip-project",
+        project.path(),
+        false,
+        None,
+    )
+    .expect("restore semantic index from disk");
 
     assert_eq!(restored.len(), index.len());
     assert_eq!(restored.dimension(), index.dimension());
@@ -150,7 +156,13 @@ fn write_and_read_roundtrip_preserves_semantic_entries() {
 fn read_from_nonexistent_path_returns_none() {
     let storage = tempfile::tempdir().expect("create storage dir");
 
-    let restored = SemanticIndex::read_from_disk(storage.path(), "missing-project", None);
+    let restored = SemanticIndex::read_from_disk(
+        storage.path(),
+        "missing-project",
+        storage.path(),
+        false,
+        None,
+    );
 
     assert!(restored.is_none());
 }
@@ -165,7 +177,13 @@ fn read_from_corrupt_file_returns_none_and_logs_warning() {
     let semantic_file = semantic_dir.join("semantic.bin");
     fs::write(&semantic_file, b"corrupt").expect("write corrupt semantic file");
 
-    let restored = SemanticIndex::read_from_disk(storage.path(), "corrupt-project", None);
+    let restored = SemanticIndex::read_from_disk(
+        storage.path(),
+        "corrupt-project",
+        storage.path(),
+        false,
+        None,
+    );
 
     assert!(restored.is_none());
     assert!(
@@ -192,7 +210,7 @@ fn semantic_cache_inconsistent_lengths_rebuilds() {
     let source = storage.path().join("src/lib.rs");
 
     let mut bytes = Vec::new();
-    bytes.push(5u8);
+    bytes.push(6u8);
     bytes.extend_from_slice(&1u32.to_le_bytes()); // dimension
     bytes.extend_from_slice(&1u32.to_le_bytes()); // one entry
     bytes.extend_from_slice(&0u32.to_le_bytes()); // no fingerprint
@@ -211,7 +229,14 @@ fn semantic_cache_inconsistent_lengths_rebuilds() {
     bytes.extend_from_slice(&1.0f32.to_le_bytes());
     fs::write(&semantic_file, bytes).expect("write inconsistent semantic cache");
 
-    assert!(SemanticIndex::read_from_disk(storage.path(), "drift-project", None).is_none());
+    assert!(SemanticIndex::read_from_disk(
+        storage.path(),
+        "drift-project",
+        storage.path(),
+        false,
+        None
+    )
+    .is_none());
     assert!(
         !semantic_file.exists(),
         "bad semantic cache should be removed"
@@ -227,8 +252,9 @@ fn stale_file_detected_after_deletion() {
     index.write_to_disk(storage.path(), "stale-project");
     fs::remove_file(&source_file).expect("remove indexed source file");
 
-    let restored = SemanticIndex::read_from_disk(storage.path(), "stale-project", None)
-        .expect("restore semantic index from disk");
+    let restored =
+        SemanticIndex::read_from_disk(storage.path(), "stale-project", project.path(), false, None)
+            .expect("restore semantic index from disk");
 
     // After deletion, the single indexed file must be stale.
     assert!(
@@ -245,7 +271,8 @@ fn read_from_disk_rebuilds_v1_cache_when_fingerprint_is_expected() {
     fs::write(&legacy_file, "pub fn legacy_symbol() {}\n").expect("write legacy source file");
 
     let v1_bytes = build_v1_index_bytes(&legacy_file);
-    let restored = SemanticIndex::from_bytes(&v1_bytes).expect("parse v1 semantic index bytes");
+    let restored = SemanticIndex::from_bytes(&v1_bytes, storage.path())
+        .expect("parse v1 semantic index bytes");
     assert!(restored.fingerprint().is_none());
 
     let semantic_dir = storage.path().join("semantic").join("v1-project");
@@ -265,6 +292,8 @@ fn read_from_disk_rebuilds_v1_cache_when_fingerprint_is_expected() {
     assert!(SemanticIndex::read_from_disk(
         storage.path(),
         "v1-project",
+        storage.path(),
+        false,
         Some(&expected_fingerprint)
     )
     .is_none());
@@ -311,8 +340,14 @@ fn write_roundtrip_preserves_subsecond_mtime_precision() {
 
     index.write_to_disk(storage.path(), "subsec-project");
 
-    let restored = SemanticIndex::read_from_disk(storage.path(), "subsec-project", None)
-        .expect("restore semantic index from disk");
+    let restored = SemanticIndex::read_from_disk(
+        storage.path(),
+        "subsec-project",
+        project.path(),
+        false,
+        None,
+    )
+    .expect("restore semantic index from disk");
 
     // The source file has not been touched since index construction, so
     // after round-trip it MUST NOT be flagged as stale. This is the
@@ -385,7 +420,14 @@ fn read_from_disk_rebuilds_v2_cache_for_v4_snippets() {
     fs::create_dir_all(&semantic_dir).expect("create semantic dir");
     fs::write(semantic_dir.join("semantic.bin"), &bytes).expect("write v2 cache");
 
-    assert!(SemanticIndex::read_from_disk(storage.path(), "v2-project", Some(&fp_str)).is_none());
+    assert!(SemanticIndex::read_from_disk(
+        storage.path(),
+        "v2-project",
+        project.path(),
+        false,
+        Some(&fp_str)
+    )
+    .is_none());
     assert!(!semantic_dir.join("semantic.bin").exists());
 }
 
@@ -433,8 +475,8 @@ fn from_bytes_rejects_corrupt_v3_cache_payloads() {
 
     // Case 1: nanos >= 1e9 → reject with a specific message.
     let bad_nanos = build_v3_with_mtime(0, 2_000_000_000);
-    let err =
-        SemanticIndex::from_bytes(&bad_nanos).expect_err("V3 with nanos >= 1e9 must be rejected");
+    let err = SemanticIndex::from_bytes(&bad_nanos, Path::new("/"))
+        .expect_err("V3 with nanos >= 1e9 must be rejected");
     assert!(
         err.contains("nanos") && err.contains("1_000_000_000"),
         "nanos-overflow error should explain the rejection: {err}"
@@ -444,8 +486,8 @@ fn from_bytes_rejects_corrupt_v3_cache_payloads() {
     // panicking. We pick secs = u64::MAX so adding any Duration carries past
     // the platform's representable range on every target.
     let overflow = build_v3_with_mtime(u64::MAX, 0);
-    let err =
-        SemanticIndex::from_bytes(&overflow).expect_err("V3 with secs=u64::MAX must be rejected");
+    let err = SemanticIndex::from_bytes(&overflow, Path::new("/"))
+        .expect_err("V3 with secs=u64::MAX must be rejected");
     assert!(
         err.contains("overflows SystemTime"),
         "SystemTime-overflow error should explain the rejection: {err}"
@@ -454,6 +496,6 @@ fn from_bytes_rejects_corrupt_v3_cache_payloads() {
     // Case 3: valid V3 payload with nanos = 999_999_999 (max valid) loads
     // cleanly — proves the boundary is strictly < 1e9, not <=.
     let boundary = build_v3_with_mtime(1_700_000_000, 999_999_999);
-    let _ =
-        SemanticIndex::from_bytes(&boundary).expect("V3 with nanos=999_999_999 must load cleanly");
+    let _ = SemanticIndex::from_bytes(&boundary, Path::new("/"))
+        .expect("V3 with nanos=999_999_999 must load cleanly");
 }

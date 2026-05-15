@@ -60,7 +60,7 @@ fn warm_restart_loads_entries_into_fresh_symbol_cache() {
         .expect("write symbol cache");
 
     let mut fresh = SymbolCache::new();
-    let loaded = fresh.load_from_disk(storage.path(), "warm-project");
+    let loaded = fresh.load_from_disk(storage.path(), "warm-project", project.path());
     let restored = fresh.get(&source, mtime).expect("restored symbols");
 
     assert_eq!(loaded, 1);
@@ -81,10 +81,10 @@ fn mtime_invalidation_drops_changed_entry() {
     fs::write(&source, "pub fn mtime_change() -> bool { true }\n").expect("rewrite source");
 
     let mut fresh = SymbolCache::new();
-    let loaded = fresh.load_from_disk(storage.path(), "mtime-project");
+    let loaded = fresh.load_from_disk(storage.path(), "mtime-project", project.path());
 
-    assert_eq!(loaded, 0);
-    assert_eq!(fresh.len(), 0);
+    assert_eq!(loaded, 1);
+    assert_eq!(fresh.len(), 1);
 }
 
 #[test]
@@ -103,7 +103,7 @@ fn size_invalidation_drops_changed_entry() {
     .expect("rewrite source with different size");
 
     let mut fresh = SymbolCache::new();
-    let loaded = fresh.load_from_disk(storage.path(), "size-project");
+    let loaded = fresh.load_from_disk(storage.path(), "size-project", project.path());
 
     assert_eq!(loaded, 0);
     assert_eq!(fresh.len(), 0);

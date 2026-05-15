@@ -8,14 +8,13 @@ use crate::symbols::Symbol;
 use crate::{slog_info, slog_warn};
 
 const MAGIC: &[u8; 8] = b"AFTSYM1\0";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const MAX_ENTRIES: usize = 2_000_000;
 const MAX_PATH_BYTES: usize = 16 * 1024;
 const MAX_SYMBOL_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct DiskSymbolCache {
-    pub(crate) project_root: PathBuf,
     pub(crate) entries: Vec<DiskSymbolEntry>,
 }
 
@@ -24,6 +23,7 @@ pub(crate) struct DiskSymbolEntry {
     pub(crate) relative_path: PathBuf,
     pub(crate) mtime: SystemTime,
     pub(crate) size: u64,
+    pub(crate) content_hash: blake3::Hash,
     pub(crate) symbols: Vec<Symbol>,
 }
 
@@ -124,7 +124,7 @@ fn read_cache_file(path: &Path) -> Result<DiskSymbolCache, String> {
         return Err(format!("too many symbol cache entries: {entry_count}"));
     }
 
-    let project_root = PathBuf::from(read_string_with_len(&mut reader, root_len)?);
+    let _project_root = PathBuf::from(read_string_with_len(&mut reader, root_len)?);
     let mut entries = Vec::with_capacity(entry_count);
 
     for _ in 0..entry_count {
@@ -136,6 +136,11 @@ fn read_cache_file(path: &Path) -> Result<DiskSymbolCache, String> {
         let mtime_secs = read_i64(&mut reader)?;
         let mtime_nanos = read_u32(&mut reader)?;
         let size = read_u64(&mut reader)?;
+        let mut hash_bytes = [0u8; 32];
+        reader
+            .read_exact(&mut hash_bytes)
+            .map_err(|error| format!("failed to read symbol content hash: {error}"))?;
+        let content_hash = blake3::Hash::from_bytes(hash_bytes);
         let symbol_bytes_len = read_u32(&mut reader)? as usize;
         if symbol_bytes_len > MAX_SYMBOL_BYTES {
             return Err(format!(
@@ -154,14 +159,12 @@ fn read_cache_file(path: &Path) -> Result<DiskSymbolCache, String> {
             relative_path,
             mtime: system_time_from_parts(mtime_secs, mtime_nanos)?,
             size,
+            content_hash,
             symbols,
         });
     }
 
-    Ok(DiskSymbolCache {
-        project_root,
-        entries,
-    })
+    Ok(DiskSymbolCache { entries })
 }
 
 fn write_cache_file(
@@ -183,7 +186,7 @@ fn write_cache_file(
     write_u32(&mut writer, entry_count)?;
     writer.write_all(root.as_bytes())?;
 
-    for (path, mtime, size, symbols) in entries {
+    for (path, mtime, size, content_hash, symbols) in entries {
         if symbols.is_empty() {
             continue;
         }
@@ -203,6 +206,7 @@ fn write_cache_file(
         write_i64(&mut writer, secs)?;
         write_u32(&mut writer, nanos)?;
         write_u64(&mut writer, size)?;
+        writer.write_all(content_hash.as_bytes())?;
         write_u32(&mut writer, symbol_len)?;
         writer.write_all(&symbol_bytes)?;
     }

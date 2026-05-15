@@ -226,6 +226,9 @@ pub struct AppContext {
     backup: RefCell<BackupStore>,
     checkpoint: RefCell<CheckpointStore>,
     config: RefCell<Config>,
+    canonical_cache_root: RefCell<Option<PathBuf>>,
+    is_worktree_bridge: RefCell<bool>,
+    git_common_dir: RefCell<Option<PathBuf>>,
     callgraph: RefCell<Option<CallGraph>>,
     search_index: RefCell<Option<SearchIndex>>,
     search_index_rx: RefCell<Option<crossbeam_channel::Receiver<SearchIndex>>>,
@@ -286,6 +289,9 @@ impl AppContext {
             backup: RefCell::new(BackupStore::new()),
             checkpoint: RefCell::new(CheckpointStore::new()),
             config: RefCell::new(config),
+            canonical_cache_root: RefCell::new(None),
+            is_worktree_bridge: RefCell::new(false),
+            git_common_dir: RefCell::new(None),
             callgraph: RefCell::new(None),
             search_index: RefCell::new(None),
             search_index_rx: RefCell::new(None),
@@ -558,6 +564,41 @@ impl AppContext {
     /// Access the configuration (mutable borrow).
     pub fn config_mut(&self) -> RefMut<'_, Config> {
         self.config.borrow_mut()
+    }
+
+    pub fn set_canonical_cache_root(&self, root: PathBuf) {
+        debug_assert!(root.is_absolute());
+        *self.canonical_cache_root.borrow_mut() = Some(root);
+    }
+
+    pub fn canonical_cache_root(&self) -> PathBuf {
+        self.canonical_cache_root
+            .borrow()
+            .clone()
+            .expect("canonical_cache_root accessed before handle_configure")
+    }
+
+    pub fn canonical_cache_root_opt(&self) -> Option<PathBuf> {
+        self.canonical_cache_root.borrow().clone()
+    }
+
+    pub fn set_cache_role(&self, is_worktree_bridge: bool, git_common_dir: Option<PathBuf>) {
+        *self.is_worktree_bridge.borrow_mut() = is_worktree_bridge;
+        *self.git_common_dir.borrow_mut() = git_common_dir;
+    }
+
+    pub fn is_worktree_bridge(&self) -> bool {
+        *self.is_worktree_bridge.borrow()
+    }
+
+    pub fn cache_role(&self) -> &'static str {
+        if self.canonical_cache_root.borrow().is_none() {
+            "not_initialized"
+        } else if self.is_worktree_bridge() {
+            "worktree"
+        } else {
+            "main"
+        }
     }
 
     /// Access the call graph engine.

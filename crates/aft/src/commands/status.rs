@@ -141,6 +141,8 @@ pub fn handle_status(req: &RawRequest, ctx: &AppContext) -> Response {
         serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "project_root": config.project_root.as_ref().map(|p| p.display().to_string()),
+            "canonical_root": ctx.canonical_cache_root_opt().map(|p| p.display().to_string()),
+            "cache_role": ctx.cache_role(),
             "features": {
                 "format_on_edit": config.format_on_edit,
                 "validate_on_edit": config.validate_on_edit.as_deref().unwrap_or("off"),
@@ -192,4 +194,44 @@ fn dir_size_recursive(path: &std::path::Path) -> u64 {
         }
     }
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handle_status;
+    use crate::config::Config;
+    use crate::context::AppContext;
+    use crate::parser::TreeSitterProvider;
+    use crate::protocol::RawRequest;
+    use serde_json::json;
+
+    fn request() -> RawRequest {
+        RawRequest {
+            id: "status".to_string(),
+            command: "status".to_string(),
+            lsp_hints: None,
+            session_id: None,
+            params: json!({}),
+        }
+    }
+
+    #[test]
+    fn status_exposes_cache_role_and_canonical_root() {
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let response = handle_status(&request(), &ctx);
+        assert_eq!(response.data["cache_role"], "not_initialized");
+        assert!(response.data["canonical_root"].is_null());
+
+        let temp = tempfile::tempdir().unwrap();
+        ctx.config_mut().project_root = Some(temp.path().to_path_buf());
+        ctx.set_canonical_cache_root(std::fs::canonicalize(temp.path()).unwrap());
+        ctx.set_cache_role(false, None);
+        let response = handle_status(&request(), &ctx);
+        assert_eq!(response.data["cache_role"], "main");
+        assert!(response.data["canonical_root"].as_str().is_some());
+
+        ctx.set_cache_role(true, None);
+        let response = handle_status(&request(), &ctx);
+        assert_eq!(response.data["cache_role"], "worktree");
+    }
 }

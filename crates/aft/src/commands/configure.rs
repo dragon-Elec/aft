@@ -1,5 +1,6 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -123,6 +124,36 @@ fn validate_storage_dir(raw: &str) -> Result<PathBuf, String> {
 fn has_parent_component(path: &Path) -> bool {
     path.components()
         .any(|component| matches!(component, Component::ParentDir))
+}
+
+fn detect_worktree_bridge(project_root: &Path) -> (bool, Option<PathBuf>) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return (false, None);
+    };
+    if !output.status.success() {
+        return (false, None);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+    let Some(git_dir) = lines.next().map(PathBuf::from) else {
+        return (false, None);
+    };
+    let Some(common_dir) = lines.next().map(PathBuf::from) else {
+        return (false, None);
+    };
+    let git_dir = std::fs::canonicalize(&git_dir).unwrap_or(git_dir);
+    let common_dir = std::fs::canonicalize(&common_dir).unwrap_or(common_dir);
+    (git_dir != common_dir, Some(common_dir))
 }
 
 fn parse_semantic_config(
@@ -902,6 +933,13 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     let root_path = PathBuf::from(root);
+    if !root_path.is_absolute() {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "project_root must be an absolute path",
+        );
+    }
     if !root_path.is_dir() {
         return Response::error(
             &req.id,
@@ -909,6 +947,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             format!("configure: project_root is not a directory: {}", root),
         );
     }
+    let canonical_cache_root =
+        std::fs::canonicalize(&root_path).unwrap_or_else(|_| root_path.clone());
+    debug_assert!(canonical_cache_root.is_absolute());
+    let (is_worktree_bridge, git_common_dir) = detect_worktree_bridge(&canonical_cache_root);
 
     let previous_project_root = ctx.config().project_root.clone();
     if previous_project_root.as_ref() != Some(&root_path) {
@@ -917,6 +959,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Set project root on config
     ctx.config_mut().project_root = Some(root_path.clone());
+    ctx.set_canonical_cache_root(canonical_cache_root.clone());
+    ctx.set_cache_role(is_worktree_bridge, git_common_dir);
 
     // Rebuild gitignore matcher used by the watcher event filter to honor the
     // user's `.gitignore` files instead of a hardcoded directory list.
@@ -1214,9 +1258,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut search_index_cache_reused = false;
 
     if search_index {
-        let cache_dir = resolve_cache_dir(&root_path, storage_dir.as_deref());
-        let current_head = current_git_head(&root_path);
-        let mut baseline = SearchIndex::read_from_disk(&cache_dir);
+        let cache_dir = resolve_cache_dir(&canonical_cache_root, storage_dir.as_deref());
+        let current_head = current_git_head(&canonical_cache_root);
+        let mut baseline = SearchIndex::read_from_disk(&cache_dir, &canonical_cache_root);
         search_index_cache_reused = baseline.is_some();
 
         if let Some(index) = baseline.as_mut() {
@@ -1234,18 +1278,23 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         ) = unbounded();
         *ctx.search_index_rx().borrow_mut() = Some(rx);
 
-        let root_clone = root_path.clone();
+        let root_clone = canonical_cache_root.clone();
         let symbol_cache = ctx.symbol_cache();
         let symbol_storage = storage_dir.clone();
-        let symbol_project_key = project_cache_key(&root_path);
+        let symbol_project_key = project_cache_key(&canonical_cache_root);
+        let is_worktree_bridge_for_search = is_worktree_bridge;
         let session_id_for_bg = log_ctx::current_session();
         thread::spawn(move || {
             log_ctx::with_session(session_id_for_bg, || {
-                let _cache_lock = match CacheLock::acquire(&cache_dir) {
-                    Ok(lock) => Some(lock),
-                    Err(error) => {
-                        slog_warn!("failed to acquire search cache lock: {}", error);
-                        None
+                let _cache_lock = if is_worktree_bridge_for_search {
+                    None
+                } else {
+                    match CacheLock::acquire(&cache_dir) {
+                        Ok(lock) => Some(lock),
+                        Err(error) => {
+                            slog_warn!("failed to acquire search cache lock: {}", error);
+                            None
+                        }
                     }
                 };
                 let index = SearchIndex::rebuild_or_refresh(
@@ -1254,7 +1303,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                     current_head,
                     baseline,
                 );
-                index.write_to_disk(&cache_dir, index.stored_git_head());
+                if !is_worktree_bridge_for_search {
+                    index.write_to_disk(&cache_dir, index.stored_git_head());
+                }
 
                 // Pre-warm symbol cache from indexed files
                 let mut warmed_files = 0usize;
@@ -1272,6 +1323,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             symbol_cache_generation,
                             storage_dir,
                             &symbol_project_key,
+                            &root_clone,
                         );
                         slog_info!("loaded symbol cache from disk: {} files", loaded_count);
                     }
@@ -1299,22 +1351,26 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 }
 
                 let total_files = symbol_cache.read().map(|cache| cache.len()).unwrap_or(0);
-                if let Some(storage_dir) = symbol_storage.as_deref() {
-                    if let Ok(cache) = symbol_cache.read() {
-                        if cache.generation() != symbol_cache_generation {
-                            slog_info!("skipping stale symbol cache persistence after reconfigure");
-                            return;
-                        }
-                        match crate::symbol_cache_disk::write_to_disk(
-                            &cache,
-                            storage_dir,
-                            &symbol_project_key,
-                        ) {
-                            Ok(()) => {
-                                slog_info!("persisted symbol cache: {} files", cache.len());
+                if !is_worktree_bridge_for_search {
+                    if let Some(storage_dir) = symbol_storage.as_deref() {
+                        if let Ok(cache) = symbol_cache.read() {
+                            if cache.generation() != symbol_cache_generation {
+                                slog_info!(
+                                    "skipping stale symbol cache persistence after reconfigure"
+                                );
+                                return;
                             }
-                            Err(error) => {
-                                slog_warn!("failed to persist symbol cache: {}", error);
+                            match crate::symbol_cache_disk::write_to_disk(
+                                &cache,
+                                storage_dir,
+                                &symbol_project_key,
+                            ) {
+                                Ok(()) => {
+                                    slog_info!("persisted symbol cache: {} files", cache.len());
+                                }
+                                Err(error) => {
+                                    slog_warn!("failed to persist symbol cache: {}", error);
+                                }
                             }
                         }
                     }
@@ -1344,11 +1400,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         ) = unbounded();
         *ctx.semantic_index_rx().borrow_mut() = Some(rx);
 
-        let root_clone = root_path.clone();
+        let root_clone = canonical_cache_root.clone();
         let semantic_storage = storage_dir.clone();
-        let semantic_project_key = crate::search_index::project_cache_key(&root_path);
+        let semantic_project_key = crate::search_index::project_cache_key(&canonical_cache_root);
         let semantic_config = semantic_config.clone();
         let tx_progress = tx.clone();
+        let is_worktree_bridge_for_semantic = is_worktree_bridge;
         let session_id_for_bg2 = log_ctx::current_session();
         thread::spawn(move || {
             log_ctx::with_session(session_id_for_bg2, || {
@@ -1369,22 +1426,30 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             crate::semantic_index::EmbeddingModel::from_config(&semantic_config)?;
                         let fingerprint = model.fingerprint(&semantic_config)?;
                         let fingerprint_key = fingerprint.as_string();
-                        let _semantic_cache_lock = semantic_storage.as_ref().and_then(|dir| {
-                            let semantic_cache_dir =
-                                dir.join("semantic").join(&semantic_project_key);
-                            match CacheLock::acquire(&semantic_cache_dir) {
-                                Ok(lock) => Some(lock),
-                                Err(error) => {
-                                    slog_warn!("failed to acquire semantic cache lock: {}", error);
-                                    None
+                        let _semantic_cache_lock = (!is_worktree_bridge_for_semantic)
+                            .then(|| ())
+                            .and_then(|_| semantic_storage.as_ref())
+                            .and_then(|dir| {
+                                let semantic_cache_dir =
+                                    dir.join("semantic").join(&semantic_project_key);
+                                match CacheLock::acquire(&semantic_cache_dir) {
+                                    Ok(lock) => Some(lock),
+                                    Err(error) => {
+                                        slog_warn!(
+                                            "failed to acquire semantic cache lock: {}",
+                                            error
+                                        );
+                                        None
+                                    }
                                 }
-                            }
-                        });
+                            });
 
                         if let Some(ref dir) = semantic_storage {
                             if let Some(cached) = SemanticIndex::read_from_disk(
                                 dir,
                                 &semantic_project_key,
+                                &root_clone,
+                                is_worktree_bridge_for_semantic,
                                 Some(&fingerprint_key),
                             ) {
                                 // Try incremental refresh: re-embed only changed/new files,
@@ -1450,8 +1515,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                                 cached.len(),
                                             );
                                             cached.set_fingerprint(fingerprint);
-                                            if let Some(ref dir) = semantic_storage {
-                                                cached.write_to_disk(dir, &semantic_project_key);
+                                            if !is_worktree_bridge_for_semantic {
+                                                if let Some(ref dir) = semantic_storage {
+                                                    cached
+                                                        .write_to_disk(dir, &semantic_project_key);
+                                                }
                                             }
                                         }
                                         let _ = tx_progress.send(SemanticIndexEvent::Progress {
@@ -1534,8 +1602,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             entries_total: Some(index.len()),
                         });
 
-                        if let Some(ref dir) = semantic_storage {
-                            index.write_to_disk(dir, &semantic_project_key);
+                        if !is_worktree_bridge_for_semantic {
+                            if let Some(ref dir) = semantic_storage {
+                                index.write_to_disk(dir, &semantic_project_key);
+                            }
                         }
 
                         Ok(index)
@@ -1672,6 +1742,48 @@ mod tests {
     use crate::config::Config;
     use crate::context::AppContext;
     use crate::parser::TreeSitterProvider;
+    use crate::protocol::RawRequest;
+
+    fn test_context() -> AppContext {
+        AppContext::new(Box::new(TreeSitterProvider::new()), Config::default())
+    }
+
+    fn configure_request(project_root: serde_json::Value) -> RawRequest {
+        RawRequest {
+            id: "cfg".to_string(),
+            command: "configure".to_string(),
+            lsp_hints: None,
+            session_id: None,
+            params: json!({ "project_root": project_root }),
+        }
+    }
+
+    #[test]
+    fn handle_configure_rejects_relative_project_root() {
+        let ctx = test_context();
+        let req = configure_request(json!("relative/path"));
+
+        let response = super::handle_configure(&req, &ctx);
+
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "invalid_request");
+    }
+
+    #[test]
+    fn handle_configure_populates_canonical_cache_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        let req = configure_request(json!(temp.path()));
+
+        let response = super::handle_configure(&req, &ctx);
+
+        assert!(response.success);
+        assert_eq!(
+            ctx.canonical_cache_root(),
+            std::fs::canonicalize(temp.path()).unwrap()
+        );
+        assert_eq!(ctx.cache_role(), "main");
+    }
 
     #[cfg(unix)]
     fn create_dir_symlink(src: &std::path::Path, dst: &std::path::Path) {

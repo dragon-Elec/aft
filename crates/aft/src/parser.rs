@@ -7,6 +7,7 @@ use std::time::SystemTime;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language, Node, Parser, Query, QueryCursor, Tree};
 
+use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph::resolve_module_path;
 use crate::error::AftError;
 use crate::symbol_cache_disk;
@@ -507,6 +508,8 @@ struct CachedTree {
 #[derive(Clone)]
 struct CachedSymbols {
     mtime: SystemTime,
+    size: u64,
+    content_hash: blake3::Hash,
     symbols: Vec<Symbol>,
 }
 
@@ -532,6 +535,7 @@ impl SymbolCache {
 
     /// Set the project root used for disk persistence.
     pub fn set_project_root(&mut self, project_root: PathBuf) {
+        debug_assert!(project_root.is_absolute());
         self.project_root = Some(project_root);
     }
 
@@ -550,8 +554,23 @@ impl SymbolCache {
     }
 
     /// Insert pre-warmed symbols for a file.
-    pub fn insert(&mut self, path: PathBuf, mtime: SystemTime, symbols: Vec<Symbol>) {
-        self.entries.insert(path, CachedSymbols { mtime, symbols });
+    pub fn insert(
+        &mut self,
+        path: PathBuf,
+        mtime: SystemTime,
+        size: u64,
+        content_hash: blake3::Hash,
+        symbols: Vec<Symbol>,
+    ) {
+        self.entries.insert(
+            path,
+            CachedSymbols {
+                mtime,
+                size,
+                content_hash,
+                symbols,
+            },
+        );
     }
 
     /// Insert symbols only when the caller still belongs to the active cache generation.
@@ -560,12 +579,14 @@ impl SymbolCache {
         generation: u64,
         path: PathBuf,
         mtime: SystemTime,
+        size: u64,
+        content_hash: blake3::Hash,
         symbols: Vec<Symbol>,
     ) -> bool {
         if self.generation != generation {
             return false;
         }
-        self.insert(path, mtime, symbols);
+        self.insert(path, mtime, size, content_hash, symbols);
         true
     }
 
@@ -584,31 +605,40 @@ impl SymbolCache {
     }
 
     /// Load valid symbol entries from disk, dropping only entries whose source file changed.
-    pub fn load_from_disk(&mut self, storage_dir: &Path, project_key: &str) -> usize {
+    pub fn load_from_disk(
+        &mut self,
+        storage_dir: &Path,
+        project_key: &str,
+        current_root: &Path,
+    ) -> usize {
+        debug_assert!(current_root.is_absolute());
         let Some(cache) = symbol_cache_disk::read_from_disk(storage_dir, project_key) else {
             return 0;
         };
 
-        self.project_root = Some(cache.project_root.clone());
+        self.project_root = Some(current_root.to_path_buf());
         self.entries.clear();
         let mut loaded = 0usize;
 
         for entry in cache.entries {
-            let path = cache.project_root.join(&entry.relative_path);
-            let Ok(metadata) = std::fs::metadata(&path) else {
-                continue;
+            let path = current_root.join(&entry.relative_path);
+            let cached_freshness = FileFreshness {
+                mtime: entry.mtime,
+                size: entry.size,
+                content_hash: entry.content_hash,
             };
-            let Ok(current_mtime) = metadata.modified() else {
-                continue;
+            let mtime = match cache_freshness::verify_file(&path, &cached_freshness) {
+                FreshnessVerdict::HotFresh => entry.mtime,
+                FreshnessVerdict::ContentFresh { new_mtime, .. } => new_mtime,
+                FreshnessVerdict::Stale | FreshnessVerdict::Deleted => continue,
             };
-            if metadata.len() != entry.size || current_mtime != entry.mtime {
-                continue;
-            }
 
             self.entries.insert(
                 path,
                 CachedSymbols {
-                    mtime: entry.mtime,
+                    mtime,
+                    size: entry.size,
+                    content_hash: entry.content_hash,
                     symbols: entry.symbols,
                 },
             );
@@ -625,11 +655,12 @@ impl SymbolCache {
         generation: u64,
         storage_dir: &Path,
         project_key: &str,
+        current_root: &Path,
     ) -> usize {
         if self.generation != generation {
             return 0;
         }
-        self.load_from_disk(storage_dir, project_key)
+        self.load_from_disk(storage_dir, project_key, current_root)
     }
 
     /// Invalidate cached symbols for a specific file.
@@ -664,15 +695,22 @@ impl SymbolCache {
         self.project_root.clone()
     }
 
-    pub(crate) fn disk_entries(&self) -> Vec<(&PathBuf, SystemTime, u64, &Vec<Symbol>)> {
+    pub(crate) fn disk_entries(
+        &self,
+    ) -> Vec<(&PathBuf, SystemTime, u64, blake3::Hash, &Vec<Symbol>)> {
         self.entries
             .iter()
             .filter_map(|(path, cached)| {
                 if cached.symbols.is_empty() {
                     return None;
                 }
-                let size = std::fs::metadata(path).ok()?.len();
-                Some((path, cached.mtime, size, &cached.symbols))
+                Some((
+                    path,
+                    cached.mtime,
+                    cached.size,
+                    cached.content_hash,
+                    &cached.symbols,
+                ))
             })
             .collect()
     }
@@ -830,6 +868,8 @@ impl FileParser {
         let source = std::fs::read_to_string(path).map_err(|e| AftError::FileNotFound {
             path: format!("{}: {}", path.display(), e),
         })?;
+        let size = source.len() as u64;
+        let content_hash = cache_freshness::hash_bytes(source.as_bytes());
 
         let symbols = {
             let (tree, lang) = self.parse(path)?;
@@ -844,9 +884,16 @@ impl FileParser {
                 message: "symbol cache lock poisoned".to_string(),
             })?;
         if let Some(generation) = self.symbol_cache_generation {
-            symbol_cache.insert_for_generation(generation, canon, current_mtime, symbols.clone());
+            symbol_cache.insert_for_generation(
+                generation,
+                canon,
+                current_mtime,
+                size,
+                content_hash,
+                symbols.clone(),
+            );
         } else {
-            symbol_cache.insert(canon, current_mtime, symbols.clone());
+            symbol_cache.insert(canon, current_mtime, size, content_hash, symbols.clone());
         }
 
         Ok(symbols)
@@ -3857,15 +3904,24 @@ mod tests {
             .expect("stat source")
             .modified()
             .expect("source mtime");
+        let content = std::fs::read(&source).expect("read source");
+        let size = content.len() as u64;
+        let hash = crate::cache_freshness::hash_bytes(&content);
 
         let mut cache = SymbolCache::new();
         cache.set_project_root(project.path().to_path_buf());
-        cache.insert(source.clone(), mtime, vec![test_symbol("cached")]);
+        cache.insert(
+            source.clone(),
+            mtime,
+            size,
+            hash,
+            vec![test_symbol("cached")],
+        );
         symbol_cache_disk::write_to_disk(&cache, storage.path(), "unit-project")
             .expect("write symbol cache");
 
         let mut restored = SymbolCache::new();
-        let loaded = restored.load_from_disk(storage.path(), "unit-project");
+        let loaded = restored.load_from_disk(storage.path(), "unit-project", project.path());
         let symbols = restored.get(&source, mtime).expect("restored symbols");
 
         assert_eq!(loaded, 1);
@@ -3885,17 +3941,26 @@ mod tests {
             .expect("stat source")
             .modified()
             .expect("source mtime");
+        let content = std::fs::read(&source).expect("read source");
+        let size = content.len() as u64;
+        let hash = crate::cache_freshness::hash_bytes(&content);
 
         let mut cache = SymbolCache::new();
         cache.set_project_root(project.path().to_path_buf());
-        cache.insert(source.clone(), mtime, vec![test_symbol("cached")]);
+        cache.insert(
+            source.clone(),
+            mtime,
+            size,
+            hash,
+            vec![test_symbol("cached")],
+        );
         symbol_cache_disk::write_to_disk(&cache, storage.path(), "stale-unit-project")
             .expect("write symbol cache");
 
         std::fs::write(&source, "pub fn cached() {}\npub fn fresh() {}\n").expect("change source");
 
         let mut restored = SymbolCache::new();
-        let loaded = restored.load_from_disk(storage.path(), "stale-unit-project");
+        let loaded = restored.load_from_disk(storage.path(), "stale-unit-project", project.path());
 
         assert_eq!(loaded, 0);
         assert_eq!(restored.len(), 0);
@@ -3913,10 +3978,19 @@ mod tests {
             .expect("stat source")
             .modified()
             .expect("source mtime");
+        let content = std::fs::read(&source).expect("read source");
+        let size = content.len() as u64;
+        let hash = crate::cache_freshness::hash_bytes(&content);
 
         let mut disk_cache = SymbolCache::new();
         disk_cache.set_project_root(project.path().to_path_buf());
-        disk_cache.insert(source.clone(), mtime, vec![test_symbol("cached")]);
+        disk_cache.insert(
+            source.clone(),
+            mtime,
+            size,
+            hash,
+            vec![test_symbol("cached")],
+        );
         symbol_cache_disk::write_to_disk(&disk_cache, storage.path(), "prewarm-reset")
             .expect("write symbol cache");
 
@@ -3933,7 +4007,8 @@ mod tests {
                 cache.load_from_disk_for_generation(
                     stale_generation,
                     storage.path(),
-                    "prewarm-reset"
+                    "prewarm-reset",
+                    project.path()
                 ),
                 0
             );

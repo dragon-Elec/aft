@@ -15,15 +15,17 @@ use rayon::prelude::*;
 use regex::bytes::{Regex, RegexBuilder};
 use regex_syntax::hir::{Hir, HirKind};
 
+use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
+
 const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
 const CACHE_MAGIC: u32 = 0x3144_4958; // "XID1" little-endian
 const INDEX_MAGIC: &[u8; 8] = b"AFTIDX01";
 const LOOKUP_MAGIC: &[u8; 8] = b"AFTLKP01";
-const INDEX_VERSION: u32 = 2;
+const INDEX_VERSION: u32 = 3;
 const PREVIEW_BYTES: usize = 8 * 1024;
 const EOF_SENTINEL: u8 = 0;
 const MAX_ENTRIES: usize = 10_000_000;
-const MIN_FILE_ENTRY_BYTES: usize = 25;
+const MIN_FILE_ENTRY_BYTES: usize = 57;
 const LOOKUP_ENTRY_BYTES: usize = 16;
 const POSTING_BYTES: usize = 6;
 
@@ -164,6 +166,7 @@ pub struct FileEntry {
     pub path: PathBuf,
     pub size: u64,
     pub modified: SystemTime,
+    pub content_hash: blake3::Hash,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -299,6 +302,9 @@ impl SearchIndex {
             Some(file_id) => file_id,
             None => return,
         };
+        if let Some(file) = self.files.get_mut(file_id as usize) {
+            file.content_hash = cache_freshness::hash_bytes(content);
+        }
 
         let mut trigram_map: BTreeMap<u32, PostingFilter> = BTreeMap::new();
         for (trigram, next_char, position) in extract_trigrams(content) {
@@ -355,6 +361,7 @@ impl SearchIndex {
             file.path = PathBuf::new();
             file.size = 0;
             file.modified = UNIX_EPOCH;
+            file.content_hash = cache_freshness::zero_hash();
         }
     }
 
@@ -731,6 +738,7 @@ impl SearchIndex {
                 write_u64(&mut postings_writer, file.size)?;
                 write_u64(&mut postings_writer, modified.as_secs())?;
                 write_u32(&mut postings_writer, modified.subsec_nanos())?;
+                postings_writer.write_all(file.content_hash.as_bytes())?;
                 postings_writer.write_all(path.as_bytes())?;
             }
 
@@ -819,7 +827,8 @@ impl SearchIndex {
         }
     }
 
-    pub fn read_from_disk(cache_dir: &Path) -> Option<Self> {
+    pub fn read_from_disk(cache_dir: &Path, current_canonical_root: &Path) -> Option<Self> {
+        debug_assert!(current_canonical_root.is_absolute());
         let cache_path = cache_dir.join("cache.bin");
         let cache_bytes = fs::read(&cache_path).ok()?;
         if cache_bytes.len() < 16 {
@@ -888,7 +897,8 @@ impl SearchIndex {
         }
         let mut root_bytes = vec![0u8; root_len];
         postings_reader.read_exact(&mut root_bytes).ok()?;
-        let project_root = PathBuf::from(String::from_utf8(root_bytes).ok()?);
+        let _stored_project_root = PathBuf::from(String::from_utf8(root_bytes).ok()?);
+        let project_root = current_canonical_root.to_path_buf();
 
         let mut files = Vec::with_capacity(file_count);
         let mut path_to_id = HashMap::new();
@@ -901,6 +911,9 @@ impl SearchIndex {
             let size = read_u64(&mut postings_reader).ok()?;
             let secs = read_u64(&mut postings_reader).ok()?;
             let nanos = read_u32(&mut postings_reader).ok()?;
+            let mut hash_bytes = [0u8; 32];
+            postings_reader.read_exact(&mut hash_bytes).ok()?;
+            let content_hash = blake3::Hash::from_bytes(hash_bytes);
             if nanos >= 1_000_000_000 {
                 return None;
             }
@@ -917,6 +930,7 @@ impl SearchIndex {
                 path: full_path.clone(),
                 size,
                 modified: UNIX_EPOCH + Duration::new(secs, nanos),
+                content_hash,
             });
             path_to_id.insert(full_path, file_id_u32);
             if unindexed[0] == 1 {
@@ -1056,6 +1070,7 @@ impl SearchIndex {
             path: path.to_path_buf(),
             size,
             modified,
+            content_hash: cache_freshness::zero_hash(),
         });
         self.path_to_id.insert(path.to_path_buf(), file_id);
         Some(file_id)
@@ -1680,17 +1695,35 @@ fn verify_file_mtimes(index: &mut SearchIndex) {
         if entry.path.as_os_str().is_empty() {
             continue; // tombstoned entry
         }
-        match fs::metadata(&entry.path) {
-            Ok(meta) => {
-                let current_mtime = meta.modified().unwrap_or(UNIX_EPOCH);
-                if current_mtime != entry.modified || meta.len() != entry.size {
-                    stale_paths.push(entry.path.clone());
-                }
+        let cached = FileFreshness {
+            mtime: entry.modified,
+            size: entry.size,
+            content_hash: entry.content_hash,
+        };
+        match cache_freshness::verify_file(&entry.path, &cached) {
+            FreshnessVerdict::HotFresh | FreshnessVerdict::ContentFresh { .. } => {}
+            FreshnessVerdict::Stale | FreshnessVerdict::Deleted => {
+                stale_paths.push(entry.path.clone())
             }
-            Err(_) => {
-                // File deleted
-                stale_paths.push(entry.path.clone());
-            }
+        }
+    }
+
+    for entry in &mut index.files {
+        if entry.path.as_os_str().is_empty() {
+            continue;
+        }
+        let cached = FileFreshness {
+            mtime: entry.modified,
+            size: entry.size,
+            content_hash: entry.content_hash,
+        };
+        if let FreshnessVerdict::ContentFresh {
+            new_mtime,
+            new_size,
+        } = cache_freshness::verify_file(&entry.path, &cached)
+        {
+            entry.modified = new_mtime;
+            entry.size = new_size;
         }
     }
 
@@ -2129,7 +2162,8 @@ mod tests {
         let cache_dir = dir.path().join("cache");
         index.write_to_disk(&cache_dir, index.git_head.as_deref());
 
-        let loaded = SearchIndex::read_from_disk(&cache_dir).expect("load index from disk");
+        let loaded =
+            SearchIndex::read_from_disk(&cache_dir, &project).expect("load index from disk");
         assert_eq!(loaded.stored_git_head(), Some("deadbeef"));
         assert_eq!(loaded.files.len(), 1);
         assert_eq!(
@@ -2159,7 +2193,7 @@ mod tests {
         bytes[middle] ^= 0xff;
         fs::write(&cache_path, bytes).expect("write corrupted cache");
 
-        assert!(SearchIndex::read_from_disk(&cache_dir).is_none());
+        assert!(SearchIndex::read_from_disk(&cache_dir, &project).is_none());
     }
 
     #[test]
@@ -2208,7 +2242,7 @@ mod tests {
         a.join().expect("writer a");
         b.join().expect("writer b");
 
-        assert!(SearchIndex::read_from_disk(&cache_dir).is_some());
+        assert!(SearchIndex::read_from_disk(&cache_dir, &project).is_some());
     }
 
     #[test]
@@ -2218,7 +2252,7 @@ mod tests {
         fs::create_dir_all(&cache_dir).expect("create cache dir");
         fs::write(cache_dir.join("cache.bin.tmp.1.1"), b"partial").expect("write partial tmp");
 
-        assert!(SearchIndex::read_from_disk(&cache_dir).is_none());
+        assert!(SearchIndex::read_from_disk(&cache_dir, dir.path()).is_none());
     }
 
     #[test]
@@ -2486,7 +2520,7 @@ mod tests {
         cache.extend_from_slice(&lookup);
         fs::write(cache_dir.join("cache.bin"), cache).expect("write cache");
 
-        assert!(SearchIndex::read_from_disk(&cache_dir).is_none());
+        assert!(SearchIndex::read_from_disk(&cache_dir, dir.path()).is_none());
     }
 
     /// Regression: v0.15.2 — sort_paths_by_mtime_desc panicked when files

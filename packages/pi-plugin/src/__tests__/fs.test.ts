@@ -15,14 +15,14 @@ import {
 } from "./tool-test-utils.js";
 
 describe("fs tool adapters", () => {
-  test("aft_delete sends each file with session_id and reports partial success", async () => {
+  test("aft_delete batches all files into one bridge call and reports partial success", async () => {
     const { api, tools } = makeMockApi();
-    const { bridge, calls } = makeMockBridge((_command, params) => {
-      if (params.file === "locked.ts") {
-        return { success: false, message: "permission denied" };
-      }
-      return { success: true };
-    });
+    const { bridge, calls } = makeMockBridge(() => ({
+      success: true,
+      complete: false,
+      deleted: [{ file: "ok.ts", backup_id: "b-1" }],
+      skipped_files: [{ file: "locked.ts", reason: "permission denied" }],
+    }));
     registerFsTools(api, makePluginContext(bridge), { delete: true, move: true });
 
     const result = (await executeTool(
@@ -31,10 +31,12 @@ describe("fs tool adapters", () => {
       makeExtContext("/repo", "delete-session"),
     )) as { content: Array<{ text: string }>; details: Record<string, unknown> };
 
-    expect(calls.map((call) => call.params)).toEqual([
-      { file: "ok.ts", session_id: "delete-session" },
-      { file: "locked.ts", session_id: "delete-session" },
-    ]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].params).toEqual({
+      files: ["ok.ts", "locked.ts"],
+      recursive: false,
+      session_id: "delete-session",
+    });
     expect(result.content[0].text).toBe("Deleted 1/2 file(s)");
     expect(result.details).toMatchObject({
       complete: false,
@@ -45,7 +47,12 @@ describe("fs tool adapters", () => {
 
   test("aft_delete throws when every file fails instead of claiming success", async () => {
     const { api, tools } = makeMockApi();
-    const { bridge } = makeMockBridge(() => ({ success: false, code: "missing" }));
+    const { bridge } = makeMockBridge(() => ({
+      success: true,
+      complete: false,
+      deleted: [],
+      skipped_files: [{ file: "missing.ts", reason: "file_not_found" }],
+    }));
     registerFsTools(api, makePluginContext(bridge), { delete: true, move: false });
 
     await expect(executeTool(tools.get("aft_delete")!, { files: ["missing.ts"] })).rejects.toThrow(

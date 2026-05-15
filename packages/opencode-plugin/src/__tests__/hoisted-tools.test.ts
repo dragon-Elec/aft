@@ -162,9 +162,15 @@ describe("Hoisted tool execute handlers", () => {
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
     sdkCtx = createMockSdkContext(tmpDir);
 
-    const { tools } = createMockHoistedHarness(async (command) => {
+    const { tools } = createMockHoistedHarness(async (command, params) => {
       expect(command).toBe("delete_file");
-      return { success: false, message: "Cannot delete protected file" };
+      const files = (params.files as string[]) ?? [];
+      return {
+        success: true,
+        complete: false,
+        deleted: [],
+        skipped_files: files.map((file) => ({ file, reason: "Cannot delete protected file" })),
+      };
     });
 
     await expect(
@@ -176,17 +182,24 @@ describe("Hoisted tool execute handlers", () => {
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
     sdkCtx = createMockSdkContext(tmpDir);
 
-    const responses = [
-      { success: true },
-      { success: false, message: "permission denied", code: "permission_denied" },
-      { success: true },
-    ];
-    let callIndex = 0;
-    const { tools } = createMockHoistedHarness(async (command) => {
+    const { tools } = createMockHoistedHarness(async (command, params) => {
       expect(command).toBe("delete_file");
-      const response = responses[callIndex++];
-      if (!response) throw new Error("unexpected extra delete_file call");
-      return response;
+      const files = (params.files as string[]) ?? [];
+      const deleted: Array<{ file: string; backup_id: string | null }> = [];
+      const skipped: Array<{ file: string; reason: string }> = [];
+      for (const file of files) {
+        if (file.includes("blocked.ts")) {
+          skipped.push({ file, reason: "permission denied" });
+        } else {
+          deleted.push({ file, backup_id: null });
+        }
+      }
+      return {
+        success: true,
+        complete: skipped.length === 0,
+        deleted,
+        skipped_files: skipped,
+      };
     });
 
     const raw = await tools.aft_delete.execute({ files: ["a.ts", "blocked.ts", "c.ts"] }, sdkCtx);
@@ -206,9 +219,15 @@ describe("Hoisted tool execute handlers", () => {
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
     sdkCtx = createMockSdkContext(tmpDir);
 
-    const { tools } = createMockHoistedHarness(async (command) => {
+    const { tools } = createMockHoistedHarness(async (command, params) => {
       expect(command).toBe("delete_file");
-      return { success: true };
+      const files = (params.files as string[]) ?? [];
+      return {
+        success: true,
+        complete: true,
+        deleted: files.map((file) => ({ file, backup_id: null })),
+        skipped_files: [],
+      };
     });
 
     const raw = await tools.aft_delete.execute({ files: ["a.ts", "b.ts"] }, sdkCtx);

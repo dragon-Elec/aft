@@ -1480,8 +1480,10 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
 // ---------------------------------------------------------------------------
 
 const DELETE_DESCRIPTION =
-  "Delete one or more files with backup.\n\n" +
-  "Each file is backed up before deletion — use aft_safety undo to recover any of them.\n\n" +
+  "Delete one or more files (or directories) with backup.\n\n" +
+  "Each file is backed up before deletion — use aft_safety undo to recover any of them. " +
+  "For directories, every file inside is individually backed up before the tree is removed.\n\n" +
+  "Directory deletion requires recursive: true. Without it, passing a directory returns an error.\n\n" +
   "Returns: { success, complete, deleted: [paths], skipped_files: [{file, reason}] }. " +
   "Partial success is allowed: files that can be deleted are deleted; files that fail " +
   "(missing, permission denied, etc.) are reported in skipped_files. " +
@@ -1494,12 +1496,17 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
       files: z
         .array(z.string())
         .min(1)
+        .describe("Paths to delete (one or more). May include directories when recursive=true."),
+      recursive: z
+        .boolean()
+        .optional()
         .describe(
-          "Paths to delete (one or more). Single-file callers pass a single-element array.",
+          "Required to delete a directory and its contents. Defaults to false; passing a directory without this returns an error.",
         ),
     },
     execute: async (args, context): Promise<string> => {
       const inputs = args.files as string[];
+      const recursive = args.recursive === true;
       const absolutePaths = inputs.map((f) =>
         path.isAbsolute(f) ? f : path.resolve(context.directory, f),
       );
@@ -1524,19 +1531,17 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
         }),
       );
 
-      const deleted: string[] = [];
-      const skipped: Array<{ file: string; reason: string }> = [];
-      for (const filePath of absolutePaths) {
-        const result = await callBridge(ctx, context, "delete_file", { file: filePath });
-        if (result.success === false) {
-          skipped.push({
-            file: filePath,
-            reason: (result.message as string) || (result.code as string) || "delete failed",
-          });
-        } else {
-          deleted.push(filePath);
-        }
-      }
+      // Single batched call so every file shares one op_id; one `aft_safety
+      // undo` then restores the whole delete atomically.
+      const response = await callBridge(ctx, context, "delete_file", {
+        files: absolutePaths,
+        recursive,
+      });
+
+      const deletedEntries = (response.deleted as Array<{ file: string }> | undefined) ?? [];
+      const skipped =
+        (response.skipped_files as Array<{ file: string; reason: string }> | undefined) ?? [];
+      const deleted = deletedEntries.map((entry) => entry.file);
 
       // Refuse a fully-failed batch with a real error so the agent surface
       // doesn't silently render "completed" for nothing-actually-deleted.

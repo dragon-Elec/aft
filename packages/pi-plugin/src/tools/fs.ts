@@ -18,9 +18,15 @@ import {
 
 const DeleteParams = Type.Object({
   files: Type.Array(Type.String(), {
-    description: "Paths to delete (one or more). Single-file callers pass a single-element array.",
+    description: "Paths to delete (one or more). May include directories when recursive=true.",
     minItems: 1,
   }),
+  recursive: Type.Optional(
+    Type.Boolean({
+      description:
+        "Required to delete a directory and its contents. Defaults to false; passing a directory without this returns an error.",
+    }),
+  ),
 });
 
 const MoveParams = Type.Object({
@@ -110,7 +116,8 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
       name: "aft_delete",
       label: "delete",
       description:
-        "Delete one or more files with backup. Each file is backed up before deletion — use `aft_safety undo` to recover any of them. " +
+        "Delete one or more files (or directories) with backup. Each file is backed up before deletion — use `aft_safety undo` to recover any of them. " +
+        "For directories, every file inside is individually backed up before removal. Directory deletion requires recursive: true. " +
         "Returns { success, complete, deleted, skipped_files }: partial success is allowed; files that fail are reported in skipped_files.",
       parameters: DeleteParams,
       async execute(
@@ -122,24 +129,17 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
       ) {
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const sessionId = resolveSessionId(extCtx);
-        const deleted: string[] = [];
-        const skipped: Array<{ file: string; reason: string }> = [];
-        // Use bridge.send directly (not the throwing callBridge wrapper) so
-        // a single-file failure doesn't abort the rest of the batch.
-        for (const filePath of params.files) {
-          const response = await bridge.send("delete_file", {
-            file: filePath,
-            ...(sessionId ? { session_id: sessionId } : {}),
-          });
-          if (response.success === false) {
-            skipped.push({
-              file: filePath,
-              reason: (response.message as string) || (response.code as string) || "delete failed",
-            });
-          } else {
-            deleted.push(filePath);
-          }
-        }
+        // Single batched call so every file shares one op_id; one
+        // `aft_safety undo` then restores the whole delete atomically.
+        const response = await bridge.send("delete_file", {
+          files: params.files,
+          recursive: params.recursive === true,
+          ...(sessionId ? { session_id: sessionId } : {}),
+        });
+        const deletedEntries = (response.deleted as Array<{ file: string }> | undefined) ?? [];
+        const skipped =
+          (response.skipped_files as Array<{ file: string; reason: string }> | undefined) ?? [];
+        const deleted = deletedEntries.map((entry) => entry.file);
         // Refuse a fully-failed batch with an error so renderers don't show
         // "completed" for nothing-actually-deleted.
         if (deleted.length === 0 && skipped.length > 0) {

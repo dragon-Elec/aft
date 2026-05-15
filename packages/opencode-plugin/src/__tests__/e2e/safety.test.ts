@@ -104,4 +104,96 @@ maybeDescribe("e2e safety commands", () => {
     expect(checkpoints.some((checkpoint) => checkpoint.name === "one")).toBe(true);
     expect(checkpoints.some((checkpoint) => checkpoint.name === "two")).toBe(true);
   });
+
+  test("operation undo restores every file from a multi-file delete in one call", async () => {
+    // Regression: v0.25 introduced operation-scoped backups. aft_delete
+    // files: [a, b, c] writes one op_id; a single `undo` with no `file`
+    // param restores all three atomically.
+    const h = await harness();
+    const fileA = h.path("op-undo-a.txt");
+    const fileB = h.path("op-undo-b.txt");
+    const fileC = h.path("op-undo-c.txt");
+
+    await writeFile(fileA, "content-a\n");
+    await writeFile(fileB, "content-b\n");
+    await writeFile(fileC, "content-c\n");
+
+    const deleteResp = await h.bridge.send("delete_file", {
+      files: [fileA, fileB, fileC],
+    });
+    expect(deleteResp.success).toBe(true);
+    expect(deleteResp.complete).toBe(true);
+    const { existsSync } = await import("node:fs");
+    expect(existsSync(fileA)).toBe(false);
+    expect(existsSync(fileB)).toBe(false);
+    expect(existsSync(fileC)).toBe(false);
+
+    // Operation undo: no `file` param. Restores everything tagged with the
+    // most recent op_id atomically.
+    const undoResp = await h.bridge.send("undo");
+    expect(undoResp.success).toBe(true);
+    expect(undoResp.operation).toBe(true);
+    expect(undoResp.restored_count).toBe(3);
+    expect(await readTextFile(fileA)).toBe("content-a\n");
+    expect(await readTextFile(fileB)).toBe("content-b\n");
+    expect(await readTextFile(fileC)).toBe("content-c\n");
+  });
+
+  test("operation undo restores a recursive directory delete in one call", async () => {
+    // Regression: v0.25 added aft_delete recursive: true. Backs every file
+    // in the tree under one op_id; single undo restores files AND
+    // intermediate parent directories.
+    const h = await harness();
+    const dir = h.path("op-undo-tree");
+    const { mkdir } = await import("node:fs/promises");
+    const { existsSync } = await import("node:fs");
+    await mkdir(`${dir}/nested`, { recursive: true });
+    await writeFile(`${dir}/top.txt`, "top-content\n");
+    await writeFile(`${dir}/nested/inner.txt`, "inner-content\n");
+
+    const deleteResp = await h.bridge.send("delete_file", {
+      file: dir,
+      recursive: true,
+    });
+    expect(deleteResp.success).toBe(true);
+    expect(deleteResp.is_directory).toBe(true);
+    expect(deleteResp.files_deleted).toBe(2);
+    expect(existsSync(dir)).toBe(false);
+
+    const undoResp = await h.bridge.send("undo");
+    expect(undoResp.success).toBe(true);
+    expect(undoResp.operation).toBe(true);
+    expect(undoResp.restored_count).toBe(2);
+    // Both files AND their parent directories must be restored.
+    expect(await readTextFile(`${dir}/top.txt`)).toBe("top-content\n");
+    expect(await readTextFile(`${dir}/nested/inner.txt`)).toBe("inner-content\n");
+  });
+
+  test("recursive delete rejects symlinks before touching the filesystem", async () => {
+    // Regression: v0.25 guards recursive delete against symlinks (whose
+    // canonical target could be outside the tree) and empty directories
+    // (which the backup format can't currently restore).
+    const h = await harness();
+    const dir = h.path("symlink-guard");
+    const outside = h.path("symlink-target.txt");
+    const { mkdir, symlink } = await import("node:fs/promises");
+    const { existsSync } = await import("node:fs");
+    await mkdir(dir, { recursive: true });
+    await writeFile(`${dir}/real.txt`, "inside\n");
+    await writeFile(outside, "outside\n");
+    await symlink(outside, `${dir}/link.txt`);
+
+    const resp = await h.bridge.send("delete_file", {
+      file: dir,
+      recursive: true,
+    });
+    expect(resp.success).toBe(false);
+    expect(resp.code).toBe("unsupported_directory_contents");
+    expect(resp.message as string).toContain("link.txt");
+    // The whole tree, the symlink, and the outside target must be untouched.
+    expect(existsSync(dir)).toBe(true);
+    expect(existsSync(`${dir}/real.txt`)).toBe(true);
+    expect(existsSync(`${dir}/link.txt`)).toBe(true);
+    expect(await readTextFile(outside)).toBe("outside\n");
+  });
 });

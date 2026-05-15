@@ -547,7 +547,15 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       // No session_id: this runs before any user session exists; the
       // resulting configure threads will log with no [ses_xxx] prefix
       // (correct behavior for plugin-init activity).
-      await bridge.send("status", {}, { configureWarningClient: input.client });
+      const response = await bridge.send("status", {}, { configureWarningClient: input.client });
+      // Seed the plugin-side cache so the TUI sidebar's first poll after
+      // spawn finds a warm snapshot instead of racing into bridge.send and
+      // hitting the 5s client timeout while the bridge dispatch loop is
+      // still finishing configure. Push frames will overwrite this with
+      // fresh data on every state transition (1s debounce).
+      if (response.success !== false) {
+        bridge.cacheStatusSnapshot(response as Parameters<typeof bridge.cacheStatusSnapshot>[0]);
+      }
     } catch (err) {
       log(`eager configure failed: ${err instanceof Error ? err.message : String(err)}`);
     }

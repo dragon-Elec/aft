@@ -580,7 +580,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       const bridge = pool.getBridge(cwd);
       // No session_id: runs before any user session exists; configure
       // threads spawned by this warmup will log with no [ses_xxx] prefix.
-      await bridge.send("status", {});
+      const response = await bridge.send("status", {});
+      // Seed the plugin-side cache so the /aft-status overlay's first poll
+      // after spawn finds a warm snapshot instead of racing into bridge.send
+      // and hitting the client timeout while the bridge dispatch loop is
+      // still finishing configure. Push frames will overwrite this with
+      // fresh data on every state transition (1s debounce).
+      if (response.success !== false) {
+        bridge.cacheStatusSnapshot(response as Parameters<typeof bridge.cacheStatusSnapshot>[0]);
+      }
     } catch (err) {
       log(`eager configure failed: ${err instanceof Error ? err.message : String(err)}`);
     }

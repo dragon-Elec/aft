@@ -48,7 +48,16 @@ impl LspChildRegistry {
 
     /// Force-kill every tracked child synchronously. Used by the signal
     /// handler to prevent orphaned LSP processes when aft is SIGTERM'd.
-    /// Returns the number of PIDs that were sent SIGKILL.
+    /// Returns the number of process groups that were sent SIGKILL.
+    ///
+    /// On Unix, kills the entire process group (via `killpg`) rather than
+    /// just the wrapper PID. Necessary because npm-wrapped LSP servers like
+    /// biome ship as `node biome lsp-proxy` shims that spawn the real
+    /// `cli-darwin-arm64 biome lsp-proxy` as a child; killing only the
+    /// wrapper leaves the real server orphaned to PID 1.
+    ///
+    /// `LspClient::spawn` puts each child in its own session via `setsid()`
+    /// so `pgid == child.id()`.
     #[cfg(unix)]
     pub fn kill_all(&self) -> usize {
         use std::os::raw::c_int;
@@ -58,10 +67,10 @@ impl LspChildRegistry {
             // SIGKILL = 9. We use the raw libc call rather than crossbeam
             // because we're inside a signal-handler context where allocator
             // and channel use is risky.
-            // SAFETY: kill(2) is async-signal-safe.
+            // SAFETY: killpg(2) is async-signal-safe.
             unsafe {
-                let pid_t = pid as libc::pid_t;
-                let rc = libc::kill(pid_t, 9 as c_int);
+                let pgid = pid as libc::pid_t;
+                let rc = libc::killpg(pgid, 9 as c_int);
                 if rc == 0 {
                     killed += 1;
                 }
@@ -70,15 +79,17 @@ impl LspChildRegistry {
         killed
     }
 
-    /// Windows fallback: best-effort kill via `taskkill`. Not technically
-    /// async-signal-safe but Windows doesn't deliver signals the same way.
+    /// Windows fallback: best-effort kill via `taskkill /F /T`. The `/T`
+    /// flag kills the entire process tree (Windows analogue of process
+    /// groups). Not technically async-signal-safe but Windows doesn't
+    /// deliver signals the same way.
     #[cfg(not(unix))]
     pub fn kill_all(&self) -> usize {
         let pids = self.pids();
         let mut killed = 0;
         for pid in pids {
             if std::process::Command::new("taskkill")
-                .args(["/F", "/PID", &pid.to_string()])
+                .args(["/F", "/T", "/PID", &pid.to_string()])
                 .status()
                 .is_ok()
             {
@@ -126,5 +137,97 @@ mod tests {
     fn kill_all_with_no_pids_returns_zero() {
         let reg = LspChildRegistry::new();
         assert_eq!(reg.kill_all(), 0);
+    }
+
+    // Regression for the npm-wrapper orphan bug: biome ships as `node
+    // biome lsp-proxy` (the wrapper) that spawns
+    // `cli-darwin-arm64 biome lsp-proxy` (the actual server) as a child.
+    // Killing just the wrapper PID via `kill(2)` leaves the real server
+    // orphaned to PID 1. `killpg(2)` kills the whole group.
+    //
+    // This test simulates that two-process structure with a shell pipeline:
+    // a parent shell that forks a child `sleep`. The parent stays attached
+    // (via wait), so both die when the group is killed.
+    #[cfg(unix)]
+    #[test]
+    fn kill_all_kills_process_group_not_just_wrapper_pid() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::Duration;
+
+        // Spawn a wrapper that forks a child and waits for it. Print the
+        // child PID to stdout so we can verify it's killed too.
+        let mut child = unsafe {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c")
+                .arg("sleep 60 & echo $! ; wait")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            // setsid() so wrapper becomes its own process-group leader,
+            // matching what LspClient::spawn does.
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+            cmd.spawn().expect("spawn wrapper")
+        };
+
+        // Read the child PID from stdout.
+        let mut stdout = child.stdout.take().expect("stdout pipe");
+        let mut buf = String::new();
+        use std::io::Read;
+        // Give the shell a moment to print the PID.
+        let mut byte = [0u8; 1];
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match stdout.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                    buf.push(byte[0] as char);
+                }
+                Err(_) => break,
+            }
+        }
+        let grandchild_pid: u32 = buf.trim().parse().expect("parse grandchild PID");
+
+        // Verify both are alive before kill.
+        let wrapper_pid = child.id();
+        assert!(
+            crate::bash_background::process::is_process_alive(wrapper_pid),
+            "wrapper should be alive"
+        );
+        assert!(
+            crate::bash_background::process::is_process_alive(grandchild_pid),
+            "grandchild should be alive"
+        );
+
+        // Track wrapper PID, kill the group.
+        let reg = LspChildRegistry::new();
+        reg.track(wrapper_pid);
+        let killed = reg.kill_all();
+        assert_eq!(killed, 1, "should report 1 group killed");
+
+        // Reap the wrapper so we don't leave a zombie.
+        let _ = child.wait();
+
+        // Give the kernel a moment to propagate SIGKILL through the group.
+        thread::sleep(Duration::from_millis(100));
+
+        // Both must be dead. This is the actual regression assertion:
+        // without killpg() the grandchild would survive as an orphan.
+        assert!(
+            !crate::bash_background::process::is_process_alive(wrapper_pid),
+            "wrapper must be dead after killpg"
+        );
+        assert!(
+            !crate::bash_background::process::is_process_alive(grandchild_pid),
+            "grandchild must be dead after killpg (this was the npm-wrapper orphan bug)"
+        );
     }
 }

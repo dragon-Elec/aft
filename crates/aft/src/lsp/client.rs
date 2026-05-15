@@ -141,6 +141,22 @@ impl LspClient {
             command.env(key, value);
         }
 
+        // Put each LSP child in its own process group so we can SIGKILL the
+        // whole group on shutdown. Critical for npm-wrapped servers like
+        // biome (`node biome lsp-proxy` spawns `cli-darwin-arm64 biome
+        // lsp-proxy` as a child); killing just the wrapper PID leaves the
+        // real server orphaned to PID 1.
+        #[cfg(unix)]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
         let mut child = command.spawn()?;
         let child_pid = child.id();
         child_registry.track(child_pid);
@@ -505,8 +521,10 @@ impl LspClient {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+                // Kill the entire process group, not just the wrapper PID, so
+                // npm-wrapped servers (biome's `node biome lsp-proxy` spawns
+                // a separate cli-darwin-arm64 child) don't leak orphans.
+                kill_lsp_child_group(&mut self.child);
                 self.state = ServerState::Exited;
                 return Err(LspError::Timeout(format!(
                     "timed out waiting for {:?} to exit",
@@ -557,8 +575,27 @@ impl Drop for LspClient {
         // Untrack first so the signal handler can't race with this kill and
         // try to SIGKILL a PID that's already been reaped.
         self.child_registry.untrack(self.child_pid);
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        kill_lsp_child_group(&mut self.child);
+    }
+}
+
+/// Force-terminate an LSP child and its entire process group on Unix.
+/// On Windows, `taskkill /F /T` kills the process tree.
+///
+/// Necessary because some LSP servers ship as npm-installed Node shims that
+/// spawn the real binary as a child. Killing only the wrapper PID leaves the
+/// real server orphaned to PID 1 and accumulates over time.
+fn kill_lsp_child_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pgid = child.id() as i32;
+        crate::bash_background::process::terminate_pgid(pgid, Some(child));
+        let _ = child.wait();
+    }
+    #[cfg(not(unix))]
+    {
+        crate::bash_background::process::terminate_process(child);
+        let _ = child.wait();
     }
 }
 

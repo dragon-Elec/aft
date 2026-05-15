@@ -353,9 +353,11 @@ impl AppContext {
         let root_ignore = Path::new(&root).join(".gitignore");
         if root_ignore.exists() {
             if let Some(err) = builder.add(&root_ignore) {
-                crate::slog_warn!("gitignore parse error in {}: {}",
-                root_ignore.display(),
-                err);
+                crate::slog_warn!(
+                    "gitignore parse error in {}: {}",
+                    root_ignore.display(),
+                    err
+                );
             }
         }
         // .git/info/exclude — manually added because GitignoreBuilder::new()
@@ -363,9 +365,11 @@ impl AppContext {
         let info_exclude = Path::new(&root).join(".git").join("info").join("exclude");
         if info_exclude.exists() {
             if let Some(err) = builder.add(&info_exclude) {
-                crate::slog_warn!("gitignore parse error in {}: {}",
-                info_exclude.display(),
-                err);
+                crate::slog_warn!(
+                    "gitignore parse error in {}: {}",
+                    info_exclude.display(),
+                    err
+                );
             }
         }
         // Walk the project to pick up nested .gitignore files. Cap the walk
@@ -390,9 +394,11 @@ impl AppContext {
         for entry in walker.flatten() {
             if entry.file_name() == ".gitignore" && entry.path() != root_ignore {
                 if let Some(err) = builder.add(entry.path()) {
-                    crate::slog_warn!("nested gitignore parse error in {}: {}",
-                    entry.path().display(),
-                    err);
+                    crate::slog_warn!(
+                        "nested gitignore parse error in {}: {}",
+                        entry.path().display(),
+                        err
+                    );
                 }
             }
         }

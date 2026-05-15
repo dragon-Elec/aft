@@ -987,8 +987,10 @@ fn rewrite_consumer_imports(
                 if export_statement_has_wildcard(content, &node) {
                     // TODO: safely rewrite `export * from "..."` once moved-symbol
                     // provenance can distinguish which names are provided by the star.
-                    crate::slog_warn!("move_symbol: leaving wildcard re-export unchanged in {}",
-                    consumer_file.display());
+                    crate::slog_warn!(
+                        "move_symbol: leaving wildcard re-export unchanged in {}",
+                        consumer_file.display()
+                    );
                     continue;
                 }
                 if !export_statement_contains_name(content, &node, symbol_name) {

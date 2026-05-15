@@ -480,9 +480,11 @@ fn rollback(
             store.restore_latest(session, path)
         };
         if let Err(e) = result {
-            crate::slog_warn!("transaction rollback: failed to restore {}: {}",
-            path.display(),
-            e);
+            crate::slog_warn!(
+                "transaction rollback: failed to restore {}: {}",
+                path.display(),
+                e
+            );
             failures.push(RollbackFailure {
                 file: path.display().to_string(),
                 action: "restore".to_string(),
@@ -495,9 +497,11 @@ fn rollback(
     for path in new_files {
         if path.exists() {
             if let Err(e) = std::fs::remove_file(path) {
-                crate::slog_warn!("transaction rollback: failed to delete new file {}: {}",
-                path.display(),
-                e);
+                crate::slog_warn!(
+                    "transaction rollback: failed to delete new file {}: {}",
+                    path.display(),
+                    e
+                );
                 failures.push(RollbackFailure {
                     file: path.display().to_string(),
                     action: "delete".to_string(),

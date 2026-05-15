@@ -382,13 +382,17 @@ impl BackupStore {
                 continue;
             }
             if let Err(e) = std::fs::remove_dir_all(&session_dir) {
-                crate::slog_warn!("failed to remove stale backup session {}: {}",
-                session_dir.display(),
-                e);
+                crate::slog_warn!(
+                    "failed to remove stale backup session {}: {}",
+                    session_dir.display(),
+                    e
+                );
             } else {
-                crate::slog_warn!("removed stale backup session {} (last_accessed={})",
-                session_dir.display(),
-                last_accessed);
+                crate::slog_warn!(
+                    "removed stale backup session {} (last_accessed={})",
+                    session_dir.display(),
+                    last_accessed
+                );
             }
         }
     }
@@ -452,15 +456,19 @@ impl BackupStore {
                     migrated += 1;
                 }
                 Err(e) => {
-                    crate::slog_warn!("failed to migrate legacy backup {}: {}",
-                    entry_path.display(),
-                    e);
+                    crate::slog_warn!(
+                        "failed to migrate legacy backup {}: {}",
+                        entry_path.display(),
+                        e
+                    );
                 }
             }
         }
         if migrated > 0 {
-            crate::slog_info!("migrated {} legacy backup entries into default session namespace",
-            migrated);
+            crate::slog_info!(
+                "migrated {} legacy backup entries into default session namespace",
+                migrated
+            );
             // Write a session.json marker so future scans don't re-migrate.
             let marker = default_session_dir.join("session.json");
             let json = serde_json::json!({
@@ -547,9 +555,11 @@ impl BackupStore {
             }
         }
         if total_entries > 0 {
-            crate::slog_info!("loaded {} backup entries across {} session(s) from disk",
-            total_entries,
-            self.disk_index.len());
+            crate::slog_info!(
+                "loaded {} backup entries across {} session(s) from disk",
+                total_entries,
+                self.disk_index.len()
+            );
         }
     }
 

@@ -1120,9 +1120,11 @@ pub fn auto_format(path: &Path, config: &Config) -> (bool, Option<String>) {
             return (false, Some("no_formatter_configured".to_string()));
         }
         ToolDetection::NotInstalled { tool } => {
-            crate::slog_warn!("format: {} (skipped: formatter_not_installed: {})",
-            path.display(),
-            tool);
+            crate::slog_warn!(
+                "format: {} (skipped: formatter_not_installed: {})",
+                path.display(),
+                tool
+            );
             return (false, Some("formatter_not_installed".to_string()));
         }
     };
@@ -1147,8 +1149,10 @@ pub fn auto_format(path: &Path, config: &Config) -> (bool, Option<String>) {
             (false, Some("timeout".to_string()))
         }
         Err(FormatError::NotFound { .. }) => {
-            crate::slog_warn!("format: {} (skipped: formatter_not_installed)",
-            path.display());
+            crate::slog_warn!(
+                "format: {} (skipped: formatter_not_installed)",
+                path.display()
+            );
             (false, Some("formatter_not_installed".to_string()))
         }
         Err(FormatError::Failed { stderr, .. }) => {
@@ -1164,14 +1168,18 @@ pub fn auto_format(path: &Path, config: &Config) -> (bool, Option<String>) {
             // landed unformatted. Detect the common stderr fingerprints and
             // return a distinct, surfaced skip reason.
             if formatter_excluded_path(&stderr) {
-                crate::slog_info!("format: {} (skipped: formatter_excluded_path; stderr: {})",
-                path.display(),
-                stderr.lines().next().unwrap_or("").trim());
+                crate::slog_info!(
+                    "format: {} (skipped: formatter_excluded_path; stderr: {})",
+                    path.display(),
+                    stderr.lines().next().unwrap_or("").trim()
+                );
                 return (false, Some("formatter_excluded_path".to_string()));
             }
-            crate::slog_warn!("format: {} (skipped: error: {})",
-            path.display(),
-            stderr.lines().next().unwrap_or("unknown").trim());
+            crate::slog_warn!(
+                "format: {} (skipped: error: {})",
+                path.display(),
+                stderr.lines().next().unwrap_or("unknown").trim()
+            );
             (false, Some("error".to_string()))
         }
         Err(FormatError::UnsupportedLanguage) => {
@@ -1532,9 +1540,11 @@ pub fn validate_full(path: &Path, config: &Config) -> (Vec<ValidationError>, Opt
             return (Vec::new(), Some("no_checker_configured".to_string()));
         }
         ToolDetection::NotInstalled { tool } => {
-            crate::slog_warn!("validate: {} (skipped: checker_not_installed: {})",
-            path.display(),
-            tool);
+            crate::slog_warn!(
+                "validate: {} (skipped: checker_not_installed: {})",
+                path.display(),
+                tool
+            );
             return (Vec::new(), Some("checker_not_installed".to_string()));
         }
     };
@@ -1565,8 +1575,10 @@ pub fn validate_full(path: &Path, config: &Config) -> (Vec<ValidationError>, Opt
             (Vec::new(), Some("timeout".to_string()))
         }
         Err(FormatError::NotFound { .. }) => {
-            crate::slog_warn!("validate: {} (skipped: checker_not_installed)",
-            path.display());
+            crate::slog_warn!(
+                "validate: {} (skipped: checker_not_installed)",
+                path.display()
+            );
             (Vec::new(), Some("checker_not_installed".to_string()))
         }
         Err(FormatError::Failed { stderr, .. }) => {

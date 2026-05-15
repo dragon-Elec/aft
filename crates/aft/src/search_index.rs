@@ -1708,8 +1708,10 @@ fn verify_file_mtimes(index: &mut SearchIndex) {
     }
 
     if !stale_paths.is_empty() {
-        crate::slog_info!("search index: refreshed {} stale file(s) from disk cache",
-        stale_paths.len());
+        crate::slog_info!(
+            "search index: refreshed {} stale file(s) from disk cache",
+            stale_paths.len()
+        );
     }
 }
 

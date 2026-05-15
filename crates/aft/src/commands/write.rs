@@ -55,9 +55,11 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
         match std::fs::read_to_string(path.as_path()) {
             Ok(content) => content,
             Err(error) => {
-                crate::slog_warn!("write: failed to read existing file before diff for {}: {}",
-                file,
-                error);
+                crate::slog_warn!(
+                    "write: failed to read existing file before diff for {}: {}",
+                    file,
+                    error
+                );
                 String::new()
             }
         }

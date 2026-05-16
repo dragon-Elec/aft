@@ -339,13 +339,12 @@ fn find_request(command: &str) -> Option<Value> {
     }
 
     let name = name?;
-    let pattern = if path == "." {
-        format!("**/{name}")
+    let pattern = format!("**/{name}");
+    if path == "." {
+        Some(json!({ "pattern": pattern }))
     } else {
-        format!("{}/**/{name}", path.trim_end_matches('/'))
-    };
-
-    Some(json!({ "pattern": pattern }))
+        Some(json!({ "path": path.trim_end_matches('/'), "pattern": pattern }))
+    }
 }
 
 fn cat_read_request(command: &str) -> Option<Value> {
@@ -462,4 +461,43 @@ fn ls_request(command: &str) -> Option<Value> {
     }
 
     Some(json!({ "file": target }))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::find_request;
+
+    #[test]
+    fn find_absolute_path_uses_glob_path_arg() {
+        assert_eq!(
+            find_request(r#"find /tmp/foo -name "*.ts" -type f"#),
+            Some(json!({ "path": "/tmp/foo", "pattern": "**/*.ts" }))
+        );
+    }
+
+    #[test]
+    fn find_dot_keeps_project_root_relative_pattern() {
+        assert_eq!(
+            find_request(r#"find . -name "*.ts" -type f"#),
+            Some(json!({ "pattern": "**/*.ts" }))
+        );
+    }
+
+    #[test]
+    fn find_relative_path_uses_glob_path_arg() {
+        assert_eq!(
+            find_request(r#"find ./src -name "*.go""#),
+            Some(json!({ "path": "./src", "pattern": "**/*.go" }))
+        );
+    }
+
+    #[test]
+    fn find_trims_trailing_slash_from_path_arg() {
+        assert_eq!(
+            find_request(r#"find /tmp/foo/ -name "*.ts""#),
+            Some(json!({ "path": "/tmp/foo", "pattern": "**/*.ts" }))
+        );
+    }
 }

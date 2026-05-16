@@ -1836,6 +1836,27 @@ mod tests {
     #[cfg(windows)]
     const LONG_RUNNING_COMMAND: &str = "cmd /c timeout /t 5 /nobreak > nul";
 
+    /// Spawn a child process that exits immediately and return it after
+    /// it has terminated. Used by reap_child tests to simulate the
+    /// "child exists and is dead" state when the watchdog has already
+    /// nulled out the original child handle.
+    fn spawn_dead_child() -> std::process::Child {
+        #[cfg(unix)]
+        let mut cmd = std::process::Command::new("true");
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/c", "exit", "0"]);
+            c
+        };
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        let mut child = cmd.spawn().expect("spawn replacement child for reap test");
+        let _ = child.wait();
+        child
+    }
+
     #[test]
     fn cleanup_finished_removes_terminal_tasks_older_than_threshold() {
         let registry = BgTaskRegistry::default();
@@ -1946,20 +1967,44 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
 
+        // Stop the watchdog so it doesn't race with our manual reap_child.
+        // On fast Windows runners the watchdog ticks (every 500ms) can
+        // observe the child exit and reap it before this test's assertion
+        // fires, leaving us with state.child = None and an already-terminal
+        // status. We specifically want to test reap_child's logic when
+        // invoked manually on a Running-but-actually-dead task, so we need
+        // exclusive control over the reap path here.
+        registry
+            .inner
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Give the watchdog at most one tick (500ms) to notice shutdown
+        // before we touch task state. Without this, an in-flight watchdog
+        // iteration could still race with our state setup below.
+        std::thread::sleep(Duration::from_millis(550));
+
         // Wrapper likely wrote the marker by now; remove it to simulate
         // a wrapper crash that exited before persisting the exit code.
         let _ = std::fs::remove_file(&task.paths.exit);
 
-        // The watchdog thread may have already noticed the exit and marked
-        // the task terminal before this point — observed on fast Windows
-        // runners. We want to test `reap_child` directly on a task whose
-        // metadata is `Running` but whose child has exited without an exit
-        // marker, so explicitly reset the status here. This is the exact
-        // state shape we're testing the recovery logic for.
+        // The watchdog may have already reaped the child handle and
+        // marked the task terminal before we got here. Reset both so
+        // reap_child has the "Running task whose child just exited"
+        // shape it's designed to handle. We don't restore state.child
+        // (the underlying OS process is gone), but reap_child's
+        // try_wait path won't be exercised; we're testing the
+        // status-transition logic when state.child is set to a dead
+        // child OR None and the marker is missing.
         {
             let mut state = task.state.lock().unwrap();
             state.metadata.status = BgTaskStatus::Running;
             state.metadata.status_reason = None;
+            // If the watchdog already nulled state.child, we need to
+            // simulate "child exists and is dead" so reap_child's
+            // try_wait path runs. Spawn a quick-exit child as a stand-in.
+            if state.child.is_none() {
+                state.child = Some(spawn_dead_child());
+            }
         }
         // Clear the terminal_at marker too so mark_terminal_now() can fire
         // again inside reap_child.
@@ -2053,6 +2098,37 @@ mod tests {
                 "child should exit and write marker quickly"
             );
             std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Stop the watchdog so it doesn't race with our manual reap_child.
+        // On fast Windows runners the watchdog can call poll_task (which
+        // finalizes via marker) before this test asserts the
+        // "marker exists, status still Running" invariant. We want
+        // exclusive control over the reap path.
+        registry
+            .inner
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(550));
+
+        // If the watchdog already finalized the task before we stopped it,
+        // restore the test setup: reset status to Running and ensure the
+        // marker file is still on disk. We're testing reap_child's
+        // behavior when called manually with both child-exited AND
+        // marker-present, regardless of whether the watchdog beat us.
+        {
+            let mut state = task.state.lock().unwrap();
+            state.metadata.status = BgTaskStatus::Running;
+            state.metadata.status_reason = None;
+            if state.child.is_none() {
+                state.child = Some(spawn_dead_child());
+            }
+        }
+        *task.terminal_at.lock().unwrap() = None;
+        // Make sure the marker is still on disk (poll_task removes it on
+        // finalization). Recreate it if needed.
+        if !task.paths.exit.exists() {
+            std::fs::write(&task.paths.exit, "0").expect("write replacement exit marker");
         }
 
         // reap_child sees: child exited, marker exists. It should:

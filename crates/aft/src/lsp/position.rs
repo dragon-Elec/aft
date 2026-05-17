@@ -243,6 +243,9 @@ mod tests {
         );
     }
 
+    // Unix-absolute path syntax; not a valid Windows absolute path so the
+    // round-trip can only be verified on Unix-like targets.
+    #[cfg(unix)]
     #[test]
     fn unix_path_to_uri_round_trips() {
         let path = Path::new("/tmp/aft-lsp-position.rs");

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -408,8 +408,23 @@ impl BgTaskRegistry {
             if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(mut metadata) = read_task(&path) else {
-                continue;
+            let mut metadata = match read_task(&path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    crate::slog_warn!(
+                        "quarantining invalid background task metadata {} during replay: {error}",
+                        path.display()
+                    );
+                    if let Err(quarantine_error) =
+                        quarantine_task_json(storage_dir, &dir, &path, QuarantineKind::Invalid)
+                    {
+                        crate::slog_warn!(
+                            "failed to quarantine invalid background task metadata {}: {quarantine_error}",
+                            path.display()
+                        );
+                    }
+                    continue;
+                }
             };
             if metadata.session_id != session_id {
                 continue;
@@ -431,6 +446,7 @@ impl BgTaskRegistry {
                     );
                     let _ = write_task(&paths.json, &metadata);
                     self.enqueue_completion_if_needed(&metadata, Some(&paths), false);
+                    self.insert_rehydrated_task(metadata, paths, true)?;
                 }
                 BgTaskStatus::Running | BgTaskStatus::Killing => {
                     if self.running_metadata_is_stale(&metadata) {
@@ -444,6 +460,7 @@ impl BgTaskRegistry {
                         }
                         let _ = write_task(&paths.json, &metadata);
                         self.enqueue_completion_if_needed(&metadata, Some(&paths), false);
+                        self.insert_rehydrated_task(metadata, paths, true)?;
                     } else if let Ok(Some(marker)) = read_exit_marker(&paths.exit) {
                         let reason = (metadata.status == BgTaskStatus::Killing).then(|| {
                             "recovered from inconsistent killing state on replay".to_string()
@@ -455,6 +472,7 @@ impl BgTaskRegistry {
                         metadata = terminal_metadata_from_marker(metadata, marker, reason);
                         let _ = write_task(&paths.json, &metadata);
                         self.enqueue_completion_if_needed(&metadata, Some(&paths), false);
+                        self.insert_rehydrated_task(metadata, paths, true)?;
                     } else if metadata.status == BgTaskStatus::Killing {
                         if !paths.exit.exists() {
                             let _ = write_kill_marker_if_absent(&paths.exit);
@@ -466,6 +484,7 @@ impl BgTaskRegistry {
                         );
                         let _ = write_task(&paths.json, &metadata);
                         self.enqueue_completion_if_needed(&metadata, Some(&paths), false);
+                        self.insert_rehydrated_task(metadata, paths, true)?;
                     } else if metadata.child_pid.is_some_and(|pid| !is_process_alive(pid)) {
                         metadata.mark_terminal(
                             BgTaskStatus::Failed,
@@ -474,6 +493,7 @@ impl BgTaskRegistry {
                         );
                         let _ = write_task(&paths.json, &metadata);
                         self.enqueue_completion_if_needed(&metadata, Some(&paths), false);
+                        self.insert_rehydrated_task(metadata, paths, true)?;
                     } else {
                         self.insert_rehydrated_task(metadata, paths, true)?;
                     }
@@ -542,8 +562,23 @@ impl BgTaskRegistry {
             if !path.exists() {
                 continue;
             }
-            let Ok(metadata) = read_task(&path) else {
-                continue;
+            let metadata = match read_task(&path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    crate::slog_warn!(
+                        "quarantining invalid background task metadata {} during relaxed lookup: {error}",
+                        path.display()
+                    );
+                    if let Err(quarantine_error) =
+                        quarantine_task_json(storage_dir, &dir, &path, QuarantineKind::Invalid)
+                    {
+                        crate::slog_warn!(
+                            "failed to quarantine invalid background task metadata {}: {quarantine_error}",
+                            path.display()
+                        );
+                    }
+                    continue;
+                }
             };
             let metadata_project = metadata.project_root.as_deref().map(canonicalized_path);
             if metadata_project.as_deref() != Some(canonical_project.as_path()) {
@@ -587,6 +622,18 @@ impl BgTaskRegistry {
         let mut snapshot = task.snapshot(preview_bytes);
         self.maybe_compress_snapshot(&task, &mut snapshot);
         Some(snapshot)
+    }
+
+    pub fn kill_relaxed(
+        &self,
+        task_id: &str,
+        project_root: &Path,
+        storage_dir: &Path,
+    ) -> Result<BgTaskSnapshot, String> {
+        let task = self
+            .status_relaxed_task(task_id, project_root, storage_dir)
+            .ok_or_else(|| format!("background task not found: {task_id}"))?;
+        self.kill_with_status(task_id, &task.session_id, BgTaskStatus::Killed)
     }
 
     pub fn maybe_gc_persisted(&self, storage_dir: &Path) -> Result<usize, String> {
@@ -637,7 +684,12 @@ impl BgTaskRegistry {
                                 "quarantining corrupt background task metadata {}: {error}",
                                 json_path.display()
                             );
-                            quarantine_corrupt_task_json(storage_dir, &session_dir, &json_path)?;
+                            quarantine_task_json(
+                                storage_dir,
+                                &session_dir,
+                                &json_path,
+                                QuarantineKind::Corrupt,
+                            )?;
                             continue;
                         }
                     };
@@ -793,35 +845,59 @@ impl BgTaskRegistry {
     }
 
     pub fn drain_completions_for_session(&self, session_id: Option<&str>) -> Vec<BgCompletion> {
-        let mut completions = match self.inner.completions.lock() {
+        let completions = match self.inner.completions.lock() {
             Ok(completions) => completions,
             Err(_) => return Vec::new(),
         };
 
-        let drained = if let Some(session_id) = session_id {
-            let mut matched = Vec::new();
-            let mut retained = VecDeque::new();
-            while let Some(completion) = completions.pop_front() {
-                if completion.session_id == session_id {
-                    matched.push(completion);
-                } else {
-                    retained.push_back(completion);
-                }
-            }
-            *completions = retained;
-            matched
-        } else {
-            completions.drain(..).collect()
+        completions
+            .iter()
+            .filter(|completion| {
+                session_id
+                    .map(|session_id| completion.session_id == session_id)
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn ack_completions_for_session(
+        &self,
+        session_id: Option<&str>,
+        task_ids: &[String],
+    ) -> Vec<String> {
+        if task_ids.is_empty() {
+            return Vec::new();
+        }
+        let task_ids = task_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+        let mut completions = match self.inner.completions.lock() {
+            Ok(completions) => completions,
+            Err(_) => return Vec::new(),
         };
+        let mut acked = Vec::new();
+        completions.retain(|completion| {
+            let session_matches = session_id
+                .map(|session_id| completion.session_id == session_id)
+                .unwrap_or(true);
+            if session_matches && task_ids.contains(completion.task_id.as_str()) {
+                acked.push((completion.task_id.clone(), completion.session_id.clone()));
+                false
+            } else {
+                true
+            }
+        });
         drop(completions);
 
-        for completion in &drained {
-            if let Some(task) = self.task_for_session(&completion.task_id, &completion.session_id) {
-                let _ = task.set_completion_delivered(true);
+        let mut delivered = Vec::new();
+        for (task_id, completion_session_id) in acked {
+            if let Some(task) = self.task_for_session(&task_id, &completion_session_id) {
+                if task.set_completion_delivered(true).is_ok() {
+                    delivered.push(task_id);
+                }
             }
         }
 
-        drained
+        delivered
     }
 
     pub fn pending_completions_for_session(&self, session_id: &str) -> Vec<BgCompletion> {
@@ -958,12 +1034,13 @@ impl BgTaskRegistry {
         let task_id = metadata.task_id.clone();
         let session_id = metadata.session_id.clone();
         let started = started_instant_from_unix_millis(metadata.started_at);
+        let suppress_replayed_running_reminder = metadata.status == BgTaskStatus::Running;
         let task = Arc::new(BgTask {
             task_id: task_id.clone(),
             session_id,
             paths: paths.clone(),
             started,
-            last_reminder_at: Mutex::new(None),
+            last_reminder_at: Mutex::new(suppress_replayed_running_reminder.then(Instant::now)),
             terminal_at: Mutex::new(metadata.status.is_terminal().then(Instant::now)),
             state: Mutex::new(BgTaskState {
                 metadata,
@@ -1389,10 +1466,16 @@ fn gc_quarantine(storage_dir: &Path) {
     let _ = fs::remove_dir(&quarantine_root);
 }
 
-fn quarantine_corrupt_task_json(
+enum QuarantineKind {
+    Corrupt,
+    Invalid,
+}
+
+fn quarantine_task_json(
     storage_dir: &Path,
     session_dir: &Path,
     json_path: &Path,
+    kind: QuarantineKind,
 ) -> Result<(), String> {
     let session_hash = session_dir
         .file_name()
@@ -1418,10 +1501,11 @@ fn quarantine_corrupt_task_json(
             quarantine_dir.display()
         )
     })?;
-    let target = quarantine_dir.join(format!("{task_name}.corrupt-{unix_ts}"));
+    let target_name = quarantine_name(task_name, unix_ts, &kind);
+    let target = quarantine_dir.join(target_name);
     fs::rename(json_path, &target).map_err(|e| {
         format!(
-            "failed to quarantine corrupt background task metadata {} to {}: {e}",
+            "failed to quarantine background task metadata {} to {}: {e}",
             json_path.display(),
             target.display()
         )
@@ -1438,7 +1522,7 @@ fn quarantine_corrupt_task_json(
             );
             continue;
         };
-        let sibling_target = quarantine_dir.join(format!("{sibling_name}.corrupt-{unix_ts}"));
+        let sibling_target = quarantine_dir.join(quarantine_name(sibling_name, unix_ts, &kind));
         if let Err(error) = fs::rename(&sibling, &sibling_target) {
             crate::slog_warn!(
                 "failed to quarantine background task sibling {} to {}: {error}",
@@ -1450,6 +1534,21 @@ fn quarantine_corrupt_task_json(
 
     let _ = fs::remove_dir(session_dir);
     Ok(())
+}
+
+fn quarantine_name(file_name: &str, unix_ts: u64, kind: &QuarantineKind) -> String {
+    match kind {
+        QuarantineKind::Corrupt => format!("{file_name}.corrupt-{unix_ts}"),
+        QuarantineKind::Invalid => {
+            let path = Path::new(file_name);
+            let stem = path.file_stem().and_then(|stem| stem.to_str());
+            let extension = path.extension().and_then(|extension| extension.to_str());
+            match (stem, extension) {
+                (Some(stem), Some(extension)) => format!("{stem}.invalid.{unix_ts}.{extension}"),
+                _ => format!("{file_name}.invalid.{unix_ts}"),
+            }
+        }
+    }
 }
 
 fn task_sibling_paths(json_path: &Path) -> Vec<PathBuf> {
@@ -1936,6 +2035,10 @@ mod tests {
             .unwrap();
         let completions = registry.drain_completions_for_session(Some("session"));
         assert_eq!(completions.len(), 1);
+        assert_eq!(
+            registry.ack_completions_for_session(Some("session"), std::slice::from_ref(&task_id)),
+            vec![task_id.clone()]
+        );
 
         registry.cleanup_finished(Duration::ZERO);
 

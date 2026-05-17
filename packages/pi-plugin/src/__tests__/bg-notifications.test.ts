@@ -79,7 +79,7 @@ describe("Pi background notifications", () => {
     expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
   });
 
-  test("no-overhead path skips bridge drain when no tasks are outstanding", async () => {
+  test("first no-task path force-drains once for replayed completions", async () => {
     const send = mock(async () => ({ success: true, bg_completions: [] }));
     const { ctx } = harness(send);
 
@@ -88,8 +88,32 @@ describe("Pi background notifications", () => {
       [{ type: "text", text: "tool output" }],
     );
 
-    expect(send).toHaveBeenCalledTimes(0);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0]).toBe("bash_drain_completions");
     expect(content).toBeUndefined();
+  });
+
+  test("forced drain delivers replayed completion even when task is not tracked", async () => {
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-1", "echo replayed")] }
+        : { success: true, acked_task_ids: ["task-1"] },
+    );
+    const { ctx } = harness(send);
+
+    const content = await appendToolResultBgCompletions(
+      { ctx, directory: "/tmp/project", sessionID: "s1" },
+      [{ type: "text", text: "tool output" }],
+    );
+
+    expect(content?.[1]).toEqual({
+      type: "text",
+      text: "<system-reminder>\n[BACKGROUND BASH COMPLETED]\n- task task-1 (exit 0)\n</system-reminder>",
+    });
+    expect(send.mock.calls.map((call) => call[0])).toEqual([
+      "bash_drain_completions",
+      "bash_ack_completions",
+    ]);
   });
 
   test("turn-end wake sends one runtime user message with reminder", async () => {
@@ -121,7 +145,12 @@ describe("Pi background notifications", () => {
 
   test("push completion lands in pending and wakes when idle", async () => {
     trackBgTask("s1", "task-1");
-    const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
+    const send = mock(async () => ({
+      success: true,
+      bg_completions: [],
+      acked_task_ids: ["task-1"],
+    }));
+    const { ctx } = harness(send);
     const sendUserMessage = mock(() => {});
 
     await handlePushedBgCompletion(
@@ -139,6 +168,7 @@ describe("Pi background notifications", () => {
     expect(sendUserMessage.mock.calls[0][0]).toContain("- task task-1 (exit 0)");
     expect(sendUserMessage.mock.calls[0][0]).not.toContain(": npm test");
     expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
+    expect(send.mock.calls.some((call) => call[0] === "bash_ack_completions")).toBe(true);
   });
 
   test("buffers push completion received before task tracking", async () => {
@@ -185,6 +215,24 @@ describe("Pi background notifications", () => {
     expect(sessionBgStates.get("s1")?.debounceTimer).not.toBeNull();
   });
 
+  test("failed wake hard-stops after capped retries", async () => {
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
+    const sendUserMessage = mock(() => {
+      throw new Error("send failed");
+    });
+
+    await handlePushedBgCompletion(
+      { ctx, directory: "/tmp/project", sessionID: "s1", runtime: { sendUserMessage } },
+      completion("task-1", "npm test"),
+    );
+    await sleep(3_800);
+
+    expect(sendUserMessage).toHaveBeenCalledTimes(5);
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(1);
+    expect(sessionBgStates.get("s1")?.debounceTimer).toBeNull();
+  });
+
   test("drain uses Rust's default session when Pi session id is unknown", async () => {
     trackBgTask(undefined, "task-1");
     const send = mock(async () => ({
@@ -197,8 +245,11 @@ describe("Pi background notifications", () => {
       { type: "text", text: "normal" },
     ]);
 
-    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[0][0]).toBe("bash_drain_completions");
     expect(send.mock.calls[0][1]).toEqual({});
+    expect(send.mock.calls[1][0]).toBe("bash_ack_completions");
+    expect(send.mock.calls[1][1]).toEqual({ task_ids: ["task-1"] });
     expect(sessionBgStates.get("__default__")?.outstandingTaskIds.has("task-1")).toBe(false);
   });
 

@@ -9,7 +9,7 @@ use crate::backup::hash_session;
 
 use super::BgTaskStatus;
 
-const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct TaskPaths {
@@ -142,7 +142,17 @@ pub fn task_paths(storage_dir: &Path, session_id: &str, task_id: &str) -> TaskPa
 
 pub fn read_task(path: &Path) -> io::Result<PersistedTask> {
     let content = fs::read_to_string(path)?;
-    serde_json::from_str(&content).map_err(io::Error::other)
+    let task: PersistedTask = serde_json::from_str(&content).map_err(io::Error::other)?;
+    if task.schema_version != SCHEMA_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported background task schema_version {} (expected {SCHEMA_VERSION})",
+                task.schema_version
+            ),
+        ));
+    }
+    Ok(task)
 }
 
 pub fn write_task(path: &Path, task: &PersistedTask) -> io::Result<()> {

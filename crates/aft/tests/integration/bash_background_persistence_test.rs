@@ -95,6 +95,18 @@ fn drain(aft: &mut AftProcess, session: &str) -> Value {
     )
 }
 
+fn ack(aft: &mut AftProcess, session: &str, task_id: &str) -> Value {
+    aft.send(
+        &json!({
+            "id": "ack-persist-bg",
+            "session_id": session,
+            "command": "bash_ack_completions",
+            "params": { "task_ids": [task_id] }
+        })
+        .to_string(),
+    )
+}
+
 fn wait_for_status(aft: &mut AftProcess, session: &str, task_id: &str, expected: &str) -> Value {
     let started = Instant::now();
     loop {
@@ -337,35 +349,27 @@ fn bash_status_cross_session_different_project_returns_not_found() {
 }
 
 #[test]
-fn bash_status_legacy_persisted_task_without_project_root_does_not_leak_across_sessions() {
+fn bash_status_legacy_persisted_task_is_quarantined_on_replay() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let task_id = "bash-legacy1";
-    write_legacy_task_json(storage.path(), "session-a", task_id, project.path());
-
-    let cross = registry();
-    assert!(cross
-        .status(
-            task_id,
-            "session-b",
-            Some(project.path()),
-            Some(storage.path()),
-            1024,
-        )
-        .is_none());
+    let legacy_path = write_legacy_task_json(storage.path(), "session-a", task_id, project.path());
 
     let same = registry();
-    let snapshot = same
-        .status(
-            task_id,
-            "session-a",
-            Some(project.path()),
-            Some(storage.path()),
-            1024,
-        )
-        .expect("same-session legacy replay should still work");
-    assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
-    assert!(snapshot.output_preview.contains("legacy"));
+    same.replay_session(storage.path(), "session-a").unwrap();
+
+    assert!(!legacy_path.exists());
+    let quarantine_session = storage
+        .path()
+        .join("bash-tasks-quarantine")
+        .join(aft::backup::hash_session("session-a"));
+    let quarantined = fs::read_dir(quarantine_session)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(quarantined
+        .iter()
+        .any(|name| name.starts_with("bash-legacy1.invalid.") && name.ends_with(".json")));
 }
 
 #[test]
@@ -391,6 +395,29 @@ fn bash_kill_cross_session_still_returns_not_found() {
     let error = registry.kill(&task_id, "session-b").unwrap_err();
     assert!(error.contains("not found"));
     let _ = registry.kill(&task_id, "session-a");
+}
+
+#[test]
+fn bash_kill_command_cross_session_same_project_finds_task_by_id() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let mut aft = AftProcess::spawn();
+    configure_background(&mut aft, project.path(), storage.path(), "session-a");
+    let task_id = spawn_bg(&mut aft, "session-a", "sleep 5", None);
+
+    let killed = aft.send(
+        &json!({
+            "id": "kill-cross-session",
+            "session_id": "session-b",
+            "command": "bash_kill",
+            "params": { "task_id": task_id }
+        })
+        .to_string(),
+    );
+
+    assert_eq!(killed["success"], true, "kill failed: {killed:?}");
+    assert_eq!(killed["status"], "killed");
+    assert!(aft.shutdown().success());
 }
 
 #[test]
@@ -651,6 +678,12 @@ fn cleanup_finished_deletes_disk_bundle_of_delivered_terminal() {
         registry.drain_completions_for_session(Some(SESSION)).len(),
         1
     );
+    assert_eq!(
+        registry
+            .ack_completions_for_session(Some(SESSION), std::slice::from_ref(&task_id))
+            .len(),
+        1
+    );
 
     registry.cleanup_finished(Duration::ZERO);
 
@@ -699,6 +732,12 @@ fn cleanup_finished_does_not_block_other_registry_operations_during_delete() {
     registry.kill(&removable, SESSION).unwrap();
     assert_eq!(
         registry.drain_completions_for_session(Some(SESSION)).len(),
+        1
+    );
+    assert_eq!(
+        registry
+            .ack_completions_for_session(Some(SESSION), std::slice::from_ref(&removable))
+            .len(),
         1
     );
     fs::write(
@@ -885,6 +924,8 @@ fn configure_replays_background_tasks_from_default_storage_dir() {
         .as_str()
         .unwrap()
         .contains("default-replay"));
+    let acked = ack(&mut aft, SESSION, &task_id);
+    assert_eq!(acked["success"], true, "ack failed: {acked:?}");
     assert!(aft.shutdown().success());
 }
 
@@ -944,6 +985,14 @@ fn pre_spawn_metadata_starting_replays_as_failed() {
     let completions = registry.drain_completions_for_session(Some(SESSION));
     assert_eq!(completions.len(), 1);
     assert_eq!(completions[0].status, BgTaskStatus::Failed);
+    assert_eq!(
+        registry.ack_completions_for_session(Some(SESSION), &[task_id.to_string()]),
+        vec![task_id.to_string()]
+    );
+    assert_eq!(
+        read_json(storage.path(), SESSION, task_id)["completion_delivered"],
+        true
+    );
 }
 
 #[test]
@@ -1002,6 +1051,12 @@ fn completion_durability_replays_undelivered_terminal_task() {
         .any(|completion| completion["task_id"] == task_id));
     assert_eq!(
         read_json(storage.path(), SESSION, &task_id)["completion_delivered"],
+        false
+    );
+    let acked = ack(&mut aft, SESSION, &task_id);
+    assert_eq!(acked["success"], true, "ack failed: {acked:?}");
+    assert_eq!(
+        read_json(storage.path(), SESSION, &task_id)["completion_delivered"],
         true
     );
     assert!(aft.shutdown().success());
@@ -1053,6 +1108,8 @@ fn persistence_restore_does_not_push_completion_frame() {
         .unwrap()
         .iter()
         .any(|completion| completion["task_id"] == task_id));
+    let acked = ack(&mut aft, SESSION, &task_id);
+    assert_eq!(acked["success"], true, "ack failed: {acked:?}");
     assert!(aft.shutdown().success());
 }
 

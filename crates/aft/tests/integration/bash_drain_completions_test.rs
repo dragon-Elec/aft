@@ -29,6 +29,17 @@ fn drain(aft: &mut AftProcess) -> Value {
     )
 }
 
+fn ack(aft: &mut AftProcess, task_id: &str) -> Value {
+    aft.send(
+        &json!({
+            "id": "ack-bg",
+            "command": "bash_ack_completions",
+            "params": { "task_ids": [task_id] }
+        })
+        .to_string(),
+    )
+}
+
 #[test]
 fn drain_completions_returns_empty_success_when_none_pending() {
     let mut aft = AftProcess::spawn();
@@ -42,7 +53,7 @@ fn drain_completions_returns_empty_success_when_none_pending() {
 }
 
 #[test]
-fn drain_completions_returns_and_consumes_background_completions() {
+fn drain_completions_peeks_until_ack_consumes_background_completions() {
     let mut aft = AftProcess::spawn();
     let _dir = configure_background(&mut aft);
 
@@ -79,6 +90,18 @@ fn drain_completions_returns_and_consumes_background_completions() {
 
     let second = drain(&mut aft);
     assert_eq!(second["success"], true);
-    assert_eq!(second["bg_completions"].as_array().unwrap().len(), 0);
+    assert_eq!(second["bg_completions"].as_array().unwrap().len(), 1);
+
+    let acked = ack(&mut aft, &task_id);
+    assert_eq!(acked["success"], true);
+    assert!(acked["acked_task_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|acked| acked.as_str() == Some(task_id.as_str())));
+
+    let third = drain(&mut aft);
+    assert_eq!(third["success"], true);
+    assert_eq!(third["bg_completions"].as_array().unwrap().len(), 0);
     assert!(aft.shutdown().success());
 }

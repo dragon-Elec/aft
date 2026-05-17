@@ -31,6 +31,9 @@ type SessionBgState = {
   scheduledFireAt: number | null;
   scheduledCompletionCount: number;
   retryDelayMs: number | null;
+  wakeRetryAttempts: number;
+  wakeHardStopped: boolean;
+  forcedDrainCompleted: boolean;
   unknownCompletions: Array<{ completion: BgCompletion; receivedAt: number }>;
   lastSeenAt: number;
 };
@@ -48,6 +51,7 @@ export const sessionBgStates: Map<string, SessionBgState> = new Map();
 export const SESSION_BG_STATE_IDLE_TTL_MS = 60 * 60 * 1000;
 const DEBOUNCE_STEP_MS = 200;
 const DEBOUNCE_CAP_MS = 1000;
+const MAX_WAKE_SEND_ATTEMPTS = 5;
 const UNKNOWN_COMPLETION_TTL_MS = 5000;
 const UNKNOWN_COMPLETION_CAP = 32;
 const DEFAULT_SESSION_ID = "__default__";
@@ -128,17 +132,27 @@ export async function appendToolResultBgCompletions(
     state.pendingCompletions.length === 0 &&
     state.pendingLongRunning.length === 0
   )
+    await drainCompletions(drainContext);
+  if (
+    state.outstandingTaskIds.size === 0 &&
+    state.pendingCompletions.length === 0 &&
+    state.pendingLongRunning.length === 0
+  )
     return undefined;
 
-  if (state.outstandingTaskIds.size > 0) {
+  if (state.outstandingTaskIds.size > 0 || !state.forcedDrainCompleted) {
     await drainCompletions(drainContext);
   }
   if (state.pendingCompletions.length === 0 && state.pendingLongRunning.length === 0)
     return undefined;
 
+  const deliveredCompletions = [...state.pendingCompletions];
   const reminder = formatCombinedSystemReminder(state.pendingCompletions, state.pendingLongRunning);
   state.pendingCompletions = [];
   state.pendingLongRunning = [];
+  state.wakeRetryAttempts = 0;
+  state.wakeHardStopped = false;
+  await ackCompletions(drainContext, deliveredCompletions);
   // Cancel any pending debounced wake — its captured pendingCompletions /
   // pendingLongRunning are now drained, and firing the timer anyway would
   // build an empty-body "[BACKGROUND BASH STILL RUNNING]" reminder.
@@ -171,14 +185,14 @@ async function triggerWakeIfPending(
   // creates a hang. Mirrors the OpenCode fix.
   const state = stateFor(drainContext.sessionID);
 
-  if (!skipDrain && state.outstandingTaskIds.size > 0) {
+  if (!skipDrain && (state.outstandingTaskIds.size > 0 || !state.forcedDrainCompleted)) {
     await drainCompletions(drainContext);
   }
   if (state.pendingCompletions.length === 0 && state.pendingLongRunning.length === 0) return;
 
   scheduleWake(
     state,
-    async (reminder) => {
+    async (reminder, deliveredCompletions) => {
       // Pi rejects sendUserMessage with "Agent is already processing" when
       // the agent is mid-turn unless we pass `deliverAs`. Use `steer`:
       // Pi delivers steering messages after the current tool batch finishes
@@ -199,11 +213,14 @@ async function triggerWakeIfPending(
       // turn uses Pi's currently-selected model, so there is no per-message
       // override for us to thread through.
       drainContext.runtime.sendUserMessage(reminder, { deliverAs: "steer" });
+      await ackCompletions(drainContext, deliveredCompletions);
     },
-    (err) => {
+    (err, hardStopped) => {
       sessionWarn(
         drainContext.sessionID ?? "",
-        `${LOG_PREFIX} wake send failed: ${err instanceof Error ? err.message : String(err)}`,
+        hardStopped
+          ? `${LOG_PREFIX} wake send failed ${MAX_WAKE_SEND_ATTEMPTS} times; stopping retries: ${err instanceof Error ? err.message : String(err)}`
+          : `${LOG_PREFIX} wake send failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     },
   );
@@ -247,6 +264,7 @@ export function __resetBgNotificationStateForTests(): void {
 }
 
 async function drainCompletions({ ctx, directory, sessionID }: DrainContext): Promise<void> {
+  const state = stateFor(sessionID);
   try {
     const bridge = ctx.pool.getActiveBridgeForRoot(directory) ?? ctx.pool.getBridge(directory);
     const params = sessionID ? { session_id: sessionID } : {};
@@ -258,7 +276,8 @@ async function drainCompletions({ ctx, directory, sessionID }: DrainContext): Pr
       );
       return;
     }
-    ingestBgCompletions(sessionID, response.bg_completions);
+    state.forcedDrainCompleted = true;
+    ingestDrainedBgCompletions(sessionID, response.bg_completions);
   } catch (err) {
     sessionWarn(
       sessionID ?? "",
@@ -267,11 +286,36 @@ async function drainCompletions({ ctx, directory, sessionID }: DrainContext): Pr
   }
 }
 
+async function ackCompletions(
+  { ctx, directory, sessionID }: DrainContext,
+  completions: readonly BgCompletion[],
+): Promise<void> {
+  const taskIds = [...new Set(completions.map((completion) => completion.task_id))];
+  if (taskIds.length === 0) return;
+  try {
+    const bridge = ctx.pool.getActiveBridgeForRoot(directory) ?? ctx.pool.getBridge(directory);
+    const params = sessionID ? { session_id: sessionID, task_ids: taskIds } : { task_ids: taskIds };
+    const response = await bridge.send("bash_ack_completions", params);
+    if (response.success === false) {
+      sessionWarn(
+        sessionID ?? "",
+        `${LOG_PREFIX} ack failed: ${String(response.message ?? "unknown error")}`,
+      );
+    }
+  } catch (err) {
+    sessionWarn(
+      sessionID ?? "",
+      `${LOG_PREFIX} ack failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
 function scheduleWake(
   state: SessionBgState,
-  sendWake: (reminder: string) => Promise<void>,
-  onSendFailure: (err: unknown) => void,
+  sendWake: (reminder: string, completions: readonly BgCompletion[]) => Promise<void>,
+  onSendFailure: (err: unknown, hardStopped: boolean) => void,
 ): void {
+  if (state.wakeHardStopped) return;
   // Race model: JS state changes are synchronous; awaits only happen before scheduling
   // drains and during final user-message delivery. Multiple hook invocations can
   // interleave only at those awaits, so we gate timer extension on completion count.
@@ -309,15 +353,24 @@ function scheduleWake(
     const reminder = formatCombinedSystemReminder(pending, pendingLongRunning);
     state.pendingCompletions = [];
     state.pendingLongRunning = [];
-    void sendWake(reminder)
+    void sendWake(reminder, pending)
       .then(() => {
         state.retryDelayMs = null;
+        state.wakeRetryAttempts = 0;
+        state.wakeHardStopped = false;
       })
       .catch((err) => {
         state.pendingCompletions = [...pending, ...state.pendingCompletions];
         state.pendingLongRunning = [...pendingLongRunning, ...state.pendingLongRunning];
+        state.wakeRetryAttempts += 1;
+        if (state.wakeRetryAttempts >= MAX_WAKE_SEND_ATTEMPTS) {
+          state.retryDelayMs = null;
+          state.wakeHardStopped = true;
+          onSendFailure(err, true);
+          return;
+        }
         state.retryDelayMs = Math.min((delay || DEBOUNCE_STEP_MS) * 2, DEBOUNCE_CAP_MS);
-        onSendFailure(err);
+        onSendFailure(err, false);
         scheduleWake(state, sendWake, onSendFailure);
       });
   }, delay);
@@ -339,6 +392,9 @@ function stateFor(sessionID: string | undefined): SessionBgState {
       scheduledFireAt: null,
       scheduledCompletionCount: 0,
       retryDelayMs: null,
+      wakeRetryAttempts: 0,
+      wakeHardStopped: false,
+      forcedDrainCompleted: false,
       unknownCompletions: [],
       lastSeenAt: now,
     };
@@ -347,6 +403,27 @@ function stateFor(sessionID: string | undefined): SessionBgState {
     state.lastSeenAt = now;
   }
   return state;
+}
+
+function ingestDrainedBgCompletions(
+  sessionID: string | undefined,
+  completions: unknown,
+): BgCompletion[] {
+  if (!Array.isArray(completions) || completions.length === 0) return [];
+  const state = stateFor(sessionID);
+  const accepted: BgCompletion[] = [];
+  for (const completion of completions) {
+    if (!isBgCompletion(completion)) continue;
+    state.outstandingTaskIds.delete(completion.task_id);
+    if (
+      !state.pendingCompletions.some((pending) => pending.task_id === completion.task_id) &&
+      !accepted.some((pending) => pending.task_id === completion.task_id)
+    ) {
+      accepted.push(completion);
+    }
+  }
+  state.pendingCompletions.push(...accepted);
+  return accepted;
 }
 
 export function cleanupIdleSessionStates(now: number = Date.now()): void {

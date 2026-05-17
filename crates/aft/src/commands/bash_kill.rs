@@ -30,7 +30,32 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         return Response::error(&req.id, "invalid_request", "bash_kill: missing task_id");
     };
 
-    match ctx.bash_background().kill(&task_id, req.session()) {
+    let storage_dir = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+    let result = ctx
+        .bash_background()
+        .kill(&task_id, req.session())
+        .or_else(|message| {
+            if !message.contains("not found") {
+                return Err(message);
+            }
+            let _ = ctx
+                .bash_background()
+                .replay_session(&storage_dir, req.session());
+            ctx.bash_background().kill(&task_id, req.session())
+        })
+        .or_else(|message| {
+            if !message.contains("not found") {
+                return Err(message);
+            }
+            let config = ctx.config();
+            let Some(project_root) = config.project_root.as_deref() else {
+                return Err(message);
+            };
+            ctx.bash_background()
+                .kill_relaxed(&task_id, project_root, &storage_dir)
+        });
+
+    match result {
         Ok(snapshot) => Response::success(&req.id, json!(snapshot)),
         Err(message) if message.contains("not found") => {
             Response::error(&req.id, "task_not_found", message)

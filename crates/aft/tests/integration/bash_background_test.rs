@@ -484,7 +484,7 @@ fn background_status_allows_cross_session_same_project_lookup() {
 }
 
 #[test]
-fn background_kill_rejects_cross_session_task_as_not_found() {
+fn background_kill_cross_session_same_project_finds_task_by_id() {
     let mut aft = AftProcess::spawn();
     let _dir = configure_background(&mut aft);
 
@@ -500,7 +500,7 @@ fn background_kill_rejects_cross_session_task_as_not_found() {
     assert_eq!(spawn["success"], true, "spawn failed: {spawn:?}");
     let task_id = spawn["task_id"].as_str().unwrap().to_string();
 
-    let rejected = aft.send(
+    let killed = aft.send(
         &json!({
             "id": "kill-cross-session",
             "session_id": "session-b",
@@ -510,26 +510,14 @@ fn background_kill_rejects_cross_session_task_as_not_found() {
         .to_string(),
     );
     assert_eq!(
-        rejected["success"], false,
-        "cross-session kill succeeded: {rejected:?}"
+        killed["success"], true,
+        "cross-session kill failed: {killed:?}"
     );
-    assert_eq!(rejected["code"], "task_not_found");
+    assert_eq!(killed["status"], "killed");
 
     let owned = status_with_session(&mut aft, &task_id, "session-a");
     assert_eq!(owned["success"], true, "owner status failed: {owned:?}");
-    assert_eq!(owned["status"], "running");
-
-    let killed = aft.send(
-        &json!({
-            "id": "kill-owner-session",
-            "session_id": "session-a",
-            "command": "bash_kill",
-            "params": { "task_id": task_id }
-        })
-        .to_string(),
-    );
-    assert_eq!(killed["success"], true, "owner kill failed: {killed:?}");
-    assert_eq!(killed["status"], "killed");
+    assert_eq!(owned["status"], "killed");
 
     assert!(aft.shutdown().success());
 }

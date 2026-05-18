@@ -1256,12 +1256,26 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // on a 2M-file `$HOME` (limited by directory traversal latency, not by
     // the cap itself); still well under configure's budget.
     let max_callgraph_files = ctx.config().max_callgraph_files;
-    let walk_limit = max_callgraph_files.max(MAX_SEARCH_INDEX_FILES) + 1;
-    let source_file_count = crate::callgraph::walk_project_files(&root_path)
-        .take(walk_limit)
-        .count();
-    let exceeds = source_file_count > max_callgraph_files;
-    let exceeds_search_threshold = source_file_count > MAX_SEARCH_INDEX_FILES;
+    // Skip the synchronous source-file walk entirely when we already KNOW
+    // the answer: a `$HOME` root has hundreds of thousands of files spread
+    // across `~/Library`, `~/Documents`, `~/Downloads` etc. Even bounded by
+    // `take(20_001)`, `ignore::WalkBuilder` has to traverse directories to
+    // discover that many source files, and on macOS `$HOME` this routinely
+    // exceeds configure's 30s budget — exactly the failure mode degraded
+    // mode is meant to prevent. When `home_match` is true we already know
+    // the project is "too large" for callgraph and search, so we record the
+    // limits directly and skip the walk.
+    let (source_file_count, exceeds, exceeds_search_threshold) = if home_match {
+        (max_callgraph_files + 1, true, true)
+    } else {
+        let walk_limit = max_callgraph_files.max(MAX_SEARCH_INDEX_FILES) + 1;
+        let count = crate::callgraph::walk_project_files(&root_path)
+            .take(walk_limit)
+            .count();
+        let exceeds_cg = count > max_callgraph_files;
+        let exceeds_search = count > MAX_SEARCH_INDEX_FILES;
+        (count, exceeds_cg, exceeds_search)
+    };
     if exceeds {
         slog_warn!(
             "project has >{} source files. Call-graph operations (callers, trace_to, trace_data, impact) will be disabled. Open a specific subdirectory for call-graph features.",

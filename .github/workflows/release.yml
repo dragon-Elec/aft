@@ -501,10 +501,19 @@ jobs:
             echo "::error::Curated release notes missing: $notes_file"
             exit 1
           fi
+          # Use a random delimiter to guard against any string in the notes
+          # accidentally matching the heredoc terminator. Also ensure the file
+          # ends with a newline so `cat`'s output doesn't glue onto the EOF
+          # marker (v0.26.3 release notes had no trailing newline, which
+          # produced "Matching delimiter not found" and skipped the Discord
+          # announcement entirely).
+          eof="EOF_$(openssl rand -hex 12)"
           {
-            echo "body<<DISCORD_EOF"
+            printf 'body<<%s\n' "$eof"
             cat "$notes_file"
-            echo "DISCORD_EOF"
+            # Guarantee a newline before the closing delimiter, even if the
+            # file itself doesn't end with one.
+            printf '\n%s\n' "$eof"
           } >> "$GITHUB_OUTPUT"
 
       - name: Post to Discord

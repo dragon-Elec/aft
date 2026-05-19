@@ -29,6 +29,13 @@ export {
   getCachedBinaryPath,
 } from "./downloader.js";
 export type { Logger, LogMeta } from "./logger.js";
+export type { MigrationHarness, MigrationOptions } from "./migration.js";
+// --- storage migration ---
+export {
+  ensureStorageMigrated,
+  resolveCortexKitStorageRoot,
+  resolveLegacyStorageRoot,
+} from "./migration.js";
 // --- ONNX runtime ---
 export {
   __test__ as __onnxTest__,

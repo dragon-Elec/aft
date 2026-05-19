@@ -31,15 +31,15 @@
  */
 
 import { createRequire } from "node:module";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import {
   BridgePool,
   ensureBinary,
   ensureOnnxRuntime,
+  ensureStorageMigrated,
   findBinary,
   getManualInstallHint,
   isHomeDirectoryRoot,
+  resolveCortexKitStorageRoot,
   setActiveLogger,
 } from "@cortexkit/aft-bridge";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -262,12 +262,6 @@ async function handleConfigureWarningsForSession(context: {
   );
 }
 
-/** Resolve the AFT storage directory (auth + semantic index + ONNX cache). */
-function resolveStorageDir(): string {
-  // Pi doesn't expose its data dir via a public API; use ~/.pi/agent/aft as convention.
-  return join(homedir(), ".pi", "agent", "aft");
-}
-
 /**
  * Tool surface mirrors opencode-plugin: navigate/delete/move/transform/refactor
  * are all-only. recommended exposes hoisted + read/safety/import/ast/lsp/conflicts
@@ -385,9 +379,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     return;
   }
 
+  await ensureStorageMigrated({ harness: "pi", binaryPath, logger: bridgeLogger });
+
   // Load config (user + project).
   const config = loadAftConfig(process.cwd());
-  const storageDir = resolveStorageDir();
+  const storageDir = resolveCortexKitStorageRoot();
 
   // ONNX runtime for semantic search (optional, best-effort).
   //

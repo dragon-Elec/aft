@@ -1,15 +1,16 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import {
   BridgePool,
   cleanupUrlCache,
   ensureBinary,
   ensureOnnxRuntime,
+  ensureStorageMigrated,
   findBinary,
   getManualInstallHint,
   isOrtAutoDownloadSupported,
+  resolveCortexKitStorageRoot,
   setActiveLogger,
 } from "@cortexkit/aft-bridge";
 import type { Plugin } from "@opencode-ai/plugin";
@@ -201,6 +202,8 @@ const plugin: Plugin = async (input) => initializePluginForDirectory(input);
 async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   const binaryPath = await findBinary(PLUGIN_VERSION);
 
+  await ensureStorageMigrated({ harness: "opencode", binaryPath, logger: bridgeLogger });
+
   // Load config: ~/.config/opencode/aft.jsonc → <project>/.opencode/aft.jsonc
   const aftConfig = loadAftConfig(input.directory);
   const autoUpdateAbort = new AbortController();
@@ -238,10 +241,10 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
 
   const isFastembedSemanticBackend = (aftConfig.semantic?.backend ?? "fastembed") === "fastembed";
 
-  // Compute XDG-compliant storage dir for persistent indexes (trigram, semantic)
-  // Pattern: ~/.local/share/opencode/storage/plugin/aft/
-  const dataHome = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
-  configOverrides.storage_dir = join(dataHome, "opencode", "storage", "plugin", "aft");
+  // v0.27 stores runtime state under the shared CortexKit root. Migration from
+  // the legacy OpenCode plugin root completed synchronously before any storage
+  // consumer (ONNX, RPC server, bridge configure) can touch this path.
+  configOverrides.storage_dir = resolveCortexKitStorageRoot();
 
   // Auto-resolve ONNX Runtime for semantic search.
   //

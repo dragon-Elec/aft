@@ -60,6 +60,17 @@ pub struct BashCompletedFrame {
     /// `…` prefix and signal that `bash_status` would return more.
     #[serde(default)]
     pub output_truncated: bool,
+    /// Token count of raw stdout+stderr before compression. Omitted when the
+    /// payload exceeded the 128 KiB per-stream tokenization cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_tokens: Option<u32>,
+    /// Token count of the compressed completion payload. Omitted when raw
+    /// tokenization was skipped due to the cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compressed_tokens: Option<u32>,
+    /// True when output exceeded the tokenization cap and was not measured.
+    #[serde(default)]
+    pub tokens_skipped: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -291,6 +302,9 @@ impl BashCompletedFrame {
         command: impl Into<String>,
         output_preview: impl Into<String>,
         output_truncated: bool,
+        original_tokens: Option<u32>,
+        compressed_tokens: Option<u32>,
+        tokens_skipped: bool,
     ) -> Self {
         Self {
             frame_type: "bash_completed",
@@ -301,6 +315,9 @@ impl BashCompletedFrame {
             command: command.into(),
             output_preview: output_preview.into(),
             output_truncated,
+            original_tokens,
+            compressed_tokens,
+            tokens_skipped,
         }
     }
 }

@@ -13,6 +13,7 @@ mod bash_foreground_background_architecture_test;
 mod bash_permissions_test;
 mod bash_rewrite_test;
 mod bash_test;
+mod bash_token_count_test;
 mod callgraph_test;
 mod commands_test;
 mod compress_cli_commands_test;

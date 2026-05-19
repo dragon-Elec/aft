@@ -64,6 +64,9 @@ export interface BashCompletedFrame {
   runtime?: number;
   output_preview?: string;
   output_truncated?: boolean;
+  original_tokens?: number;
+  compressed_tokens?: number;
+  tokens_skipped?: boolean;
   session_id?: string;
 }
 
@@ -120,4 +123,8 @@ export interface BgCompletion {
   output_preview?: string;
   /** True when the captured tail is shorter than the actual output. */
   output_truncated?: boolean;
+  /** Token counts arrive in v0.27 but remain unused by plugins until commit 13. */
+  original_tokens?: number;
+  compressed_tokens?: number;
+  tokens_skipped?: boolean;
 }

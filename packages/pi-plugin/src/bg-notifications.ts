@@ -13,6 +13,11 @@ export interface BgCompletion {
   output_preview?: string;
   /** True when the captured tail is shorter than the actual output. */
   output_truncated?: boolean;
+  // Token counts arrive in v0.27 but commit 7 leaves them unused.
+  // Commit 13 will write them to storage via aft_db_record_compression.
+  original_tokens?: number;
+  compressed_tokens?: number;
+  tokens_skipped?: boolean;
 }
 
 export interface BgLongRunningReminder {

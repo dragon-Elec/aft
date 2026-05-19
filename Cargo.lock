@@ -23,6 +23,7 @@ dependencies = [
 name = "agent-file-tools"
 version = "0.26.4"
 dependencies = [
+ "aft-tokenizer",
  "ast-grep-core",
  "blake3",
  "content_inspector",

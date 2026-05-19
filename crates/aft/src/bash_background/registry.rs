@@ -18,7 +18,7 @@ use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use super::buffer::BgBuffer;
+use super::buffer::{combine_streams, BgBuffer, TokenCountInput};
 use super::persistence::{
     create_capture_file, delete_task_bundle, read_exit_marker, read_task, session_tasks_dir,
     task_paths, unix_millis, update_task, write_kill_marker_if_absent, write_task, ExitMarker,
@@ -49,6 +49,7 @@ const QUARANTINE_GC_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// under the model's context budget but long enough that most successful runs
 /// don't need a follow-up `bash_status` call.
 const BG_COMPLETION_PREVIEW_BYTES: usize = 300;
+const TOKENIZE_CAP_BYTES_PER_STREAM: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BgCompletion {
@@ -73,6 +74,17 @@ pub struct BgCompletion {
     /// more.
     #[serde(default, skip_serializing_if = "is_false")]
     pub output_truncated: bool,
+    /// Token count for raw stdout+stderr before compression. Omitted when any
+    /// stream exceeds the 128 KiB tokenization cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_tokens: Option<u32>,
+    /// Token count for the compressed output generated from the same capped
+    /// raw payload. Omitted when raw tokenization is skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compressed_tokens: Option<u32>,
+    /// True when a stream exceeded the tokenization cap and counts are absent.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tokens_skipped: bool,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -1209,6 +1221,7 @@ impl BgTaskRegistry {
         } else {
             raw_preview
         };
+        let token_counts = self.completion_token_counts(metadata, buffer, paths);
         let completion = BgCompletion {
             task_id: metadata.task_id.clone(),
             session_id: metadata.session_id.clone(),
@@ -1217,6 +1230,9 @@ impl BgTaskRegistry {
             command: metadata.command.clone(),
             output_preview,
             output_truncated,
+            original_tokens: token_counts.original_tokens,
+            compressed_tokens: token_counts.compressed_tokens,
+            tokens_skipped: token_counts.tokens_skipped,
         };
         if let Ok(mut completions) = self.inner.completions.lock() {
             if completions
@@ -1262,7 +1278,41 @@ impl BgTaskRegistry {
             completion.command,
             completion.output_preview,
             completion.output_truncated,
+            completion.original_tokens,
+            completion.compressed_tokens,
+            completion.tokens_skipped,
         )));
+    }
+
+    fn completion_token_counts(
+        &self,
+        metadata: &PersistedTask,
+        buffer: Option<&BgBuffer>,
+        paths: Option<&TaskPaths>,
+    ) -> CompletionTokenCounts {
+        let raw = match buffer {
+            Some(buffer) => buffer.read_for_token_count(TOKENIZE_CAP_BYTES_PER_STREAM),
+            None => paths
+                .map(|paths| read_for_token_count_from_disk(paths, TOKENIZE_CAP_BYTES_PER_STREAM))
+                .unwrap_or(TokenCountInput::Skipped),
+        };
+
+        let TokenCountInput::Text(raw_output) = raw else {
+            return CompletionTokenCounts::skipped();
+        };
+
+        let original_tokens = token_count_u32(&raw_output);
+        let compressed_output = if metadata.compressed {
+            self.compress_output(&metadata.command, raw_output)
+        } else {
+            raw_output
+        };
+        let compressed_tokens = token_count_u32(&compressed_output);
+        CompletionTokenCounts {
+            original_tokens: Some(original_tokens),
+            compressed_tokens: Some(compressed_tokens),
+            tokens_skipped: false,
+        }
     }
 
     pub(crate) fn maybe_emit_long_running_reminder(&self, task: &Arc<BgTask>) {
@@ -1387,6 +1437,28 @@ impl BgTaskRegistry {
         }
         Err("failed to allocate unique background task id after 32 attempts".to_string())
     }
+}
+
+struct CompletionTokenCounts {
+    original_tokens: Option<u32>,
+    compressed_tokens: Option<u32>,
+    tokens_skipped: bool,
+}
+
+impl CompletionTokenCounts {
+    fn skipped() -> Self {
+        Self {
+            original_tokens: None,
+            compressed_tokens: None,
+            tokens_skipped: true,
+        }
+    }
+}
+
+fn token_count_u32(text: &str) -> u32 {
+    aft_tokenizer::count_tokens(text)
+        .try_into()
+        .unwrap_or(u32::MAX)
 }
 
 impl Default for BgTaskRegistry {
@@ -1575,6 +1647,32 @@ fn read_tail_from_disk(paths: &TaskPaths, max_bytes: usize) -> (String, bool) {
     }
     let start = bytes.len().saturating_sub(max_bytes);
     (String::from_utf8_lossy(&bytes[start..]).into_owned(), true)
+}
+
+fn read_for_token_count_from_disk(
+    paths: &TaskPaths,
+    max_bytes_per_stream: usize,
+) -> TokenCountInput {
+    let stdout = match read_file_with_cap(&paths.stdout, max_bytes_per_stream) {
+        Ok(Some(stdout)) => stdout,
+        _ => return TokenCountInput::Skipped,
+    };
+    let stderr = match read_file_with_cap(&paths.stderr, max_bytes_per_stream) {
+        Ok(Some(stderr)) => stderr,
+        _ => return TokenCountInput::Skipped,
+    };
+    TokenCountInput::Text(combine_streams(
+        String::from_utf8_lossy(&stdout).as_ref(),
+        String::from_utf8_lossy(&stderr).as_ref(),
+    ))
+}
+
+fn read_file_with_cap(path: &Path, max_bytes: usize) -> std::io::Result<Option<Vec<u8>>> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > max_bytes as u64 {
+        return Ok(None);
+    }
+    fs::read(path).map(Some)
 }
 
 impl BgTask {

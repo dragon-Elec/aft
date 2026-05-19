@@ -66,6 +66,19 @@ impl BgBuffer {
         }
     }
 
+    pub fn read_for_token_count(&self, max_bytes_per_stream: usize) -> TokenCountInput {
+        match (
+            read_file_with_cap(&self.stdout_path, max_bytes_per_stream),
+            read_file_with_cap(&self.stderr_path, max_bytes_per_stream),
+        ) {
+            (Ok(Some(stdout)), Ok(Some(stderr))) => TokenCountInput::Text(combine_streams(
+                String::from_utf8_lossy(&stdout).as_ref(),
+                String::from_utf8_lossy(&stderr).as_ref(),
+            )),
+            _ => TokenCountInput::Skipped,
+        }
+    }
+
     pub fn read_stream_tail(&self, stream: StreamKind, max_bytes: usize) -> (String, bool) {
         let path = match stream {
             StreamKind::Stdout => &self.stdout_path,
@@ -102,6 +115,21 @@ impl BgBuffer {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenCountInput {
+    Text(String),
+    Skipped,
+}
+
+pub fn combine_streams(stdout: &str, stderr: &str) -> String {
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout.to_string(),
+        (true, false) => stderr.to_string(),
+        (false, false) => format!("{stdout}\n{stderr}"),
+    }
+}
+
 fn read_file_tail(path: &Path, max_bytes: usize) -> io::Result<(Vec<u8>, bool)> {
     if max_bytes == 0 {
         return Ok((
@@ -121,6 +149,17 @@ fn read_file_tail(path: &Path, max_bytes: usize) -> io::Result<(Vec<u8>, bool)> 
     let mut bytes = Vec::with_capacity(read_len as usize);
     file.read_to_end(&mut bytes)?;
     Ok((bytes, len > max_bytes as u64))
+}
+
+fn read_file_with_cap(path: &Path, max_bytes: usize) -> io::Result<Option<Vec<u8>>> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if len > max_bytes as u64 {
+        return Ok(None);
+    }
+    let mut bytes = Vec::with_capacity(len as usize);
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
 }
 
 fn truncate_front(path: &Path, retain_bytes: u64) -> io::Result<bool> {

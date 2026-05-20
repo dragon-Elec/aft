@@ -142,6 +142,48 @@ function updateCargoToml(filePath, version, dryRun) {
   return { path: filePath, changes };
 }
 
+/**
+ * Update an inline path-dep version pin in a Cargo.toml.
+ *
+ * Matches a line of the form:
+ *   <depName> = { path = "...", version = "<old>" [, ...] }
+ *
+ * and rewrites just the `version = "..."` segment. The path remains
+ * load-bearing for workspace builds; the version is required so cargo
+ * accepts the manifest for publication and so consumers resolving from
+ * crates.io get the matching version.
+ */
+function updateCargoPathDep(filePath, depName, version, dryRun) {
+  const content = readFileSync(filePath, "utf-8");
+  // depName can contain hyphens — escape for safe regex insertion.
+  const depEscaped = depName.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
+  // Match a line starting with `<dep> = { ... version = "<old>" ... }`.
+  // Capture the prefix up to (and including) `version = "` so we can rewrite
+  // just the version literal without touching path or other fields.
+  const re = new RegExp(`^(${depEscaped}\\s*=\\s*\\{[^\\n]*version\\s*=\\s*)"([^"]+)"`, "m");
+  const match = content.match(re);
+
+  if (!match) {
+    return {
+      path: filePath,
+      changes: [`  WARNING: could not find ${depName} path-dep with version pin`],
+    };
+  }
+
+  if (match[2] === version) {
+    return { path: filePath, changes: [`  (${depName} dep already at target version)`] };
+  }
+
+  const changes = [`  ${depName} dep version: ${match[2]} → ${version}`];
+
+  if (!dryRun) {
+    const updated = content.replace(re, `$1"${version}"`);
+    writeFileSync(filePath, updated, "utf-8");
+  }
+
+  return { path: filePath, changes };
+}
+
 // --- Main ---
 
 const { version, dryRun } = parseArgs(process.argv);
@@ -176,9 +218,18 @@ results.push(
 const cliPath = join(root, "packages", "aft-cli", "package.json");
 results.push(updateJsonFile(cliPath, version, {}, dryRun));
 
-// 10: Cargo.toml
+// 10: Cargo.toml — agent-file-tools (main crate)
 const cargoPath = join(root, "crates", "aft", "Cargo.toml");
 results.push(updateCargoToml(cargoPath, version, dryRun));
+
+// 11: Cargo.toml — aft-tokenizer (leaf crate, published first so the main
+// crate can resolve its `version =` constraint from crates.io). Also keep
+// the inline path-dep version pin (`aft-tokenizer = { path = "...",
+// version = "<version>" }`) in `crates/aft/Cargo.toml` in lockstep — cargo
+// refuses to publish a crate whose path-dep has no `version =`.
+const tokenizerPath = join(root, "crates", "aft-tokenizer", "Cargo.toml");
+results.push(updateCargoToml(tokenizerPath, version, dryRun));
+results.push(updateCargoPathDep(cargoPath, "aft-tokenizer", version, dryRun));
 
 // Report
 let updateCount = 0;

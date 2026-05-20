@@ -40,7 +40,6 @@ describe("hoisted tool adapters", () => {
       hoistWrite: false,
       hoistEdit: false,
       hoistGrep: false,
-      restrictToProjectRoot: true,
     });
 
     const ranged = (await executeTool(tools.get("read")!, {
@@ -66,7 +65,6 @@ describe("hoisted tool adapters", () => {
       hoistWrite: false,
       hoistEdit: true,
       hoistGrep: false,
-      restrictToProjectRoot: true,
     });
 
     await executeTool(tools.get("edit")!, {
@@ -97,7 +95,6 @@ describe("hoisted tool adapters", () => {
       hoistWrite: false,
       hoistEdit: false,
       hoistGrep: true,
-      restrictToProjectRoot: true,
     });
 
     await executeTool(
@@ -123,7 +120,6 @@ describe("hoisted tool adapters", () => {
       hoistWrite: true,
       hoistEdit: false,
       hoistGrep: false,
-      restrictToProjectRoot: true,
     });
 
     await executeTool(tools.get("write")!, { filePath: "src/app.ts", content: "export {};\n" });
@@ -137,7 +133,7 @@ describe("hoisted tool adapters", () => {
     });
   });
 
-  test("write to external path is blocked by ui.confirm when restrictToProjectRoot=true", async () => {
+  test("write to external path triggers ui.confirm; denial rejects, approval calls bridge", async () => {
     const root = await tempRoot();
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true, diff: { additions: 1 } }));
@@ -146,18 +142,22 @@ describe("hoisted tool adapters", () => {
       hoistWrite: true,
       hoistEdit: false,
       hoistGrep: false,
-      restrictToProjectRoot: true,
     });
 
+    // The ui.confirm prompt fires unconditionally for external paths, matching
+    // OpenCode's `external_directory` permission rule. Pi users who want to
+    // skip the prompt should rely on Pi's own `extension.permissions` allow-
+    // list, not on AFT's `restrict_to_project_root` flag.
     let confirmCallCount = 0;
     const externalPath = join(tmpdir(), `aft-external-${process.pid}-${Date.now()}.txt`);
+    let confirmResponse = false;
     const extCtx = {
       cwd: root,
       hasUI: true,
       ui: {
         confirm: (_title: string, _message: string) => {
           confirmCallCount += 1;
-          return Promise.resolve(false); // user denies
+          return Promise.resolve(confirmResponse);
         },
       },
     };
@@ -166,40 +166,15 @@ describe("hoisted tool adapters", () => {
       executeTool(tools.get("write")!, { filePath: externalPath, content: "x" }, extCtx as never),
     ).rejects.toThrow("Permission denied");
     expect(confirmCallCount).toBe(1);
-    expect(calls).toEqual([]); // bridge was never called because ui.confirm denied
-  });
+    expect(calls).toEqual([]);
 
-  test("write to external path skips ui.confirm when restrictToProjectRoot=false", async () => {
-    const root = await tempRoot();
-    const { api, tools } = makeMockApi();
-    const { bridge, calls } = makeMockBridge(() => ({ success: true, diff: { additions: 1 } }));
-    registerHoistedTools(api, makePluginContext(bridge), {
-      hoistRead: false,
-      hoistWrite: true,
-      hoistEdit: false,
-      hoistGrep: false,
-      restrictToProjectRoot: false,
-    });
-
-    let confirmCallCount = 0;
-    const externalPath = join(tmpdir(), `aft-external-${process.pid}-${Date.now()}.txt`);
-    const extCtx = {
-      cwd: root,
-      hasUI: true,
-      ui: {
-        confirm: (_title: string, _message: string) => {
-          confirmCallCount += 1;
-          return Promise.resolve(true);
-        },
-      },
-    };
-
+    confirmResponse = true;
     await executeTool(
       tools.get("write")!,
       { filePath: externalPath, content: "x" },
       extCtx as never,
     );
-    expect(confirmCallCount).toBe(0); // ui.confirm must never be called
+    expect(confirmCallCount).toBe(2);
     expect(calls).toHaveLength(1);
     expect(calls[0].command).toBe("write");
     expect(calls[0].params).toMatchObject({ file: externalPath, content: "x" });

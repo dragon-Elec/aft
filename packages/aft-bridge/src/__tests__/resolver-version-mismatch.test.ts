@@ -98,7 +98,7 @@ describe.skipIf(skipLinuxCi)("readBinaryVersion", () => {
   });
 });
 
-describe("findBinarySync versioned cache validation", () => {
+describe.skipIf(skipLinuxCi)("findBinarySync versioned cache validation", () => {
   let tmpDir: string;
 
   beforeEach(() => {

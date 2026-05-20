@@ -8,11 +8,5 @@
   // multi-path support) require this to be true.
   "search_index": true,
   "semantic_search": false,
-  "auto_update": false,
-  // Opt in to project-root restriction so AFT's hoisted write/edit/grep tools
-  // surface the external-directory `ui.confirm` prompt. The Pi default
-  // (`false`, for parity with Pi's built-in tools) skips the prompt entirely.
-  // The permission-matrix tests under tests/pi-rpc/ assert the prompt fires,
-  // so they require this opt-in to exercise the asks they validate.
-  "restrict_to_project_root": true
+  "auto_update": false
 }

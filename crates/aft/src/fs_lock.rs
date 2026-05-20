@@ -673,14 +673,29 @@ mod tests {
             .expect("read initial metadata")
             .heartbeat_at_ms;
 
-        thread::sleep(Duration::from_millis(
-            test_config().heartbeat_interval_ms * 3,
-        ));
-
-        let updated = read_lock_metadata(&path)
-            .expect("read updated metadata")
-            .heartbeat_at_ms;
-        assert!(updated > initial, "heartbeat timestamp did not advance");
+        // Poll for up to 2s rather than sleeping a fixed multiple of the
+        // heartbeat interval. `park_timeout` is a *maximum* wait, not a
+        // guaranteed periodic timer — under load (shared macOS CI runners
+        // running other cargo-test threads concurrently) the heartbeat
+        // thread may not fire 3 times within 75ms even though
+        // heartbeat_interval_ms=25. The contract being asserted is "the
+        // heartbeat advances eventually", not "it advances within N
+        // heartbeat intervals".
+        let deadline = std::time::Instant::now() + Duration::from_millis(2_000);
+        let mut updated = initial;
+        while std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+            updated = read_lock_metadata(&path)
+                .expect("read updated metadata")
+                .heartbeat_at_ms;
+            if updated > initial {
+                break;
+            }
+        }
+        assert!(
+            updated > initial,
+            "heartbeat timestamp did not advance within 2s"
+        );
         drop(guard);
     }
 

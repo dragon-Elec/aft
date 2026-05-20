@@ -1228,6 +1228,17 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     }
+    match crate::migrate_storage::cleanup_staging_dirs(&ctx.storage_dir(), harness) {
+        Ok(0) => {}
+        Ok(n) => slog_info!(
+            "swept {} staging directory orphans from prior migrations",
+            n
+        ),
+        Err(err) => slog_warn!(
+            "staging cleanup failed: {} (will retry next configure)",
+            err
+        ),
+    }
     if let Some(v) = params.get("semantic") {
         let current = ctx.config().semantic.clone();
         let semantic = match parse_semantic_config(v, &current) {

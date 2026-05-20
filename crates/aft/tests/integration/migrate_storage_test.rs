@@ -8,10 +8,11 @@ use aft::migrate_storage::{Args, ExitStatus, Options};
 
 fn args(from: PathBuf, to: PathBuf, log: PathBuf) -> Args {
     Args {
-        from,
+        from: Some(from),
         to,
         harness: Harness::Opencode,
-        log,
+        log: Some(log),
+        status: false,
     }
 }
 
@@ -280,6 +281,103 @@ fn migrate_logs_to_file_not_stderr() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_jsonl_parseable(&log);
+}
+
+#[test]
+fn status_mode_reports_migrated_when_marker_present() {
+    let temp = tempfile::tempdir().unwrap();
+    let to = temp.path().join("new");
+    let marker = to.join("opencode/.migrated_from_legacy");
+    write(
+        &marker,
+        r#"{"timestamp":"2026-05-19T15:00:00.123Z","source_path":"/legacy/aft","target_path":"/new/aft","harness":"opencode","aft_version":"0.27.0"}"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aft"))
+        .arg("migrate-storage")
+        .arg("--status")
+        .arg("--to")
+        .arg(&to)
+        .arg("--harness")
+        .arg("opencode")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["harness"], "opencode");
+    assert_eq!(value["target_root"], to.display().to_string());
+    assert_eq!(value["migrated"], true);
+    assert_eq!(value["marker_path"], marker.display().to_string());
+    assert_eq!(value["migrated_at"], "2026-05-19T15:00:00.123Z");
+    assert_eq!(value["source_path"], "/legacy/aft");
+    assert_eq!(value["aft_version"], "0.27.0");
+}
+
+#[test]
+fn status_mode_reports_not_migrated_when_marker_absent() {
+    let temp = tempfile::tempdir().unwrap();
+    let to = temp.path().join("new");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aft"))
+        .arg("migrate-storage")
+        .arg("--status")
+        .arg("--to")
+        .arg(&to)
+        .arg("--harness")
+        .arg("opencode")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["harness"], "opencode");
+    assert_eq!(value["target_root"], to.display().to_string());
+    assert_eq!(value["migrated"], false);
+    assert!(value.get("marker_path").is_none());
+}
+
+#[test]
+fn status_mode_does_not_acquire_lock() {
+    let temp = tempfile::tempdir().unwrap();
+    let to = temp.path().join("new");
+    fs::create_dir_all(to.join(".aft")).unwrap();
+    let _guard = aft::fs_lock::acquire(&to.join(".aft/migration.lock")).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aft"))
+        .arg("migrate-storage")
+        .arg("--status")
+        .arg("--to")
+        .arg(&to)
+        .arg("--harness")
+        .arg("opencode")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn status_mode_does_not_require_from_or_log() {
+    let parsed =
+        aft::migrate_storage::parse_cli_args(["--status", "--to", "/new", "--harness", "opencode"])
+            .unwrap();
+
+    assert!(parsed.status);
+    assert!(parsed.from.is_none());
+    assert!(parsed.log.is_none());
 }
 
 #[test]

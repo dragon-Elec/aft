@@ -17,7 +17,16 @@ export interface MigrationOptions {
   timeoutMs?: number;
 }
 
-const SOURCE_MARKER = ".migrated_to_cortexkit";
+export interface MigrationStatus {
+  harness: MigrationHarness;
+  target_root: string;
+  migrated: boolean;
+  marker_path?: string;
+  migrated_at?: string;
+  source_path?: string;
+  aft_version?: string;
+}
+
 const TARGET_MARKER = ".migrated_from_legacy";
 const DEFAULT_TIMEOUT_MS = 120_000;
 
@@ -76,13 +85,14 @@ function migrationLogPath(
 export async function ensureStorageMigrated(opts: MigrationOptions): Promise<void> {
   const legacyRoot = resolveLegacyStorageRoot(opts.harness);
   const newRoot = resolveCortexKitStorageRoot();
-  const sourceMarker = join(legacyRoot, SOURCE_MARKER);
   const targetMarker = join(newRoot, opts.harness, TARGET_MARKER);
 
-  if (existsSync(sourceMarker) || existsSync(targetMarker)) return;
+  if (existsSync(targetMarker)) return;
 
   // Commit 4's migrate-storage treats a missing source as a no-op, but plugin
   // bootstrap should not require a binary just to discover a fresh install.
+  // If only the legacy source marker exists, still invoke the migrator so it
+  // can backfill the target marker idempotently on the next plugin boot.
   if (!existsSync(legacyRoot)) return;
 
   const logPath = migrationLogPath(newRoot, opts.harness, opts.logger);
@@ -128,4 +138,49 @@ export async function ensureStorageMigrated(opts: MigrationOptions): Promise<voi
       (stderrTail ? ` Stderr tail: ${stderrTail}` : "") +
       (stdoutTail ? ` Stdout tail: ${stdoutTail}` : ""),
   );
+}
+
+/**
+ * Query the migration status without performing any migration.
+ * Used by `aft doctor` and similar diagnostics.
+ */
+export async function getMigrationStatus(opts: {
+  harness: MigrationHarness;
+  binaryPath?: string;
+}): Promise<MigrationStatus> {
+  const newRoot = resolveCortexKitStorageRoot();
+  const binaryPath = opts.binaryPath ?? (await findBinary());
+  const result = spawnSync(
+    binaryPath,
+    ["migrate-storage", "--status", "--to", newRoot, "--harness", opts.harness],
+    {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: DEFAULT_TIMEOUT_MS,
+    },
+  );
+
+  if (result.error || result.status !== 0) {
+    const detail = result.error
+      ? `spawn error ${spawnErrorLabel(result.error)}`
+      : result.status === null
+        ? `terminated by signal ${result.signal ?? "unknown"}`
+        : `exit ${result.status}`;
+    const stderrTail = tail(result.stderr);
+    const stdoutTail = tail(result.stdout);
+    throw new Error(
+      `AFT storage migration status failed (${detail}). ` +
+        `Harness: ${opts.harness}. Target: ${newRoot}.` +
+        (stderrTail ? ` Stderr tail: ${stderrTail}` : "") +
+        (stdoutTail ? ` Stdout tail: ${stdoutTail}` : ""),
+    );
+  }
+
+  try {
+    return JSON.parse(result.stdout.trim()) as MigrationStatus;
+  } catch (err) {
+    throw new Error(
+      `AFT storage migration status returned invalid JSON: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 }

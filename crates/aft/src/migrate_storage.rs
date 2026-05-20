@@ -21,10 +21,19 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct Args {
-    pub from: PathBuf,
+    pub from: Option<PathBuf>,
     pub to: PathBuf,
     pub harness: Harness,
-    pub log: PathBuf,
+    pub log: Option<PathBuf>,
+    pub status: bool,
+}
+
+#[derive(Clone, Debug)]
+struct MigrationArgs {
+    from: PathBuf,
+    to: PathBuf,
+    harness: Harness,
+    log: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -67,6 +76,24 @@ pub fn run(args: Args) -> ExitCode {
 }
 
 pub fn run_with_options(args: Args, options: Options) -> ExitStatus {
+    if args.status {
+        write_status(&args.to, args.harness);
+        return ExitStatus::Success;
+    }
+
+    let Some(from) = args.from else {
+        return ExitStatus::MigrationFailed;
+    };
+    let Some(log_path) = args.log else {
+        return ExitStatus::MigrationFailed;
+    };
+    let args = MigrationArgs {
+        from,
+        to: args.to,
+        harness: args.harness,
+        log: log_path,
+    };
+
     let target_root_error = fs::create_dir_all(&args.to).err();
     let mut log = JsonLogger::open(&args.log, args.harness);
     let started = SystemTime::now();
@@ -278,6 +305,68 @@ pub fn run_with_options(args: Args, options: Options) -> ExitStatus {
     ExitStatus::Success
 }
 
+fn write_status(target_root: &Path, harness: Harness) {
+    let marker_path = target_marker_path_from(target_root, harness);
+    let value = match fs::read(&marker_path) {
+        Ok(bytes) => match serde_json::from_slice::<Marker>(&bytes) {
+            Ok(marker) => serde_json::json!({
+                "harness": harness.as_str(),
+                "target_root": target_root.display().to_string(),
+                "migrated": true,
+                "marker_path": marker_path.display().to_string(),
+                "migrated_at": marker.timestamp,
+                "source_path": marker.source_path,
+                "aft_version": marker.aft_version,
+            }),
+            Err(_) => serde_json::json!({
+                "harness": harness.as_str(),
+                "target_root": target_root.display().to_string(),
+                "migrated": true,
+                "marker_path": marker_path.display().to_string(),
+            }),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => serde_json::json!({
+            "harness": harness.as_str(),
+            "target_root": target_root.display().to_string(),
+            "migrated": false,
+        }),
+        Err(_) => serde_json::json!({
+            "harness": harness.as_str(),
+            "target_root": target_root.display().to_string(),
+            "migrated": false,
+        }),
+    };
+
+    let mut stdout = io::stdout().lock();
+    let _ = serde_json::to_writer(&mut stdout, &value);
+    let _ = stdout.write_all(b"\n");
+}
+
+/// Sweep `staging-*` directories from prior failed migrations in the harness root.
+/// Idempotent. Returns the number of staging dirs removed.
+pub fn cleanup_staging_dirs(target_root: &Path, harness: Harness) -> io::Result<usize> {
+    let harness_dir = target_root.join(harness.as_str());
+    if !harness_dir.exists() {
+        return Ok(0);
+    }
+
+    let mut removed = 0;
+    for entry in fs::read_dir(&harness_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(s) = name.to_str() else { continue };
+        if !s.starts_with("staging-") {
+            continue;
+        }
+        let path = entry.path();
+        if fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+
+    Ok(removed)
+}
+
 fn log_complete(log: &mut JsonLogger, started: SystemTime) {
     let duration_ms = SystemTime::now()
         .duration_since(started)
@@ -394,7 +483,7 @@ fn migration_items() -> &'static [MigrationItem] {
     ]
 }
 
-fn migrate_item(args: &Args, item: MigrationItem, log: &mut JsonLogger) -> io::Result<()> {
+fn migrate_item(args: &MigrationArgs, item: MigrationItem, log: &mut JsonLogger) -> io::Result<()> {
     let source = args.from.join(item.source_name);
     if !source.exists() {
         log.write(serde_json::json!({
@@ -415,7 +504,7 @@ fn migrate_item(args: &Args, item: MigrationItem, log: &mut JsonLogger) -> io::R
 }
 
 fn migrate_whole(
-    args: &Args,
+    args: &MigrationArgs,
     item: MigrationItem,
     source: &Path,
     log: &mut JsonLogger,
@@ -458,7 +547,7 @@ fn migrate_whole(
 }
 
 fn migrate_child_union(
-    args: &Args,
+    args: &MigrationArgs,
     item: MigrationItem,
     source: &Path,
     log: &mut JsonLogger,
@@ -522,7 +611,7 @@ fn migrate_child_union(
     Ok(())
 }
 
-fn merge_trust_file(args: &Args, source: &Path, log: &mut JsonLogger) -> io::Result<()> {
+fn merge_trust_file(args: &MigrationArgs, source: &Path, log: &mut JsonLogger) -> io::Result<()> {
     let target = args.to.join("trusted-filter-projects.json");
     let mut paths = Vec::new();
     let mut seen = BTreeSet::new();
@@ -555,7 +644,7 @@ fn read_json_string_array(path: &Path) -> io::Result<Vec<String>> {
     }
 }
 
-fn target_path(args: &Args, item: MigrationItem) -> PathBuf {
+fn target_path(args: &MigrationArgs, item: MigrationItem) -> PathBuf {
     match item.target {
         TargetKind::Harness => args.to.join(args.harness.as_str()).join(item.name),
         TargetKind::Root => args.to.join(item.name),
@@ -665,7 +754,7 @@ struct Marker {
     aft_version: String,
 }
 
-fn marker(args: &Args) -> Marker {
+fn marker(args: &MigrationArgs) -> Marker {
     Marker {
         timestamp: iso_timestamp_now(),
         source_path: args.from.display().to_string(),
@@ -675,21 +764,25 @@ fn marker(args: &Args) -> Marker {
     }
 }
 
-fn write_source_marker(args: &Args) -> io::Result<()> {
+fn write_source_marker(args: &MigrationArgs) -> io::Result<()> {
     atomic_write_json(&source_marker_path(args), &marker(args))
 }
 
-fn write_target_marker(args: &Args) -> io::Result<()> {
+fn write_target_marker(args: &MigrationArgs) -> io::Result<()> {
     fs::create_dir_all(args.to.join(args.harness.as_str()))?;
     atomic_write_json(&target_marker_path(args), &marker(args))
 }
 
-fn source_marker_path(args: &Args) -> PathBuf {
+fn source_marker_path(args: &MigrationArgs) -> PathBuf {
     args.from.join(SOURCE_MARKER)
 }
 
-fn target_marker_path(args: &Args) -> PathBuf {
-    args.to.join(args.harness.as_str()).join(TARGET_MARKER)
+fn target_marker_path(args: &MigrationArgs) -> PathBuf {
+    target_marker_path_from(&args.to, args.harness)
+}
+
+fn target_marker_path_from(target_root: &Path, harness: Harness) -> PathBuf {
+    target_root.join(harness.as_str()).join(TARGET_MARKER)
 }
 
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
@@ -737,9 +830,14 @@ where
     let mut to = None;
     let mut harness = None;
     let mut log = None;
+    let mut status = false;
     let mut iter = args.into_iter().map(Into::into);
     while let Some(arg) = iter.next() {
         let arg = arg.to_string_lossy().to_string();
+        if arg == "--status" {
+            status = true;
+            continue;
+        }
         let value = match arg.as_str() {
             "--from" | "--to" | "--harness" | "--log" => iter
                 .next()
@@ -763,15 +861,29 @@ where
         }
     }
 
+    let to = to.ok_or_else(|| format!("missing required --to\n\n{}", help_text()))?;
+    let harness =
+        harness.ok_or_else(|| format!("missing required --harness\n\n{}", help_text()))?;
+    if status {
+        return Ok(Args {
+            from,
+            to,
+            harness,
+            log,
+            status,
+        });
+    }
+
     Ok(Args {
-        from: from.ok_or_else(|| format!("missing required --from\n\n{}", help_text()))?,
-        to: to.ok_or_else(|| format!("missing required --to\n\n{}", help_text()))?,
-        harness: harness.ok_or_else(|| format!("missing required --harness\n\n{}", help_text()))?,
-        log: log.ok_or_else(|| format!("missing required --log\n\n{}", help_text()))?,
+        from: Some(from.ok_or_else(|| format!("missing required --from\n\n{}", help_text()))?),
+        to,
+        harness,
+        log: Some(log.ok_or_else(|| format!("missing required --log\n\n{}", help_text()))?),
+        status,
     })
 }
 pub fn help_text() -> String {
-    "Usage: aft migrate-storage --from <legacy_root> --to <new_root> --harness <opencode|pi> --log <log_file>\n\n\
+    "Usage: aft migrate-storage --from <legacy_root> --to <new_root> --harness <opencode|pi> --log <log_file>\n       aft migrate-storage --status --to <new_root> --harness <opencode|pi>\n\n\
 Blocking one-shot migration from legacy AFT storage into the CortexKit-rooted layout.\n\n\
 Exit codes:\n  0  success (including idempotent already-migrated/no-op; missing legacy source is a no-op)\n  1  source unreadable\n  2  insufficient disk space during preflight\n  3  migration lock contention\n  4  migration in progress / partial marker state\n  5  migration failed; inspect the log file"
         .to_string()

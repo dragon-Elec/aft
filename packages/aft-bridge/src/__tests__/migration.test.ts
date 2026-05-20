@@ -44,13 +44,14 @@ describe("storage migration bootstrap", () => {
     ).resolves.toBeUndefined();
   });
 
-  test("ensureStorageMigrated_with_source_marker_is_noop", async () => {
+  test("ensureStorageMigrated_with_source_marker_backfills_target_marker", async () => {
     const legacyRoot = resolveLegacyStorageRoot("opencode");
     mkdirSync(legacyRoot, { recursive: true });
     writeFileSync(join(legacyRoot, ".migrated_to_cortexkit"), "{}", "utf8");
+    const aft = binary("#!/bin/sh\nexit 0\n");
 
     await expect(
-      ensureStorageMigrated({ harness: "opencode", binaryPath: "/missing/aft" }),
+      ensureStorageMigrated({ harness: "opencode", binaryPath: aft }),
     ).resolves.toBeUndefined();
   });
 

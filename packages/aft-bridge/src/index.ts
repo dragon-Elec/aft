@@ -31,10 +31,11 @@ export {
 // --- compact UI formatting ---
 export { compressionSavingsPercent, formatTokenCount } from "./format.js";
 export type { Logger, LogMeta } from "./logger.js";
-export type { MigrationHarness, MigrationOptions } from "./migration.js";
+export type { MigrationHarness, MigrationOptions, MigrationStatus } from "./migration.js";
 // --- storage migration ---
 export {
   ensureStorageMigrated,
+  getMigrationStatus,
   resolveCortexKitStorageRoot,
   resolveLegacyStorageRoot,
 } from "./migration.js";

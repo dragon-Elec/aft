@@ -548,8 +548,22 @@ fn process_alive(pid: u32) -> bool {
         return true;
     }
 
-    String::from_utf8_lossy(&output.stdout).contains(&format!("\",{pid},"))
-        || String::from_utf8_lossy(&output.stdout).contains(&format!("\",{pid}\""))
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // `tasklist /NH /FO CSV` emits a single line per matching process with
+    // every field quoted, e.g. `"image","7420","Console","1","12,345 K"`.
+    // When the filter matches nothing, the literal text
+    // `INFO: No tasks are running which match the specified criteria.`
+    // is written to stdout. The previous matcher was too strict — it looked
+    // for `","{pid}",` patterns mid-line, which works on most Windows builds
+    // but missed Windows runners that emit slightly different quoting (e.g.
+    // a trailing CRLF leaves the pid token at end-of-line as `"7420"\r\n`).
+    // The robust check: confirm the "no tasks" sentinel is absent AND any
+    // PID-quoted form is present.
+    if stdout.contains("No tasks are running") {
+        return false;
+    }
+    stdout.contains(&format!("\"{pid}\""))
 }
 
 #[cfg(not(any(unix, windows)))]

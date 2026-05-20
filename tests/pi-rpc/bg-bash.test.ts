@@ -111,11 +111,14 @@ describe("background bash lifecycle (real Pi RPC)", () => {
       expect(
         (await client.sendCommand({ type: "prompt", message: "Start a background echo." })).success,
       ).toBe(true);
-      // 60s budgets: Pi cold start + ONNX init + first LLM call + bg-bash
-      // spawn can exceed 30s on shared macOS CI runners under load.
+      // 90s budgets: Pi cold start + ONNX init + first LLM call + bg-bash
+      // spawn can exceed 60s on shared macOS CI runners under load. The
+      // previous 60s budget tripped at 61256ms in the v0.27 release CI run
+      // because the first LLM call + bridge spawn alone consumed it. The
+      // outer test budget is raised in lockstep below.
       const bashEnd = await client.waitForEvent(
         (event) => event.type === "tool_execution_end" && event.toolName === "bash",
-        60_000,
+        90_000,
       );
       expect(bashEnd.isError).toBe(false);
       const taskId = resultDetails(bashEnd).task_id;
@@ -137,7 +140,7 @@ describe("background bash lifecycle (real Pi RPC)", () => {
       await aimock.close();
       await cleanupPiIsolatedEnv(env);
     }
-  }, 120_000);
+  }, 180_000);
 
   test("background completion is appended to the next unrelated tool result", async () => {
     const env = createPiIsolatedEnv();

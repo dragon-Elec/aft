@@ -1492,6 +1492,19 @@ impl BgTaskRegistry {
         // real-world bash usage.
         self.record_compression_event_if_applicable(metadata, &token_counts);
 
+        // Push-frame queue is gated on `completion_delivered` so foreground
+        // bash with `notify_on_completion=false` does not leak a user-visible
+        // completion notification. `mark_terminal` pre-sets
+        // `completion_delivered=true` for those tasks; honoring it here keeps
+        // the suppression invariant the test
+        // `no_notify_foreground_poll_completion_does_not_enqueue_completion`
+        // asserts. The compression-event recording above intentionally runs
+        // before this gate so foreground bash still contributes to the
+        // session/project aggregates.
+        if metadata.completion_delivered {
+            return;
+        }
+
         // Push-frame queue dedupe stays per-task to prevent duplicate
         // user-visible completion notifications.
         let pushed = if let Ok(mut completions) = self.inner.completions.lock() {

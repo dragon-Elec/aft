@@ -277,6 +277,54 @@ export function resolveLspConfigForConfigure(config: AftConfig): ConfigureLspOve
   return overrides;
 }
 
+/**
+ * Build the per-project subset of configure overrides that come from
+ * `aft.jsonc` (user config merged with project config). Used by the OpenCode
+ * plugin's per-bridge `projectConfigLoader` so each project's `aft.jsonc` wins
+ * over the user-level config for that project's bridge, instead of every
+ * bridge inheriting whatever project was visible at plugin init.
+ *
+ * **DO NOT** put genuinely-global fields here. Things like `storage_dir`,
+ * `_ort_dylib_dir`, `harness`, `lsp_paths_extra`, `bash_permissions` are set
+ * at plugin init from process state (XDG dirs, ONNX download path, etc.) and
+ * MUST NOT be re-derived per-bridge — they're identical across all bridges in
+ * one OpenCode/Pi process.
+ *
+ * **DO NOT** put fields that affect plugin-side tool registration here.
+ * `tool_surface`, `disabled_tools`, and `hoist_builtin_tools` lock at plugin
+ * init because OpenCode registers tools synchronously when the plugin
+ * function returns. Per-bridge changes to those fields wouldn't take effect.
+ */
+export function resolveProjectOverridesForConfigure(config: AftConfig): Record<string, unknown> {
+  const overrides: Record<string, unknown> = {};
+
+  // Edit-pipeline behavior — overridable per-project.
+  if (config.format_on_edit !== undefined) overrides.format_on_edit = config.format_on_edit;
+  if (config.formatter_timeout_secs !== undefined)
+    overrides.formatter_timeout_secs = config.formatter_timeout_secs;
+  if (config.validate_on_edit !== undefined) overrides.validate_on_edit = config.validate_on_edit;
+  if (config.formatter !== undefined) overrides.formatter = config.formatter;
+  if (config.checker !== undefined) overrides.checker = config.checker;
+
+  // Project containment — default false at the plugin layer (parity with
+  // OpenCode's built-in tools). Users opt in with `restrict_to_project_root: true`.
+  overrides.restrict_to_project_root = config.restrict_to_project_root ?? false;
+
+  // Indexed search and semantic search — both are per-project opt-ins.
+  if (config.search_index !== undefined) overrides.search_index = config.search_index;
+  if (config.semantic_search !== undefined) overrides.semantic_search = config.semantic_search;
+
+  // Bash / LSP / semantic / max_callgraph_files — all flow through dedicated
+  // resolvers because they have their own merge / project-safety rules.
+  Object.assign(overrides, resolveExperimentalConfigForConfigure(config));
+  Object.assign(overrides, resolveLspConfigForConfigure(config));
+  if (config.semantic !== undefined) overrides.semantic = config.semantic;
+  if (config.max_callgraph_files !== undefined)
+    overrides.max_callgraph_files = config.max_callgraph_files;
+
+  return overrides;
+}
+
 export function resolveExperimentalConfigForConfigure(
   config: AftConfig,
 ): ConfigureExperimentalOverrides {

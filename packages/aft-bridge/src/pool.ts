@@ -72,6 +72,31 @@ export interface PoolOptions extends BridgeOptions {
   maxPoolSize?: number;
   idleTimeoutMs?: number;
   logger?: Logger;
+  /**
+   * Optional per-project configure override loader. Called exactly once when
+   * a new bridge is spawned for `projectRoot`, with the canonical (already
+   * normalized) project root. Returned overrides are deep-merged on top of
+   * the pool's global `configOverrides` and shallow-merged into the bridge's
+   * configure payload (per-project values win).
+   *
+   * Use this when one plugin instance serves many projects (OpenCode Desktop /
+   * `opencode serve`) and each project has its own `.opencode/aft.jsonc` whose
+   * fields differ from the user-level config. Without this loader, only the
+   * project config visible at plugin init reaches the Rust side; later
+   * sessions opened in other projects inherit the wrong project's overrides.
+   *
+   * Caveats:
+   *   - The loader runs synchronously inside `getBridge()`. Keep it cheap.
+   *   - Existing bridges keep the overrides they were spawned with — this is
+   *     intentional so reloads don't blow away warm trigram/LSP/semantic state.
+   *   - The loader should ONLY return per-project-overridable fields. Truly
+   *     global fields (storage_dir, _ort_dylib_dir, harness, lsp_paths_extra)
+   *     belong in the pool's static `configOverrides` constructor argument.
+   *
+   * If the loader throws, the bridge falls back to global overrides only and
+   * the error is logged via the pool logger.
+   */
+  projectConfigLoader?: (projectRoot: string) => Record<string, unknown>;
 }
 
 /**
@@ -98,6 +123,9 @@ export class BridgePool {
   private readonly idleTimeoutMs: number;
   private readonly bridgeOptions: BridgeOptions;
   private readonly configOverrides: Record<string, unknown>;
+  private readonly projectConfigLoader:
+    | ((projectRoot: string) => Record<string, unknown>)
+    | undefined;
   private readonly logger: Logger | undefined;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -110,6 +138,7 @@ export class BridgePool {
     this.maxPoolSize = options.maxPoolSize ?? DEFAULT_MAX_POOL_SIZE;
     this.idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
     this.logger = options.logger;
+    this.projectConfigLoader = options.projectConfigLoader;
     this.bridgeOptions = {
       timeoutMs: options.timeoutMs,
       maxRestarts: options.maxRestarts,
@@ -178,7 +207,23 @@ export class BridgePool {
       this.evictLRU();
     }
 
-    const bridge = new BinaryBridge(this.binaryPath, key, this.bridgeOptions, this.configOverrides);
+    // Per-project overrides ON TOP of global overrides (loader values win).
+    // Without this, OpenCode Desktop / `opencode serve` would inherit whatever
+    // project's `.opencode/aft.jsonc` was visible at plugin init for ALL
+    // sessions, ignoring the actual session's project config. See the
+    // `projectConfigLoader` doc-comment on PoolOptions.
+    let projectOverrides: Record<string, unknown> = {};
+    if (this.projectConfigLoader) {
+      try {
+        projectOverrides = this.projectConfigLoader(key) ?? {};
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.error(`projectConfigLoader failed; using global overrides only: ${message}`);
+      }
+    }
+    const mergedOverrides = { ...this.configOverrides, ...projectOverrides };
+
+    const bridge = new BinaryBridge(this.binaryPath, key, this.bridgeOptions, mergedOverrides);
     this.bridges.set(key, { bridge, lastUsed: Date.now() });
     return bridge;
   }

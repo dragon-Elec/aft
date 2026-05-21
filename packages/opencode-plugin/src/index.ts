@@ -21,11 +21,7 @@ import {
   handlePushedBgCompletion,
   handlePushedBgLongRunning,
 } from "./bg-notifications.js";
-import {
-  loadAftConfig,
-  resolveExperimentalConfigForConfigure,
-  resolveLspConfigForConfigure,
-} from "./config.js";
+import { loadAftConfig, resolveProjectOverridesForConfigure } from "./config.js";
 import { createAutoUpdateCheckerHook } from "./hooks/auto-update-checker/index.js";
 import { bridgeLogger, error, log, warn } from "./logger.js";
 import { abortInFlightAutoInstalls, runAutoInstall } from "./lsp-auto-install.js";
@@ -209,36 +205,31 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   const aftConfig = loadAftConfig(input.directory);
   const autoUpdateAbort = new AbortController();
 
-  // Build config overrides for the Rust binary (strip undefined values)
-  const configOverrides: Record<string, unknown> = {};
-  if (aftConfig.format_on_edit !== undefined)
-    configOverrides.format_on_edit = aftConfig.format_on_edit;
-  if (aftConfig.formatter_timeout_secs !== undefined)
-    configOverrides.formatter_timeout_secs = aftConfig.formatter_timeout_secs;
-  if (aftConfig.validate_on_edit !== undefined)
-    configOverrides.validate_on_edit = aftConfig.validate_on_edit;
-  if (aftConfig.formatter !== undefined) configOverrides.formatter = aftConfig.formatter;
-  if (aftConfig.checker !== undefined) configOverrides.checker = aftConfig.checker;
-  // Default to restrict_to_project_root: false for parity with the host's
-  // built-in tools. OpenCode's native `read`/`write`/`edit`/`apply_patch` do
-  // not hard-reject out-of-root paths — they call `assertExternalDirectory`
-  // which prompts the user and continues on approval. AFT previously
-  // defaulted this to `true`, which blocked legitimate cross-project work
-  // that OpenCode's own tools would have allowed (often after one click).
-  // Users who want strict containment can opt in by setting
-  // `restrict_to_project_root: true` in their aft.jsonc.
-  // TODO(v0.19): replicate OpenCode's `ctx.ask({permission:"external_directory"})`
-  // prompt at the plugin layer for full UX parity with native built-ins.
-  configOverrides.restrict_to_project_root = aftConfig.restrict_to_project_root ?? false;
-  configOverrides.bash_permissions = true;
-  if (aftConfig.search_index !== undefined) configOverrides.search_index = aftConfig.search_index;
-  if (aftConfig.semantic_search !== undefined)
-    configOverrides.semantic_search = aftConfig.semantic_search;
-  Object.assign(configOverrides, resolveExperimentalConfigForConfigure(aftConfig));
-  Object.assign(configOverrides, resolveLspConfigForConfigure(aftConfig));
-  if (aftConfig.semantic !== undefined) configOverrides.semantic = aftConfig.semantic;
-  if (aftConfig.max_callgraph_files !== undefined)
-    configOverrides.max_callgraph_files = aftConfig.max_callgraph_files;
+  // Build config overrides for the Rust binary (strip undefined values).
+  //
+  // **Two layers**:
+  //   1. `configOverrides` (this block) — GLOBAL per-process state shared by
+  //      every bridge: storage_dir, _ort_dylib_dir (patched later), harness,
+  //      bash_permissions, lsp_paths_extra (LSP install cache).
+  //   2. `projectConfigLoader` (wired below) — PER-BRIDGE, loaded from each
+  //      project's own `.opencode/aft.jsonc` at bridge-spawn time. Contains
+  //      everything that can legitimately differ per project: experimental.bash.*,
+  //      format_on_edit, formatter, checker, restrict_to_project_root,
+  //      search_index, semantic_search, semantic, lsp (per-project safe
+  //      subset), max_callgraph_files.
+  //
+  // The pool merges them with per-project values winning. Without this split,
+  // OpenCode Desktop / `opencode serve` (one plugin instance, many projects)
+  // would burn the wrong project's config into every bridge — the project
+  // visible at plugin init time would override everything.
+  //
+  // Seed the global layer with the init-time config so the FIRST bridge in
+  // the init-time project still gets its config without an extra loader call.
+  // Subsequent project switches re-resolve via the loader.
+  const configOverrides: Record<string, unknown> = {
+    ...resolveProjectOverridesForConfigure(aftConfig),
+    bash_permissions: true,
+  };
 
   const isFastembedSemanticBackend = (aftConfig.semantic?.backend ?? "fastembed") === "fastembed";
 
@@ -391,6 +382,24 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   } = {
     errorPrefix: "[aft-plugin]",
     minVersion: PLUGIN_VERSION,
+    // Per-project configure overrides — fixes OpenCode Desktop /
+    // `opencode serve` mode where one plugin instance serves many projects.
+    // Without this, every bridge inherits the project config visible at
+    // plugin init; with it, each project's `.opencode/aft.jsonc` wins for
+    // that project's bridge. See PoolOptions.projectConfigLoader doc.
+    projectConfigLoader: (projectRoot) => {
+      try {
+        const projectConfig = loadAftConfig(projectRoot);
+        return resolveProjectOverridesForConfigure(projectConfig);
+      } catch (err) {
+        warn(
+          `loadAftConfig(${projectRoot}) failed; falling back to plugin-init config: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+        return {};
+      }
+    },
     onVersionMismatch: async (binaryVersion, minVersion) => {
       const existing = versionUpgradePromises.get(minVersion);
       if (existing) {

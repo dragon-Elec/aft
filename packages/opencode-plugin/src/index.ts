@@ -160,11 +160,11 @@ const PLUGIN_VERSION: string = (() => {
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.27.0";
+const ANNOUNCEMENT_VERSION = "0.28.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Storage moved to ~/.local/share/cortexkit/aft (~/Library/Application Support/cortexkit/aft on macOS, %APPDATA%/cortexkit/aft on Windows). Your existing data migrated automatically on first launch.",
-  "Bash output compression now reports token savings — visible in /aft-status and the TUI sidebar (Session + Project totals).",
-  "Seven new languages supported by aft_outline / aft_zoom / aft_search / ast_grep: Java, Ruby, Kotlin, Swift, PHP, Lua, Perl.",
+  "Bash hoisting is now default-on. Configure with top-level `bash: { rewrite, compress, background }` instead of `experimental.bash.*` — old config migrates automatically on first launch.",
+  "Vue, Astro, and Svelte language servers now auto-install when the framework appears in your package.json (fixes #48).",
+  "Native Windows ARM64 binary — ARM64 hosts no longer fall back to x64 under emulation.",
   "Join us on Discord: https://discord.gg/F2uWxjGnU",
 ];
 

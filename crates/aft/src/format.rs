@@ -376,6 +376,13 @@ fn try_well_known_path_lookup(command: &str) -> Option<PathBuf> {
         // entirely — the user's tool is either on PATH or genuinely missing.
         return None;
     }
+    // Test-only escape hatch: integration tests that need to assert
+    // "tool not installed" semantics set AFT_DISABLE_WELL_KNOWN_LOOKUP=1
+    // so CI runners with a system tsc/biome/etc. at /usr/local/bin don't
+    // silently make those tests pass. Production callers never set this.
+    if std::env::var_os("AFT_DISABLE_WELL_KNOWN_LOOKUP").is_some() {
+        return None;
+    }
     let candidates = well_known_search_paths(command, std::env::var_os("HOME").as_deref());
     try_well_known_path_lookup_in(&candidates)
 }

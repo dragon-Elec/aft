@@ -208,7 +208,10 @@ fn format_integration_formatter_not_installed() {
     let _ = fs::remove_file(&target);
 
     let path = prepend_path(&std::ffi::OsString::new(), &dir);
-    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("PATH", path.as_os_str()),
+        ("AFT_DISABLE_WELL_KNOWN_LOOKUP", std::ffi::OsStr::new("1")),
+    ]);
     let cfg = aft.configure(&dir);
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
     let resp = aft.send(&format!(
@@ -582,7 +585,10 @@ fn validate_full_checker_not_installed() {
     let _ = fs::remove_file(&target);
 
     let path = prepend_path(&std::ffi::OsString::new(), &dir);
-    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("PATH", path.as_os_str()),
+        ("AFT_DISABLE_WELL_KNOWN_LOOKUP", std::ffi::OsStr::new("1")),
+    ]);
     let cfg = aft.configure(&dir);
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
     let resp = aft.send(&format!(

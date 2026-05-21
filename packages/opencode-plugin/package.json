@@ -41,6 +41,7 @@
     "@cortexkit/aft-darwin-x64": "0.27.1",
     "@cortexkit/aft-linux-arm64": "0.27.1",
     "@cortexkit/aft-linux-x64": "0.27.1",
+    "@cortexkit/aft-win32-arm64": "0.27.1",
     "@cortexkit/aft-win32-x64": "0.27.1"
   },
   "devDependencies": {

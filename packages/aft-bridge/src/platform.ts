@@ -11,18 +11,15 @@
  * Used by the resolver to turn the current runtime environment into the
  * canonical key (e.g. `"darwin-arm64"`) that the rest of the system uses.
  *
- * Note on Windows ARM64: we map `win32-arm64` to `win32-x64` because Windows
- * 11 on ARM ships with a built-in x64-on-ARM64 emulator (Prism). Most Node
- * installs on Windows ARM64 are x64-emulated to begin with (so process.arch
- * actually reads as "x64" already), but on the rare native-arm64 Node the
- * x64 binary still runs correctly under emulation. We don't ship a native
- * `aft-win32-arm64` binary because the cross-compile toolchain story is
- * worse than the small perf cost of running under emulation.
+ * v0.28: Windows ARM64 ships a native binary instead of relying on Windows
+ * 11's Prism x64-on-ARM64 emulator. Native ARM64 avoids the emulation tax
+ * on ARM-native Node installs and ONNX Runtime ARM64 (auto-downloaded by
+ * `onnx-runtime.ts`) couples more cleanly with a same-architecture binary.
  */
 export const PLATFORM_ARCH_MAP: Record<string, Record<string, string>> = {
   darwin: { arm64: "darwin-arm64", x64: "darwin-x64" },
   linux: { arm64: "linux-arm64", x64: "linux-x64" },
-  win32: { arm64: "win32-x64", x64: "win32-x64" },
+  win32: { arm64: "win32-arm64", x64: "win32-x64" },
 };
 
 /**
@@ -36,5 +33,6 @@ export const PLATFORM_ASSET_MAP: Record<string, string> = {
   "darwin-x64": "aft-darwin-x64",
   "linux-arm64": "aft-linux-arm64",
   "linux-x64": "aft-linux-x64",
+  "win32-arm64": "aft-win32-arm64.exe",
   "win32-x64": "aft-win32-x64.exe",
 };

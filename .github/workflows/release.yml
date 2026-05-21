@@ -248,6 +248,37 @@ jobs:
           path: target/x86_64-pc-windows-msvc/release/aft.exe
           if-no-files-found: error
 
+  build-win32-arm64:
+    name: Build Windows ARM64
+    # v0.28: native ARM64 binary. Host is windows-latest (x64) which
+    # cross-compiles to aarch64-pc-windows-msvc via the MSVC ARM64 cross
+    # toolchain bundled in the Visual Studio Build Tools on the runner.
+    runs-on: windows-latest
+    needs: [unit, e2e]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+
+      - name: Sync versions from tag
+        run: node scripts/version-sync.mjs --from-tag
+        shell: pwsh
+
+      - name: Build
+        run: cargo build --release --target aarch64-pc-windows-msvc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win32-arm64
+          path: target/aarch64-pc-windows-msvc/release/aft.exe
+          if-no-files-found: error
+
   # npm publish runs AFTER github-release so that checksums.sha256 is already
   # available on the GitHub release page when ensureBinary() runs during
   # @cortexkit/aft-opencode@latest install.
@@ -259,6 +290,7 @@ jobs:
       - build-darwin-x64
       - build-linux-arm64
       - build-linux-x64
+      - build-win32-arm64
       - build-win32-x64
       - github-release
     steps:
@@ -305,6 +337,12 @@ jobs:
         with:
           name: win32-x64
           path: packages/npm/win32-x64/bin
+
+      - name: Download win32-arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: win32-arm64
+          path: packages/npm/win32-arm64/bin
 
       - name: Set binary permissions
         run: |
@@ -371,7 +409,7 @@ jobs:
             npm publish --access public --provenance "$pkg_dir"
           }
 
-          for pkg in darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-x64; do
+          for pkg in darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-arm64 win32-x64; do
             publish_or_skip "packages/npm/$pkg"
           done
 
@@ -445,6 +483,7 @@ jobs:
       - build-darwin-x64
       - build-linux-arm64
       - build-linux-x64
+      - build-win32-arm64
       - build-win32-x64
       - publish-crates
     steps:
@@ -462,6 +501,7 @@ jobs:
           cp artifacts/darwin-x64/aft release-assets/aft-darwin-x64
           cp artifacts/linux-arm64/aft release-assets/aft-linux-arm64
           cp artifacts/linux-x64/aft release-assets/aft-linux-x64
+          cp artifacts/win32-arm64/aft.exe release-assets/aft-win32-arm64.exe
           cp artifacts/win32-x64/aft.exe release-assets/aft-win32-x64.exe
           chmod +x release-assets/aft-*
 

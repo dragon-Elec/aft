@@ -28,7 +28,14 @@ const root = join(__dirname, "..");
 
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[\w.]+)?(?:\+[\w.]+)?$/;
 
-const PLATFORM_DIRS = ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "win32-x64"];
+const PLATFORM_DIRS = [
+  "darwin-arm64",
+  "darwin-x64",
+  "linux-arm64",
+  "linux-x64",
+  "win32-arm64",
+  "win32-x64",
+];
 
 function parseArgs(argv) {
   const args = argv.slice(2);

@@ -29,6 +29,7 @@ const PLATFORMS = [
   { dir: "darwin-x64", os: "darwin", cpu: "x64" },
   { dir: "linux-arm64", os: "linux", cpu: "arm64" },
   { dir: "linux-x64", os: "linux", cpu: "x64" },
+  { dir: "win32-arm64", os: "win32", cpu: "arm64" },
   { dir: "win32-x64", os: "win32", cpu: "x64" },
 ];
 

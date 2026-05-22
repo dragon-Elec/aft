@@ -1,19 +1,23 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { warn } from "../logger";
-import { rpcPortFilePath } from "./rpc-utils";
+import { rpcPortFileDir, rpcPortFilePath } from "./rpc-utils";
 
 const MAX_RETRIES = 10;
 const RETRY_DELAY_MS = 500;
 const REQUEST_TIMEOUT_MS = 5000;
 
+type PortInfo = { port: number; token: string | null };
+
 export class AftRpcClient {
   private port: number | null = null;
   private token: string | null = null;
-  private portFilePath: string;
-  private healthChecked = false;
+  private portsDir: string;
+  private legacyPortFile: string;
 
   constructor(storageDir: string, directory: string) {
-    this.portFilePath = rpcPortFilePath(storageDir, directory);
+    this.portsDir = rpcPortFileDir(storageDir, directory);
+    this.legacyPortFile = rpcPortFilePath(storageDir, directory);
   }
 
   /** Call an RPC method. Retries port resolution if the server isn't ready yet. */
@@ -21,111 +25,129 @@ export class AftRpcClient {
     method: string,
     params: Record<string, unknown> = {},
   ): Promise<T> {
-    const info = await this.resolvePortInfo();
-    if (!info) {
+    // Try ALL discovered ports for this project (OpenCode TUI under --port 0
+    // loads our plugin twice in the same process, so two RPC servers listen
+    // and we have to try both — only one's bridge is actually warm).
+    const infos = await this.resolvePortInfos();
+    if (infos.length === 0) {
       throw new Error("AFT RPC server not available");
     }
 
-    return this.callResolved<T>(method, params, info, true);
+    // First pass: try every port. Prefer responses that look like "warm
+    // bridge" output (i.e. not the synthetic `status: "not_initialized"`
+    // placeholder served when this instance's bridge hasn't been spawned).
+    let placeholder: T | null = null;
+    let lastError: unknown = null;
+    for (const info of infos) {
+      try {
+        const result = await this.callOne<T>(method, params, info);
+        if (this.looksLikePlaceholder(result)) {
+          placeholder = result; // remember but keep trying
+          continue;
+        }
+        // Warm response — cache this port for subsequent calls.
+        this.port = info.port;
+        this.token = info.token;
+        return result;
+      } catch (err) {
+        lastError = err;
+      }
+    }
+
+    // All ports returned placeholder OR failed. Use placeholder if we have
+    // one (sidebar then shows the lazy-spawn UI); otherwise rethrow last error.
+    if (placeholder !== null) return placeholder;
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
 
-  private async callResolved<T>(
+  private async callOne<T>(
     method: string,
     params: Record<string, unknown>,
-    info: { port: number; token: string | null },
-    retryOnConnectionFailure: boolean,
+    info: PortInfo,
   ): Promise<T> {
-    let response: Response;
-    try {
-      response = await this.fetchWithTimeout(`http://127.0.0.1:${info.port}/rpc/${method}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...params, token: info.token }),
-      });
-    } catch (err) {
-      if (!retryOnConnectionFailure) throw err;
-      return this.retryAfterReset<T>(method, params, err);
-    }
-
+    const response = await this.fetchWithTimeout(`http://127.0.0.1:${info.port}/rpc/${method}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...params, token: info.token }),
+    });
     if (!response.ok) {
       const text = await response.text();
-      if (response.status >= 500 && retryOnConnectionFailure) {
-        return this.retryAfterReset<T>(method, params, `HTTP ${response.status}: ${text}`);
-      }
       throw new Error(`RPC ${method} failed (${response.status}): ${text}`);
     }
-
     return (await response.json()) as T;
   }
 
-  private async retryAfterReset<T>(
-    method: string,
-    params: Record<string, unknown>,
-    reason: unknown,
-  ): Promise<T> {
-    const message = reason instanceof Error ? reason.message : String(reason);
-    warn(`RPC ${method} failed on cached port; retrying after port refresh (${message})`);
-    this.reset();
-    const refreshed = await this.resolvePortInfo();
-    if (!refreshed) {
-      throw new Error("AFT RPC server not available after port refresh");
-    }
-    return this.callResolved<T>(method, params, refreshed, false);
+  /**
+   * Heuristic for "this response is the lazy-spawn placeholder, not the real
+   * data." We treat any `not_initialized` status as a placeholder so the
+   * client knows to try the next port (the warm one).
+   */
+  private looksLikePlaceholder<T>(result: T): boolean {
+    if (!result || typeof result !== "object") return false;
+    const status = (result as Record<string, unknown>).status;
+    return status === "not_initialized";
   }
 
-  /** Check if the RPC server is reachable. */
+  /** Check if any RPC server is reachable. */
   async isAvailable(): Promise<boolean> {
     try {
-      const port = await this.resolvePort();
-      return port !== null;
+      const infos = await this.resolvePortInfos();
+      return infos.length > 0;
     } catch {
       return false;
     }
   }
 
-  private async resolvePort(): Promise<number | null> {
-    return (await this.resolvePortInfo())?.port ?? null;
-  }
-
-  private async resolvePortInfo(): Promise<{ port: number; token: string | null } | null> {
-    if (this.port && this.healthChecked) {
-      return { port: this.port, token: this.token };
-    }
-
-    if (this.port) {
-      const alive = await this.healthCheck(this.port);
-      if (alive) {
-        this.healthChecked = true;
-        return { port: this.port, token: this.token };
-      }
-      this.port = null;
-      this.token = null;
-      this.healthChecked = false;
-    }
-
+  /**
+   * Discover all live RPC port files for this project. Tries the per-instance
+   * directory first (v0.28.2+), then falls back to the single legacy `port`
+   * file (older plugin versions in mixed deployments).
+   */
+  private async resolvePortInfos(): Promise<PortInfo[]> {
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      const info = this.readPortFile();
-      if (info) {
-        const alive = await this.healthCheck(info.port);
-        if (alive) {
-          this.port = info.port;
-          this.token = info.token;
-          this.healthChecked = true;
-          return info;
+      const infos = this.readAllPortFiles();
+      if (infos.length > 0) {
+        const alive: PortInfo[] = [];
+        for (const info of infos) {
+          if (await this.healthCheck(info.port)) {
+            alive.push(info);
+          }
         }
+        if (alive.length > 0) return alive;
       }
-
       if (attempt < MAX_RETRIES - 1) {
         await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
       }
     }
-
-    return null;
+    return [];
   }
 
-  private readPortFile(): { port: number; token: string | null } | null {
+  private readAllPortFiles(): PortInfo[] {
+    const collected: PortInfo[] = [];
+    // Per-instance directory (v0.28.2+): one file per plugin load.
+    if (existsSync(this.portsDir)) {
+      try {
+        const entries = readdirSync(this.portsDir);
+        for (const entry of entries) {
+          if (!entry.endsWith(".json")) continue;
+          const info = this.parsePortFile(join(this.portsDir, entry));
+          if (info) collected.push(info);
+        }
+      } catch {
+        // ignore read errors
+      }
+    }
+    // Legacy single file (pre-v0.28.2 plugin versions in mixed deployments).
+    if (collected.length === 0) {
+      const info = this.parsePortFile(this.legacyPortFile);
+      if (info) collected.push(info);
+    }
+    return collected;
+  }
+
+  private parsePortFile(path: string): PortInfo | null {
     try {
-      const content = readFileSync(this.portFilePath, "utf-8").trim();
+      const content = readFileSync(path, "utf-8").trim();
       let port: number;
       let token: string | null;
       if (content.startsWith("{")) {
@@ -170,6 +192,5 @@ export class AftRpcClient {
   reset(): void {
     this.port = null;
     this.token = null;
-    this.healthChecked = false;
   }
 }

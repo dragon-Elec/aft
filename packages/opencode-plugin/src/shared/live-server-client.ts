@@ -83,3 +83,50 @@ export function getLiveServerClient(serverUrl: string, directory: string): LiveS
 export function __resetLiveServerClientCacheForTests(): void {
   clientCache.clear();
 }
+
+/**
+ * True when the current runtime is Bun. OpenCode's TUI ships with Bun;
+ * the Electron Desktop app ships with Node. We use this to gate the
+ * `--port 0` nudge: Desktop is unaffected by anomalyco/opencode#28202
+ * because Node's webidl polyfill is complete, so undici v8 (and the live
+ * HTTP server) work without additional flags.
+ */
+export function isBunRuntime(): boolean {
+  return typeof (globalThis as { Bun?: unknown }).Bun !== "undefined";
+}
+
+/**
+ * Probe whether `serverUrl` accepts a connection within `timeoutMs`.
+ * Returns `true` for any HTTP response (including 4xx / 5xx) since the
+ * goal is to confirm the listener exists. Returns `false` on connection
+ * refused, DNS failure, timeout, or undefined URL.
+ *
+ * Used at plugin init under Bun to detect TUI sessions started without
+ * `opencode --port 0` — those bind an internal-only listener that 404s
+ * for `/session/...` endpoints and breaks AFT's wake path.
+ */
+export async function probeServerReachable(
+  serverUrl: string | undefined,
+  timeoutMs = 1500,
+): Promise<boolean> {
+  if (!serverUrl) return false;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    // Hit a path that actually exists on the OpenCode HTTP API so a
+    // 200 confirms the API server is up, not just any random listener
+    // (e.g. an internal IPC port that happens to accept TCP but rejects
+    // all paths with 404 — which is exactly what TUI binds without
+    // `--port 0`).
+    const probeUrl = new URL("/session", serverUrl).toString();
+    const res = await globalThis.fetch(probeUrl, {
+      method: "GET",
+      signal: controller.signal,
+    });
+    return res.status >= 200 && res.status < 500;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}

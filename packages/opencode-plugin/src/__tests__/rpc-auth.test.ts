@@ -1,12 +1,32 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { AftRpcClient } from "../shared/rpc-client.js";
 import { AftRpcServer } from "../shared/rpc-server.js";
-import { rpcPortFilePath } from "../shared/rpc-utils.js";
+import { rpcPortFileDir, rpcPortFilePath } from "../shared/rpc-utils.js";
+
+/** Resolve the (single) per-instance port file written by an AftRpcServer. */
+function resolveInstancePortFile(storageDir: string, directory: string): string {
+  const portsDir = rpcPortFileDir(storageDir, directory);
+  const entries = readdirSync(portsDir).filter((entry) => entry.endsWith(".json"));
+  if (entries.length !== 1) {
+    throw new Error(
+      `expected exactly one port file in ${portsDir}, found ${entries.length}: ${entries.join(", ")}`,
+    );
+  }
+  return join(portsDir, entries[0] as string);
+}
 
 const tempRoots = new Set<string>();
 
@@ -31,15 +51,15 @@ describe("AFT RPC auth", () => {
 
     try {
       const port = await server.start();
-      const portFile = JSON.parse(
-        readFileSync(rpcPortFilePath(fixture.storageDir, fixture.directory), "utf-8"),
-      ) as { port: number; token: string };
+      const instancePortFile = resolveInstancePortFile(fixture.storageDir, fixture.directory);
+      const portFile = JSON.parse(readFileSync(instancePortFile, "utf-8")) as {
+        port: number;
+        token: string;
+      };
       expect(portFile.port).toBe(port);
       expect(portFile.token).toMatch(/^[0-9a-f]{64}$/);
       if (process.platform !== "win32") {
-        expect(statSync(rpcPortFilePath(fixture.storageDir, fixture.directory)).mode & 0o777).toBe(
-          0o600,
-        );
+        expect(statSync(instancePortFile).mode & 0o777).toBe(0o600);
       }
 
       const forbidden = await fetch(`http://127.0.0.1:${port}/rpc/echo`, {
@@ -63,27 +83,52 @@ describe("AFT RPC auth", () => {
     // Backward-compat at the parser level: old aft versions wrote a plain integer
     // port file. The new client must still parse those files (without exceptions
     // about JSON parsing or missing token field) and reach the network layer.
-    // The current new server WILL reject the resulting tokenless request with 403,
-    // which is the intended behavior — but the client should fail at the network
-    // layer (HTTP 403), not the file-parsing layer.
+    //
+    // We use a plain http.Server that requires a token (matches new aft server
+    // behavior). The client reading the legacy integer file gets `token: null`,
+    // sends the request, server returns 403. The 403 proves the legacy parser
+    // path works end-to-end — only the server's token check rejects, not the client.
     const fixture = makeFixture();
-    const server = new AftRpcServer(fixture.storageDir, fixture.directory);
-    server.handle("echo", async (params) => ({ params }));
+    const { createServer } = await import("node:http");
+    const tokenRequiredServer = createServer((req, res) => {
+      if (req.url === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      let body = "";
+      req.on("data", (chunk) => {
+        body += chunk;
+      });
+      req.on("end", () => {
+        const params = JSON.parse(body) as { token?: string | null };
+        if (params.token == null) {
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Forbidden" }));
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      });
+    });
+    await new Promise<void>((resolve) => tokenRequiredServer.listen(0, "127.0.0.1", resolve));
+    const address = tokenRequiredServer.address();
+    const port = typeof address === "object" && address ? address.port : 0;
 
     try {
-      const port = await server.start();
-      const portPath = rpcPortFilePath(fixture.storageDir, fixture.directory);
-      mkdirSync(dirname(portPath), { recursive: true });
-      // Overwrite with legacy integer-only format (old aft versions used this).
-      writeFileSync(portPath, String(port), "utf-8");
+      const legacyPortPath = rpcPortFilePath(fixture.storageDir, fixture.directory);
+      mkdirSync(rpcPortFileDir(fixture.storageDir, fixture.directory), { recursive: true });
+      // Write legacy integer-only format AND keep the per-instance ports dir
+      // empty so the client falls back to the legacy file.
+      writeFileSync(legacyPortPath, String(port), "utf-8");
 
       const client = new AftRpcClient(fixture.storageDir, fixture.directory);
-      // The client must reach the server (parse port + connect), not crash on
-      // missing JSON token. The 403 here proves the legacy parser path works
-      // end-to-end — only the new server's token check rejects, not the client.
+      // The client must parse the integer file without throwing JSON errors,
+      // and the request must reach the server (where it's rejected with 403
+      // because no token was supplied).
       await expect(client.call("echo", {})).rejects.toThrow("403");
     } finally {
-      server.stop();
+      await new Promise<void>((resolve) => tokenRequiredServer.close(() => resolve()));
     }
   });
 

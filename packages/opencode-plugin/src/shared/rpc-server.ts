@@ -1,9 +1,9 @@
 import { randomBytes } from "node:crypto";
 import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { log, warn } from "../logger";
-import { rpcPortFilePath } from "./rpc-utils";
+import { rpcPortFileDir } from "./rpc-utils";
 
 type RpcHandler = (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
@@ -13,9 +13,14 @@ export class AftRpcServer {
   private token: string | null = null;
   private handlers = new Map<string, RpcHandler>();
   private portFilePath: string;
+  private portsDir: string;
+  /** Unique per-instance ID — distinguishes our entry from duplicate plugin loads. */
+  private instanceId: string;
 
   constructor(storageDir: string, directory: string) {
-    this.portFilePath = rpcPortFilePath(storageDir, directory);
+    this.portsDir = rpcPortFileDir(storageDir, directory);
+    this.instanceId = randomBytes(8).toString("hex");
+    this.portFilePath = join(this.portsDir, `${this.instanceId}.json`);
   }
 
   /** Register an RPC method handler. */

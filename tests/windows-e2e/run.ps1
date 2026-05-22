@@ -92,6 +92,27 @@ function LogContains {
     return [bool] (Select-String -Path $Path -Pattern $Pattern -Quiet -ErrorAction SilentlyContinue)
 }
 
+# Read the NDJSON reply with the requested id, skipping any unsolicited push
+# frames (configure_warnings, progress, status_changed, etc.) that arrive
+# before the real response. Throws after $TimeoutSec if no matching reply
+# arrives — same skip-push-frames pattern used by aft-bridge and aft-cli.
+function Read-NdjsonReply {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$ExpectedId,
+        [int]$TimeoutSec = 30
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        $line = $Process.StandardOutput.ReadLine()
+        if (-not $line) { throw "aft stdout closed before reply with id=$ExpectedId" }
+        $parsed = $line | ConvertFrom-Json
+        if ($parsed.id -eq $ExpectedId) { return $parsed }
+        # else: unsolicited push frame, keep reading
+    }
+    throw "timed out waiting for reply with id=$ExpectedId"
+}
+
 # ---------------------------------------------------------------------------
 # Environment validation
 # ---------------------------------------------------------------------------
@@ -437,7 +458,7 @@ function Invoke-AftBgBashScenario {
         } | ConvertTo-Json -Compress
         $proc.StandardInput.WriteLine($configure)
         $proc.StandardInput.Flush()
-        $cfgResponse = $proc.StandardOutput.ReadLine() | ConvertFrom-Json
+        $cfgResponse = Read-NdjsonReply -Process $proc -ExpectedId "bg-configure" -TimeoutSec 30
         if (-not $cfgResponse.success) { throw "configure failed: $($cfgResponse | ConvertTo-Json -Compress)" }
 
         $spawn = @{
@@ -451,14 +472,7 @@ function Invoke-AftBgBashScenario {
         $proc.StandardInput.WriteLine($spawn)
         $proc.StandardInput.Flush()
 
-        # Skip past push frames (configure_warnings) until we see our reply.
-        $deadline = (Get-Date).AddSeconds(10)
-        do {
-            $line = $proc.StandardOutput.ReadLine()
-            if (-not $line) { throw "aft stdout closed before bg-spawn response" }
-            $spawnResponse = $line | ConvertFrom-Json
-        } while ($spawnResponse.id -ne "bg-spawn" -and (Get-Date) -lt $deadline)
-        if ($spawnResponse.id -ne "bg-spawn") { throw "timed out waiting for bg-spawn" }
+        $spawnResponse = Read-NdjsonReply -Process $proc -ExpectedId "bg-spawn" -TimeoutSec 10
         if (-not $spawnResponse.success) { throw "background spawn failed: $($spawnResponse | ConvertTo-Json -Compress)" }
 
         $taskId = [string]$spawnResponse.task_id
@@ -474,14 +488,7 @@ function Invoke-AftBgBashScenario {
         $proc.StandardInput.WriteLine($status)
         $proc.StandardInput.Flush()
 
-        $deadline = (Get-Date).AddSeconds(10)
-        do {
-            $line = $proc.StandardOutput.ReadLine()
-            if (-not $line) { throw "aft stdout closed before status response" }
-            $statusResponse = $line | ConvertFrom-Json
-        } while ($statusResponse.id -ne "bg-status" -and (Get-Date) -lt $deadline)
-
-        if ($statusResponse.id -ne "bg-status") { throw "timed out waiting for bg-status response" }
+        $statusResponse = Read-NdjsonReply -Process $proc -ExpectedId "bg-status" -TimeoutSec 10
         if (-not $statusResponse.success) { throw "bash_status failed: $($statusResponse | ConvertTo-Json -Compress)" }
 
         # Status check: completed for exit==0, failed for non-zero.
@@ -559,7 +566,7 @@ function Invoke-AftNdjsonScenario {
         } | ConvertTo-Json -Compress
         $proc.StandardInput.WriteLine($configure)
         $proc.StandardInput.Flush()
-        $cfgResponse = $proc.StandardOutput.ReadLine() | ConvertFrom-Json
+        $cfgResponse = Read-NdjsonReply -Process $proc -ExpectedId "bg-configure" -TimeoutSec 30
         if (-not $cfgResponse.success) { throw "configure failed: $($cfgResponse | ConvertTo-Json -Compress)" }
 
         $spawn = @{
@@ -573,17 +580,7 @@ function Invoke-AftNdjsonScenario {
         $proc.StandardInput.WriteLine($spawn)
         $proc.StandardInput.Flush()
 
-        # Skip past push frames (configure_warnings, progress, etc.) until
-        # we see our reply with id=bg-spawn. Without this, the very first
-        # ReadLine() may return a configure_warnings push frame from the
-        # earlier configure call, breaking the protocol assertion.
-        $deadline = (Get-Date).AddSeconds(10)
-        do {
-            $line = $proc.StandardOutput.ReadLine()
-            if (-not $line) { throw "aft stdout closed before bg-spawn response" }
-            $spawnResponse = $line | ConvertFrom-Json
-        } while ($spawnResponse.id -ne "bg-spawn" -and (Get-Date) -lt $deadline)
-        if ($spawnResponse.id -ne "bg-spawn") { throw "timed out waiting for bg-spawn response" }
+        $spawnResponse = Read-NdjsonReply -Process $proc -ExpectedId "bg-spawn" -TimeoutSec 10
         if (-not $spawnResponse.success) { throw "background spawn failed: $($spawnResponse | ConvertTo-Json -Compress)" }
 
         $taskId = [string]$spawnResponse.task_id
@@ -599,14 +596,7 @@ function Invoke-AftNdjsonScenario {
         $proc.StandardInput.WriteLine($status)
         $proc.StandardInput.Flush()
 
-        $deadline = (Get-Date).AddSeconds(10)
-        do {
-            $line = $proc.StandardOutput.ReadLine()
-            if (-not $line) { throw "aft stdout closed before status response" }
-            $statusResponse = $line | ConvertFrom-Json
-        } while ($statusResponse.id -ne "bg-status" -and (Get-Date) -lt $deadline)
-
-        if ($statusResponse.id -ne "bg-status") { throw "timed out waiting for bg-status response" }
+        $statusResponse = Read-NdjsonReply -Process $proc -ExpectedId "bg-status" -TimeoutSec 10
         if (-not $statusResponse.success) { throw "bash_status failed: $($statusResponse | ConvertTo-Json -Compress)" }
         if ($statusResponse.status -ne "completed") { throw "expected completed status, got: $($statusResponse | ConvertTo-Json -Compress)" }
 

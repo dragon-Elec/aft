@@ -255,7 +255,14 @@ function runInstall(
       return;
     }
 
-    const child = spawn("npm", ["install", "--no-save", "--ignore-scripts", "--silent", target], {
+    // Windows: Node's child_process.spawn does NOT auto-resolve `.cmd` for
+    // `npm`. The installed npm shim on Windows GitHub runners (and most user
+    // machines) is `npm.cmd`, so spawning `"npm"` directly fails with
+    // ENOENT: no such file or directory, uv_spawn 'npm'. Use `npm.cmd` on
+    // win32. shell: true would also work but enables shell parsing on a
+    // user-supplied `target` semver string — avoid that surface.
+    const npmBin = process.platform === "win32" ? "npm.cmd" : "npm";
+    const child = spawn(npmBin, ["install", "--no-save", "--ignore-scripts", "--silent", target], {
       stdio: ["ignore", "pipe", "pipe"],
       cwd,
     });

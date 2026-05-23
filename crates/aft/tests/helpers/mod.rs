@@ -27,15 +27,14 @@ pub struct AftProcess {
     stdout_trace_log: Option<std::fs::File>,
     stderr_log_path: Option<PathBuf>,
     stderr_capture_thread: Option<std::thread::JoinHandle<String>>,
+    _cache_dir: tempfile::TempDir,
 }
 
 impl AftProcess {
     /// Spawn the aft binary with piped stdin/stdout/stderr.
     /// Sets AFT_CACHE_DIR to a temp path so tests don't pollute the user's cache.
     pub fn spawn() -> Self {
-        let temp_cache =
-            std::env::temp_dir().join(format!("aft-test-cache-{}", std::process::id()));
-        Self::spawn_with_env(&[("AFT_CACHE_DIR", temp_cache.as_os_str())])
+        Self::spawn_inner(&[], false)
     }
 
     /// Spawn the aft binary with additional environment variables.
@@ -54,14 +53,17 @@ impl AftProcess {
         let binary = env!("CARGO_BIN_EXE_aft");
         let diag_enabled =
             std::env::var_os("AFT_TEST_DIAG").as_deref() == Some(std::ffi::OsStr::new("1"));
+        let cache_dir = tempfile::tempdir().expect("create aft test cache dir");
         let mut command = Command::new(binary);
-        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(
-            if pipe_stderr || diag_enabled {
+        command
+            .env("AFT_CACHE_DIR", cache_dir.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(if pipe_stderr || diag_enabled {
                 Stdio::piped()
             } else {
                 Stdio::null()
-            },
-        );
+            });
 
         for (key, value) in envs {
             command.env(key, value);
@@ -113,6 +115,7 @@ impl AftProcess {
             stdout_trace_log,
             stderr_log_path,
             stderr_capture_thread,
+            _cache_dir: cache_dir,
         }
     }
 

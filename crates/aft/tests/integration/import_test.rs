@@ -6,13 +6,12 @@ use aft::parser::LangId;
 use std::fs;
 
 /// Helper: copy a fixture to a uniquely-named temp file for mutation testing.
-fn temp_copy(fixture_name: &str) -> std::path::PathBuf {
+fn temp_copy(fixture_name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let src = fixture_path(fixture_name);
-    let dir = std::env::temp_dir().join("aft_import_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
 
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let (stem, ext) = fixture_name.rsplit_once('.').unwrap_or((fixture_name, ""));
@@ -21,9 +20,9 @@ fn temp_copy(fixture_name: &str) -> std::path::PathBuf {
     } else {
         format!("{}_{}.{}", stem, n, ext)
     };
-    let dest = dir.join(unique);
+    let dest = dir.path().join(unique);
     fs::copy(&src, &dest).unwrap();
-    dest
+    (dir, dest)
 }
 
 /// Helper: send an add_import request and return the response.
@@ -61,7 +60,7 @@ fn send_add_import(
 #[test]
 fn add_import_ts_external_group() {
     let mut aft = AftProcess::spawn();
-    let file = temp_copy("imports_ts.ts");
+    let (_dir, file) = temp_copy("imports_ts.ts");
     let file_str = file.display().to_string();
 
     let resp = send_add_import(
@@ -113,7 +112,7 @@ fn add_import_ts_external_group() {
 #[test]
 fn add_import_ts_relative_group() {
     let mut aft = AftProcess::spawn();
-    let file = temp_copy("imports_ts.ts");
+    let (_dir, file) = temp_copy("imports_ts.ts");
     let file_str = file.display().to_string();
 
     let resp = send_add_import(
@@ -158,7 +157,7 @@ fn add_import_ts_relative_group() {
 #[test]
 fn add_import_ts_dedup() {
     let mut aft = AftProcess::spawn();
-    let file = temp_copy("imports_ts.ts");
+    let (_dir, file) = temp_copy("imports_ts.ts");
     let file_str = file.display().to_string();
 
     // Try to add useState which already exists in the fixture
@@ -191,7 +190,7 @@ fn add_import_ts_dedup() {
 #[test]
 fn add_import_ts_alphabetizes() {
     let mut aft = AftProcess::spawn();
-    let file = temp_copy("imports_ts.ts");
+    let (_dir, file) = temp_copy("imports_ts.ts");
     let file_str = file.display().to_string();
 
     // Add 'axios' which should sort before 'react' and after nothing (first external)
@@ -226,7 +225,7 @@ fn add_import_ts_alphabetizes() {
 #[test]
 fn add_import_js_works() {
     let mut aft = AftProcess::spawn();
-    let file = temp_copy("imports_js.js");
+    let (_dir, file) = temp_copy("imports_js.js");
     let file_str = file.display().to_string();
 
     let resp = send_add_import(
@@ -266,10 +265,9 @@ fn add_import_empty_file() {
     static EMPTY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_import_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let n = EMPTY_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let file = dir.join(format!("empty_{}.ts", n));
+    let file = dir.path().join(format!("empty_{}.ts", n));
     fs::write(&file, "").unwrap();
     let file_str = file.display().to_string();
 
@@ -327,10 +325,9 @@ fn add_import_unsupported_language_returns_error() {
     static UNSUP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_import_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let n = UNSUP_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let file = dir.join(format!("test_{}.txt", n));
+    let file = dir.path().join(format!("test_{}.txt", n));
     fs::write(&file, "hello world").unwrap();
     let file_str = file.display().to_string();
 
@@ -376,7 +373,7 @@ fn add_import_missing_params_returns_error() {
 #[test]
 fn add_import_py_stdlib_group() {
     let mut aft = AftProcess::spawn();
-    let file = temp_copy("imports_py.py");
+    let (_dir, file) = temp_copy("imports_py.py");
     let file_str = file.display().to_string();
 
     let resp = send_add_import(
@@ -419,7 +416,7 @@ fn add_import_py_stdlib_group() {
 #[test]
 fn add_import_py_third_party_group() {
     let mut aft = AftProcess::spawn();
-    let file = temp_copy("imports_py.py");
+    let (_dir, file) = temp_copy("imports_py.py");
     let file_str = file.display().to_string();
 
     let resp = send_add_import(&mut aft, "py-2", &file_str, "click", None, None, false);
@@ -459,7 +456,7 @@ fn add_import_py_third_party_group() {
 #[test]
 fn add_import_py_local_group() {
     let mut aft = AftProcess::spawn();
-    let file = temp_copy("imports_py.py");
+    let (_dir, file) = temp_copy("imports_py.py");
     let file_str = file.display().to_string();
 
     let resp = send_add_import(
@@ -502,7 +499,7 @@ fn add_import_py_local_group() {
 #[test]
 fn add_import_py_dedup() {
     let mut aft = AftProcess::spawn();
-    let file = temp_copy("imports_py.py");
+    let (_dir, file) = temp_copy("imports_py.py");
     let file_str = file.display().to_string();
 
     // Try to add 'os' which already exists
@@ -521,7 +518,7 @@ fn add_import_py_dedup() {
 #[test]
 fn add_import_rs_std_group() {
     let mut aft = AftProcess::spawn();
-    let file = temp_copy("imports_rs.rs");
+    let (_dir, file) = temp_copy("imports_rs.rs");
     let file_str = file.display().to_string();
 
     let resp = send_add_import(
@@ -564,7 +561,7 @@ fn add_import_rs_std_group() {
 #[test]
 fn add_import_rs_external_group() {
     let mut aft = AftProcess::spawn();
-    let file = temp_copy("imports_rs.rs");
+    let (_dir, file) = temp_copy("imports_rs.rs");
     let file_str = file.display().to_string();
 
     let resp = send_add_import(
@@ -609,7 +606,7 @@ fn add_import_rs_external_group() {
 #[test]
 fn add_import_rs_dedup() {
     let mut aft = AftProcess::spawn();
-    let file = temp_copy("imports_rs.rs");
+    let (_dir, file) = temp_copy("imports_rs.rs");
     let file_str = file.display().to_string();
 
     // Try to add std::collections::HashMap which already exists
@@ -636,7 +633,7 @@ fn add_import_rs_dedup() {
 #[test]
 fn add_import_go_stdlib_group() {
     let mut aft = AftProcess::spawn();
-    let file = temp_copy("imports_go.go");
+    let (_dir, file) = temp_copy("imports_go.go");
     let file_str = file.display().to_string();
 
     let resp = send_add_import(&mut aft, "go-1", &file_str, "net/http", None, None, false);
@@ -663,7 +660,7 @@ fn add_import_go_stdlib_group() {
 #[test]
 fn add_import_go_external_group() {
     let mut aft = AftProcess::spawn();
-    let file = temp_copy("imports_go.go");
+    let (_dir, file) = temp_copy("imports_go.go");
     let file_str = file.display().to_string();
 
     let resp = send_add_import(
@@ -698,7 +695,7 @@ fn add_import_go_external_group() {
 #[test]
 fn add_import_go_dedup() {
     let mut aft = AftProcess::spawn();
-    let file = temp_copy("imports_go.go");
+    let (_dir, file) = temp_copy("imports_go.go");
     let file_str = file.display().to_string();
 
     // Try to add "fmt" which already exists
@@ -752,7 +749,7 @@ fn send_organize_imports(aft: &mut AftProcess, id: &str, file: &str) -> serde_js
 #[test]
 fn remove_import_entire_statement_ts() {
     let mut aft = AftProcess::spawn();
-    let file = temp_copy("imports_ts.ts");
+    let (_dir, file) = temp_copy("imports_ts.ts");
     let file_str = file.display().to_string();
 
     // Remove the 'zod' import entirely
@@ -787,7 +784,7 @@ fn remove_import_entire_statement_ts() {
 #[test]
 fn remove_import_specific_name_from_multi_ts() {
     let mut aft = AftProcess::spawn();
-    let file = temp_copy("imports_ts.ts");
+    let (_dir, file) = temp_copy("imports_ts.ts");
     let file_str = file.display().to_string();
 
     // Remove 'useState' from `import { useState, useEffect } from 'react';`
@@ -824,7 +821,7 @@ fn remove_import_specific_name_from_multi_ts() {
 #[test]
 fn remove_import_missing_module_reports_not_removed() {
     let mut aft = AftProcess::spawn();
-    let file = temp_copy("imports_ts.ts");
+    let (_dir, file) = temp_copy("imports_ts.ts");
     let file_str = file.display().to_string();
 
     let resp = send_remove_import(&mut aft, "rm-3", &file_str, "nonexistent-module", None);
@@ -843,9 +840,8 @@ fn remove_import_preserves_default_when_named_removed() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_import_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let file = dir.join(format!(
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(format!(
         "remove_default_named_{}.ts",
         COUNTER.fetch_add(1, Ordering::SeqCst)
     ));
@@ -887,10 +883,9 @@ fn organize_imports_ts_regroups_and_sorts() {
     static ORG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_import_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let n = ORG_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let file = dir.join(format!("organize_ts_{}.ts", n));
+    let file = dir.path().join(format!("organize_ts_{}.ts", n));
 
     // Write a scrambled import file
     fs::write(
@@ -947,9 +942,8 @@ fn organize_imports_preserves_side_effect_order() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_import_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let file = dir.join(format!(
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(format!(
         "organize_side_effects_{}.ts",
         COUNTER.fetch_add(1, Ordering::SeqCst)
     ));
@@ -991,9 +985,8 @@ fn organize_imports_go_grouped_block_parses() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_import_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let file = dir.join(format!(
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(format!(
         "organize_go_grouped_{}.go",
         COUNTER.fetch_add(1, Ordering::SeqCst)
     ));
@@ -1029,10 +1022,9 @@ fn organize_imports_ts_deduplicates() {
     static DEDUP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_import_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let n = DEDUP_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let file = dir.join(format!("organize_dedup_{}.ts", n));
+    let file = dir.path().join(format!("organize_dedup_{}.ts", n));
 
     // Write a file with duplicate imports
     fs::write(
@@ -1088,10 +1080,9 @@ fn organize_imports_py_isort_grouping() {
     static PY_ORG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_import_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let n = PY_ORG_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let file = dir.join(format!("organize_py_{}.py", n));
+    let file = dir.path().join(format!("organize_py_{}.py", n));
 
     // Write a scrambled Python import file (wrong order: local, external, stdlib)
     fs::write(
@@ -1156,10 +1147,9 @@ fn organize_imports_rs_merges_common_prefix() {
     static RS_ORG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_import_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let n = RS_ORG_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let file = dir.join(format!("organize_rs_{}.rs", n));
+    let file = dir.path().join(format!("organize_rs_{}.rs", n));
 
     // Write Rust file with separate use declarations that share a common prefix
     fs::write(
@@ -1221,10 +1211,9 @@ fn organize_imports_rs_preserves_pub_use_and_private_use_pair() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_import_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let file = dir.join(format!("organize_rs_pub_private_{}.rs", n));
+    let file = dir.path().join(format!("organize_rs_pub_private_{}.rs", n));
 
     fs::write(
         &file,
@@ -1272,10 +1261,9 @@ fn organize_imports_ts_preserves_named_aliases() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_import_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let file = dir.join(format!("alias_ts_{}.ts", n));
+    let file = dir.path().join(format!("alias_ts_{}.ts", n));
 
     fs::write(
         &file,
@@ -1309,10 +1297,9 @@ fn organize_imports_ts_preserves_per_name_type_prefix() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_import_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let file = dir.join(format!("typeprefix_ts_{}.ts", n));
+    let file = dir.path().join(format!("typeprefix_ts_{}.ts", n));
 
     fs::write(
         &file,
@@ -1357,10 +1344,9 @@ fn organize_imports_ts_aliased_and_bare_are_not_duplicates() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_import_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let file = dir.join(format!("alias_dedup_ts_{}.ts", n));
+    let file = dir.path().join(format!("alias_dedup_ts_{}.ts", n));
 
     fs::write(
         &file,
@@ -1398,10 +1384,11 @@ fn organize_imports_ts_preserves_namespace_and_side_effect_imports() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_import_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let file = dir.join(format!("namespace_side_effect_ts_{}.ts", n));
+    let file = dir
+        .path()
+        .join(format!("namespace_side_effect_ts_{}.ts", n));
 
     fs::write(
         &file,
@@ -1436,10 +1423,11 @@ fn organize_imports_ts_preserves_side_effect_and_namespace_imports_reverse_order
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_import_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let file = dir.join(format!("side_effect_namespace_ts_{}.ts", n));
+    let file = dir
+        .path()
+        .join(format!("side_effect_namespace_ts_{}.ts", n));
 
     fs::write(
         &file,
@@ -1474,10 +1462,9 @@ fn organize_imports_ts_dedupes_identical_namespace_imports() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_import_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let file = dir.join(format!("namespace_dedup_ts_{}.ts", n));
+    let file = dir.path().join(format!("namespace_dedup_ts_{}.ts", n));
 
     fs::write(
         &file,
@@ -1509,10 +1496,9 @@ fn organize_imports_ts_keeps_distinct_namespace_aliases() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_import_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let file = dir.join(format!("namespace_aliases_ts_{}.ts", n));
+    let file = dir.path().join(format!("namespace_aliases_ts_{}.ts", n));
 
     fs::write(
         &file,
@@ -1548,10 +1534,9 @@ fn organize_imports_ts_sorts_named_specifiers_by_imported_name() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_import_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let file = dir.join(format!("specifier_sort_ts_{}.ts", n));
+    let file = dir.path().join(format!("specifier_sort_ts_{}.ts", n));
 
     fs::write(
         &file,

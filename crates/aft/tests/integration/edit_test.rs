@@ -55,9 +55,8 @@ fn path_with_node_bin(dir: &std::path::Path) -> std::ffi::OsString {
 #[test]
 fn write_creates_new_file() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("write_new.txt");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("write_new.txt");
     // Ensure file doesn't exist
     let _ = fs::remove_file(&target);
 
@@ -91,9 +90,8 @@ fn write_creates_new_file() {
 #[test]
 fn write_backups_existing_file() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("write_backup.txt");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("write_backup.txt");
     fs::write(&target, "original content").unwrap();
 
     // Overwrite via write command
@@ -133,9 +131,8 @@ fn write_backups_existing_file() {
 #[test]
 fn write_syntax_valid() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("write_valid.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("write_valid.ts");
     let _ = fs::remove_file(&target);
 
     let resp = aft.send(&format!(
@@ -157,9 +154,8 @@ fn write_syntax_valid() {
 #[test]
 fn write_syntax_invalid() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("write_invalid.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("write_invalid.ts");
     let _ = fs::remove_file(&target);
 
     let resp = aft.send(&format!(
@@ -186,9 +182,8 @@ fn write_syntax_invalid() {
 #[test]
 fn single_file_write_rolls_back_on_invalid_syntax() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("write_rollback_valid_to_invalid.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("write_rollback_valid_to_invalid.ts");
     let original = "export function ok(): string { return \"ok\"; }\n";
     fs::write(&target, original).unwrap();
 
@@ -217,9 +212,8 @@ fn single_file_write_rolls_back_on_invalid_syntax() {
 #[test]
 fn single_file_write_does_not_rollback_when_pre_was_invalid() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("write_no_rollback_pre_invalid.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("write_no_rollback_pre_invalid.ts");
     fs::write(&target, "export function { already broken\n").unwrap();
     let replacement = "export const = still_broken\n";
 
@@ -248,9 +242,8 @@ fn single_file_write_does_not_rollback_when_pre_was_invalid() {
 #[test]
 fn single_file_write_does_not_rollback_when_new_file() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("write_no_rollback_new_invalid.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("write_no_rollback_new_invalid.ts");
     let _ = fs::remove_file(&target);
 
     let req = serde_json::json!({
@@ -284,9 +277,8 @@ fn single_file_write_does_not_rollback_when_new_file() {
 #[test]
 fn edit_symbol_replace() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("edit_replace.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("edit_replace.ts");
 
     // Copy fixture
     let fixture = fixture_path("sample.ts");
@@ -336,9 +328,8 @@ fn edit_symbol_replace() {
 #[test]
 fn edit_symbol_delete() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("edit_delete.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("edit_delete.ts");
 
     // Copy fixture
     let fixture = fixture_path("sample.ts");
@@ -375,9 +366,8 @@ fn edit_symbol_delete() {
 #[test]
 fn edit_symbol_ambiguous() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("edit_ambig.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("edit_ambig.ts");
 
     // Copy ambiguous fixture
     let fixture = fixture_path("ambiguous.ts");
@@ -452,9 +442,8 @@ fn edit_symbol_not_found() {
 #[test]
 fn edit_match_single_occurrence() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("match_single.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("match_single.ts");
 
     // Copy fixture
     let fixture = fixture_path("sample.ts");
@@ -623,9 +612,8 @@ fn edit_match_inline_lsp_diagnostics_respects_wait_ms() {
 #[test]
 fn edit_match_multiple_occurrences_returns_candidates() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("match_ambig.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("match_ambig.ts");
 
     // Write a file with a repeated string
     let content = "const a = \"hello\";\nconst b = \"hello\";\nconst c = \"world\";\n";
@@ -673,9 +661,8 @@ fn edit_match_multiple_occurrences_returns_candidates() {
 #[test]
 fn edit_match_with_occurrence_selector() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("match_occ.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("match_occ.ts");
 
     // Write a file with a repeated string
     let content = "const a = \"hello\";\nconst b = \"hello\";\nconst c = \"world\";\n";
@@ -747,9 +734,8 @@ fn edit_match_no_match() {
 #[test]
 fn batch_multiple_edits() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("batch_multi.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_multi.ts");
 
     let content = "const greeting = \"hello\";\nconst farewell = \"goodbye\";\nconst count = 42;\n";
     fs::write(&target, content).unwrap();
@@ -793,9 +779,8 @@ fn batch_multiple_edits() {
 #[test]
 fn batch_rollback_on_failure() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("batch_rollback.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_rollback.ts");
 
     let content = "const greeting = \"hello\";\nconst count = 42;\n";
     fs::write(&target, content).unwrap();
@@ -830,9 +815,8 @@ fn batch_rollback_on_failure() {
 #[test]
 fn batch_fuzzy_match() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("batch_fuzzy.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_fuzzy.ts");
 
     // Source has specific whitespace; edits use slightly different whitespace
     let content = "function greet() {\n    console.log(\"hello\");  \n    return true;\n}\n";
@@ -877,9 +861,8 @@ fn batch_fuzzy_match() {
 #[test]
 fn batch_line_range_edit() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("batch_linerange.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_linerange.ts");
 
     let content = "line zero\nline one\nline two\nline three\n";
     fs::write(&target, content).unwrap();
@@ -922,9 +905,8 @@ fn batch_line_range_edit() {
 #[test]
 fn batch_with_undo() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("batch_undo.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_undo.ts");
 
     let original = "const x = 1;\nconst y = 2;\n";
     fs::write(&target, original).unwrap();
@@ -1512,9 +1494,8 @@ exit 0
 #[test]
 fn edit_match_no_op_when_old_string_equals_new_string() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_no_op_identity");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("identity.txt");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("identity.txt");
     fs::write(&target, "hello world\nfoo bar\n").unwrap();
     let original = fs::read(&target).unwrap();
 
@@ -1548,9 +1529,8 @@ fn edit_match_no_op_when_old_string_equals_new_string() {
 #[test]
 fn edit_match_no_op_absent_when_real_change_applied() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_no_op_real");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("real_change.txt");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("real_change.txt");
     fs::write(&target, "hello world\nfoo bar\n").unwrap();
 
     let req = serde_json::json!({
@@ -1580,9 +1560,8 @@ fn edit_match_no_op_absent_when_real_change_applied() {
 #[test]
 fn write_no_op_when_content_identical_to_existing_file() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_no_op_write_same");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("same.txt");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("same.txt");
     let body = "identical content\n";
     fs::write(&target, body).unwrap();
 
@@ -1614,9 +1593,8 @@ fn write_no_op_absent_when_file_created() {
     // Creating a new file is not a "no-op" — there was no pre-state to compare
     // against. `created: true` is the signal; `no_op` should be unset.
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_no_op_write_new");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("brand_new.txt");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("brand_new.txt");
     let _ = fs::remove_file(&target);
 
     let req = serde_json::json!({
@@ -1643,9 +1621,8 @@ fn write_no_op_absent_when_file_created() {
 #[test]
 fn write_no_op_absent_when_content_actually_differs() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_no_op_write_diff");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("differs.txt");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("differs.txt");
     fs::write(&target, "original\n").unwrap();
 
     let req = serde_json::json!({

@@ -9,14 +9,13 @@ fn edit_symbol_with_lsp_hints_disambiguates() {
 
     // Copy fixture to temp dir so we don't mutate the original
     let fixture = fixture_path("ambiguous.ts");
-    let dir = std::env::temp_dir().join("aft-lsp-hints-test");
-    let _ = std::fs::create_dir_all(&dir);
-    let target = dir.join("ambiguous.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("ambiguous.ts");
     std::fs::copy(&fixture, &target).unwrap();
 
     let resp = aft.send(&format!(
         r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
-        dir.display()
+        dir.path().display()
     ));
     assert_eq!(resp["success"], true, "configure failed: {:?}", resp);
 
@@ -34,7 +33,6 @@ fn edit_symbol_with_lsp_hints_disambiguates() {
     assert_eq!(resp["success"], true, "expected success, got: {:?}", resp);
     assert_eq!(resp["symbol"], "process");
 
-    let _ = std::fs::remove_dir_all(&dir);
     aft.shutdown();
 }
 

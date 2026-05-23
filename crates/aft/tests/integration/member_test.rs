@@ -5,13 +5,12 @@ use std::fs;
 use super::helpers::{fixture_path, AftProcess};
 
 /// Helper: copy a fixture to a uniquely-named temp file for mutation testing.
-fn temp_copy(fixture_name: &str) -> std::path::PathBuf {
+fn temp_copy(fixture_name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let src = fixture_path(fixture_name);
-    let dir = std::env::temp_dir().join("aft_member_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
 
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let (stem, ext) = fixture_name.rsplit_once('.').unwrap_or((fixture_name, ""));
@@ -20,9 +19,9 @@ fn temp_copy(fixture_name: &str) -> std::path::PathBuf {
     } else {
         format!("{}_{}.{}", stem, n, ext)
     };
-    let dest = dir.join(unique);
+    let dest = dir.path().join(unique);
     fs::copy(&src, &dest).unwrap();
-    dest
+    (dir, dest)
 }
 
 /// Helper: send an add_member request and return the response.
@@ -53,7 +52,7 @@ fn send_add_member(
 
 #[test]
 fn add_member_ts_class_last() {
-    let tmp = temp_copy("member_ts.ts");
+    let (_dir, tmp) = temp_copy("member_ts.ts");
     let mut aft = AftProcess::spawn();
 
     let resp = send_add_member(
@@ -85,7 +84,7 @@ fn add_member_ts_class_last() {
 
 #[test]
 fn add_member_ts_class_first() {
-    let tmp = temp_copy("member_ts.ts");
+    let (_dir, tmp) = temp_copy("member_ts.ts");
     let mut aft = AftProcess::spawn();
 
     let resp = send_add_member(
@@ -119,7 +118,7 @@ fn add_member_ts_class_first() {
 
 #[test]
 fn add_member_ts_after_name() {
-    let tmp = temp_copy("member_ts.ts");
+    let (_dir, tmp) = temp_copy("member_ts.ts");
     let mut aft = AftProcess::spawn();
 
     let resp = send_add_member(
@@ -153,7 +152,7 @@ fn add_member_ts_after_name() {
 
 #[test]
 fn add_member_ts_empty_class() {
-    let tmp = temp_copy("member_ts.ts");
+    let (_dir, tmp) = temp_copy("member_ts.ts");
     let mut aft = AftProcess::spawn();
 
     let resp = send_add_member(
@@ -180,7 +179,7 @@ fn add_member_ts_empty_class() {
 
 #[test]
 fn add_member_py_class_last() {
-    let tmp = temp_copy("member_py.py");
+    let (_dir, tmp) = temp_copy("member_py.py");
     let mut aft = AftProcess::spawn();
 
     let resp = send_add_member(
@@ -211,7 +210,7 @@ fn add_member_py_class_last() {
 
 #[test]
 fn add_member_py_indentation_matches() {
-    let tmp = temp_copy("member_py.py");
+    let (_dir, tmp) = temp_copy("member_py.py");
     let mut aft = AftProcess::spawn();
 
     let resp = send_add_member(
@@ -246,7 +245,7 @@ fn add_member_py_indentation_matches() {
 
 #[test]
 fn add_member_rs_struct_field() {
-    let tmp = temp_copy("member_rs.rs");
+    let (_dir, tmp) = temp_copy("member_rs.rs");
     let mut aft = AftProcess::spawn();
 
     // Use EmptyStruct which has no impl block — struct is the only match
@@ -278,7 +277,7 @@ fn add_member_rs_struct_field() {
 
 #[test]
 fn add_member_rs_impl_method() {
-    let tmp = temp_copy("member_rs.rs");
+    let (_dir, tmp) = temp_copy("member_rs.rs");
     let mut aft = AftProcess::spawn();
 
     // Config has both struct and impl — impl is preferred
@@ -312,7 +311,7 @@ fn add_member_rs_impl_method() {
 
 #[test]
 fn add_member_go_struct_field() {
-    let tmp = temp_copy("member_go.go");
+    let (_dir, tmp) = temp_copy("member_go.go");
     let mut aft = AftProcess::spawn();
 
     let resp = send_add_member(
@@ -337,7 +336,7 @@ fn add_member_go_struct_field() {
 
 #[test]
 fn add_member_go_empty_struct() {
-    let tmp = temp_copy("member_go.go");
+    let (_dir, tmp) = temp_copy("member_go.go");
     let mut aft = AftProcess::spawn();
 
     let resp = send_add_member(
@@ -364,7 +363,7 @@ fn add_member_go_empty_struct() {
 
 #[test]
 fn add_member_scope_not_found() {
-    let tmp = temp_copy("member_ts.ts");
+    let (_dir, tmp) = temp_copy("member_ts.ts");
     let mut aft = AftProcess::spawn();
 
     let resp = send_add_member(
@@ -389,7 +388,7 @@ fn add_member_scope_not_found() {
 
 #[test]
 fn add_member_member_not_found() {
-    let tmp = temp_copy("member_ts.ts");
+    let (_dir, tmp) = temp_copy("member_ts.ts");
     let mut aft = AftProcess::spawn();
 
     let resp = send_add_member(

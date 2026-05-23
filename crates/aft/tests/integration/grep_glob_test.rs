@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -36,6 +36,29 @@ fn configure_with_index(aft: &mut AftProcess, root: &Path) {
 
 fn send(aft: &mut AftProcess, request: Value) -> Value {
     aft.send(&serde_json::to_string(&request).expect("serialize request"))
+}
+
+fn wait_for_index_ready<F>(aft: &mut AftProcess, mut request: F) -> Value
+where
+    F: FnMut() -> Value,
+{
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_response = None;
+
+    while Instant::now() < deadline {
+        let response = send(aft, request());
+        if response["index_status"] == "Ready" {
+            return response;
+        }
+
+        last_response = Some(response);
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    panic!(
+        "search index should become ready within 10s; last response: {:?}",
+        last_response
+    );
 }
 
 #[test]
@@ -211,27 +234,14 @@ fn grep_uses_index_when_configured() {
     let mut aft = AftProcess::spawn();
     configure_with_index(&mut aft, project.path());
 
-    let mut ready_response = None;
-    for _ in 0..20 {
-        let response = send(
-            &mut aft,
-            json!({
-                "id": "grep-indexed",
-                "command": "grep",
-                "pattern": "needle",
-                "include": ["src/**/*.rs"],
-            }),
-        );
-
-        if response["index_status"] == "Ready" {
-            ready_response = Some(response);
-            break;
-        }
-
-        thread::sleep(Duration::from_millis(50));
-    }
-
-    let response = ready_response.expect("search index should become ready");
+    let response = wait_for_index_ready(&mut aft, || {
+        json!({
+            "id": "grep-indexed",
+            "command": "grep",
+            "pattern": "needle",
+            "include": ["src/**/*.rs"],
+        })
+    });
     assert_eq!(
         response["success"], true,
         "indexed grep should succeed: {response:?}"
@@ -373,26 +383,13 @@ fn grep_indexed_supports_line_anchors() {
     let mut aft = AftProcess::spawn();
     configure_with_index(&mut aft, project.path());
 
-    let mut ready_response = None;
-    for _ in 0..20 {
-        let response = send(
-            &mut aft,
-            json!({
-                "id": "grep-anchor-indexed",
-                "command": "grep",
-                "pattern": "^## ",
-            }),
-        );
-
-        if response["index_status"] == "Ready" {
-            ready_response = Some(response);
-            break;
-        }
-
-        thread::sleep(Duration::from_millis(50));
-    }
-
-    let response = ready_response.expect("search index should become ready");
+    let response = wait_for_index_ready(&mut aft, || {
+        json!({
+            "id": "grep-anchor-indexed",
+            "command": "grep",
+            "pattern": "^## ",
+        })
+    });
     assert_eq!(
         response["success"], true,
         "indexed grep should succeed: {response:?}"

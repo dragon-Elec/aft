@@ -6,13 +6,12 @@ use std::fs;
 use super::helpers::{fixture_path, AftProcess};
 
 /// Helper: copy a fixture to a uniquely-named temp file for mutation testing.
-fn temp_copy(fixture_name: &str) -> std::path::PathBuf {
+fn temp_copy(fixture_name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let src = fixture_path(fixture_name);
-    let dir = std::env::temp_dir().join("aft_structure_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
 
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let (stem, ext) = fixture_name.rsplit_once('.').unwrap_or((fixture_name, ""));
@@ -21,9 +20,9 @@ fn temp_copy(fixture_name: &str) -> std::path::PathBuf {
     } else {
         format!("{}_{}.{}", stem, n, ext)
     };
-    let dest = dir.join(unique);
+    let dest = dir.path().join(unique);
     fs::copy(&src, &dest).unwrap();
-    dest
+    (dir, dest)
 }
 
 // ============================================================
@@ -49,7 +48,7 @@ fn send_add_derive(
 
 #[test]
 fn add_derive_append_to_existing() {
-    let tmp = temp_copy("structure_rs.rs");
+    let (_dir, tmp) = temp_copy("structure_rs.rs");
     let file = tmp.to_str().unwrap();
     let mut aft = AftProcess::spawn();
 
@@ -71,7 +70,7 @@ fn add_derive_append_to_existing() {
 
 #[test]
 fn add_derive_create_new() {
-    let tmp = temp_copy("structure_rs.rs");
+    let (_dir, tmp) = temp_copy("structure_rs.rs");
     let file = tmp.to_str().unwrap();
     let mut aft = AftProcess::spawn();
 
@@ -91,7 +90,7 @@ fn add_derive_create_new() {
 
 #[test]
 fn add_derive_dedup_existing() {
-    let tmp = temp_copy("structure_rs.rs");
+    let (_dir, tmp) = temp_copy("structure_rs.rs");
     let file = tmp.to_str().unwrap();
     let mut aft = AftProcess::spawn();
 
@@ -124,7 +123,7 @@ fn add_derive_dedup_existing() {
 
 #[test]
 fn add_derive_enum() {
-    let tmp = temp_copy("structure_rs.rs");
+    let (_dir, tmp) = temp_copy("structure_rs.rs");
     let file = tmp.to_str().unwrap();
     let mut aft = AftProcess::spawn();
 
@@ -144,7 +143,7 @@ fn add_derive_enum() {
 
 #[test]
 fn add_derive_target_not_found() {
-    let tmp = temp_copy("structure_rs.rs");
+    let (_dir, tmp) = temp_copy("structure_rs.rs");
     let file = tmp.to_str().unwrap();
     let mut aft = AftProcess::spawn();
 
@@ -179,7 +178,7 @@ fn send_wrap_try_catch(
 
 #[test]
 fn wrap_try_catch_simple_function() {
-    let tmp = temp_copy("structure_ts.ts");
+    let (_dir, tmp) = temp_copy("structure_ts.ts");
     let file = tmp.to_str().unwrap();
     let mut aft = AftProcess::spawn();
 
@@ -208,7 +207,7 @@ fn wrap_try_catch_simple_function() {
 
 #[test]
 fn wrap_try_catch_method_in_class() {
-    let tmp = temp_copy("structure_ts.ts");
+    let (_dir, tmp) = temp_copy("structure_ts.ts");
     let file = tmp.to_str().unwrap();
     let mut aft = AftProcess::spawn();
 
@@ -233,7 +232,7 @@ fn wrap_try_catch_method_in_class() {
 
 #[test]
 fn wrap_try_catch_target_not_found() {
-    let tmp = temp_copy("structure_ts.ts");
+    let (_dir, tmp) = temp_copy("structure_ts.ts");
     let file = tmp.to_str().unwrap();
     let mut aft = AftProcess::spawn();
 
@@ -245,7 +244,7 @@ fn wrap_try_catch_target_not_found() {
 
 #[test]
 fn wrap_try_catch_custom_catch_body() {
-    let tmp = temp_copy("structure_ts.ts");
+    let (_dir, tmp) = temp_copy("structure_ts.ts");
     let file = tmp.to_str().unwrap();
     let mut aft = AftProcess::spawn();
 
@@ -284,7 +283,7 @@ fn send_add_decorator(
 
 #[test]
 fn add_decorator_to_plain_function() {
-    let tmp = temp_copy("structure_py.py");
+    let (_dir, tmp) = temp_copy("structure_py.py");
     let file = tmp.to_str().unwrap();
     let mut aft = AftProcess::spawn();
 
@@ -303,7 +302,7 @@ fn add_decorator_to_plain_function() {
 
 #[test]
 fn add_decorator_to_decorated_function_first() {
-    let tmp = temp_copy("structure_py.py");
+    let (_dir, tmp) = temp_copy("structure_py.py");
     let file = tmp.to_str().unwrap();
     let mut aft = AftProcess::spawn();
 
@@ -332,7 +331,7 @@ fn add_decorator_to_decorated_function_first() {
 
 #[test]
 fn add_decorator_to_decorated_function_last() {
-    let tmp = temp_copy("structure_py.py");
+    let (_dir, tmp) = temp_copy("structure_py.py");
     let file = tmp.to_str().unwrap();
     let mut aft = AftProcess::spawn();
 
@@ -353,7 +352,7 @@ fn add_decorator_to_decorated_function_last() {
 
 #[test]
 fn add_decorator_preserves_indentation() {
-    let tmp = temp_copy("structure_py.py");
+    let (_dir, tmp) = temp_copy("structure_py.py");
     let file = tmp.to_str().unwrap();
     let mut aft = AftProcess::spawn();
 
@@ -374,7 +373,7 @@ fn add_decorator_preserves_indentation() {
 
 #[test]
 fn add_decorator_target_not_found() {
-    let tmp = temp_copy("structure_py.py");
+    let (_dir, tmp) = temp_copy("structure_py.py");
     let file = tmp.to_str().unwrap();
     let mut aft = AftProcess::spawn();
 
@@ -411,7 +410,7 @@ fn send_add_struct_tags(
 
 #[test]
 fn add_struct_tags_no_existing_tag() {
-    let tmp = temp_copy("structure_go.go");
+    let (_dir, tmp) = temp_copy("structure_go.go");
     let file = tmp.to_str().unwrap();
     let mut aft = AftProcess::spawn();
 
@@ -430,7 +429,7 @@ fn add_struct_tags_no_existing_tag() {
 
 #[test]
 fn add_struct_tags_with_existing_tags() {
-    let tmp = temp_copy("structure_go.go");
+    let (_dir, tmp) = temp_copy("structure_go.go");
     let file = tmp.to_str().unwrap();
     let mut aft = AftProcess::spawn();
 
@@ -450,7 +449,7 @@ fn add_struct_tags_with_existing_tags() {
 
 #[test]
 fn add_struct_tags_update_existing_value() {
-    let tmp = temp_copy("structure_go.go");
+    let (_dir, tmp) = temp_copy("structure_go.go");
     let file = tmp.to_str().unwrap();
     let mut aft = AftProcess::spawn();
 
@@ -482,7 +481,7 @@ fn add_struct_tags_update_existing_value() {
 
 #[test]
 fn add_struct_tags_preserves_other_keys() {
-    let tmp = temp_copy("structure_go.go");
+    let (_dir, tmp) = temp_copy("structure_go.go");
     let file = tmp.to_str().unwrap();
     let mut aft = AftProcess::spawn();
 
@@ -500,7 +499,7 @@ fn add_struct_tags_preserves_other_keys() {
 
 #[test]
 fn add_struct_tags_struct_not_found() {
-    let tmp = temp_copy("structure_go.go");
+    let (_dir, tmp) = temp_copy("structure_go.go");
     let file = tmp.to_str().unwrap();
     let mut aft = AftProcess::spawn();
 
@@ -512,7 +511,7 @@ fn add_struct_tags_struct_not_found() {
 
 #[test]
 fn add_struct_tags_field_not_found() {
-    let tmp = temp_copy("structure_go.go");
+    let (_dir, tmp) = temp_copy("structure_go.go");
     let file = tmp.to_str().unwrap();
     let mut aft = AftProcess::spawn();
 

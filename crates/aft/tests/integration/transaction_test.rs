@@ -76,12 +76,11 @@ fn wait_for_publish(ctx: &AppContext) {
 #[test]
 fn transaction_success_three_files() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_transaction_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
 
-    let f1 = dir.join("txn_ok_1.ts");
-    let f2 = dir.join("txn_ok_2.ts");
-    let f3 = dir.join("txn_ok_3.ts");
+    let f1 = dir.path().join("txn_ok_1.ts");
+    let f2 = dir.path().join("txn_ok_2.ts");
+    let f3 = dir.path().join("txn_ok_3.ts");
 
     fs::write(&f1, "const a = 1;\n").unwrap();
     fs::write(&f2, "const b = 2;\n").unwrap();
@@ -228,12 +227,11 @@ fn transaction_rollback_restores_first_config_and_sends_no_lsp_notification() {
 #[test]
 fn transaction_rollback_syntax_error() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_transaction_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
 
-    let f1 = dir.join("txn_rb_1.ts");
-    let f2 = dir.join("txn_rb_2.ts");
-    let f3 = dir.join("txn_rb_3.ts");
+    let f1 = dir.path().join("txn_rb_1.ts");
+    let f2 = dir.path().join("txn_rb_2.ts");
+    let f3 = dir.path().join("txn_rb_3.ts");
 
     let orig1 = "const a = 1;\n";
     let orig2 = "const b = 2;\n";
@@ -301,12 +299,11 @@ fn transaction_rollback_syntax_error() {
 #[test]
 fn transaction_rollback_new_file() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_transaction_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
 
-    let existing = dir.join("txn_new_existing.ts");
-    let new_file = dir.join("txn_new_created.ts");
-    let bad_file = dir.join("txn_new_bad.ts");
+    let existing = dir.path().join("txn_new_existing.ts");
+    let new_file = dir.path().join("txn_new_created.ts");
+    let bad_file = dir.path().join("txn_new_bad.ts");
 
     let orig = "const x = 1;\n";
     fs::write(&existing, orig).unwrap();
@@ -353,11 +350,10 @@ fn transaction_rollback_new_file() {
 #[test]
 fn transaction_edit_match_operation() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_transaction_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
 
-    let f1 = dir.join("txn_em_1.ts");
-    let f2 = dir.join("txn_em_2.ts");
+    let f1 = dir.path().join("txn_em_1.ts");
+    let f2 = dir.path().join("txn_em_2.ts");
 
     fs::write(&f1, "const greeting = \"hello\";\n").unwrap();
     fs::write(&f2, "const name = \"world\";\n").unwrap();
@@ -390,10 +386,9 @@ fn transaction_edit_match_operation() {
 #[test]
 fn transaction_edit_match_requires_replacement() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_transaction_tests");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
 
-    let f1 = dir.join("txn_missing_replacement.ts");
+    let f1 = dir.path().join("txn_missing_replacement.ts");
     fs::write(&f1, "const greeting = \"hello\";\n").unwrap();
 
     let resp = aft.send(&format!(

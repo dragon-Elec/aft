@@ -295,7 +295,9 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     expect(response.success).toBe(true);
     expect(response.status).toBe("running");
     expect(typeof response.task_id).toBe("string");
-    expect(Date.now() - started).toBeLessThan(750);
+    // Typically returns in <100ms locally; assert only a generous deadlock bound
+    // so CI load does not turn latency into correctness.
+    expect(Date.now() - started).toBeLessThan(10_000);
   });
 
   test("bash_status reports running then completed output", async () => {

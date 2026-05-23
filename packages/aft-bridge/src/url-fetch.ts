@@ -17,8 +17,17 @@ import { log, warn } from "./active-logger.js";
 const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
 /** Cache TTL: 1 day */
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-/** Fetch timeout: 30 seconds */
+/** Fetch timeout: 30 seconds — covers initial connect + headers */
 const FETCH_TIMEOUT_MS = 30_000;
+/**
+ * Per-chunk body read timeout: 15 seconds. Resets after every successful
+ * chunk so legitimate large/slow downloads still complete, but a stalled
+ * mid-body stream (e.g. CDN edge drops the connection without closing the
+ * socket cleanly) is aborted within this window. Without this guard the
+ * body loop blocks indefinitely because Node's `AbortController` from
+ * `fetch()` only covers the connect+headers phase, not body streaming.
+ */
+const BODY_CHUNK_TIMEOUT_MS = 15_000;
 const MAX_REDIRECTS = 5;
 
 interface FetchUrlOptions {
@@ -454,24 +463,57 @@ export async function fetchUrlToTempFile(
     }
   }
 
-  // Stream with size cap
+  // Stream with size cap and per-chunk timeout. The AbortController used for
+  // the initial fetch() only covers connect + headers — once we hold a
+  // ReadableStream reader, `reader.read()` has no built-in timeout, so a
+  // server that sends headers and then stalls mid-body (CDN edge drops the
+  // socket, partial response, rate limit hold) blocks this loop forever.
+  // The per-chunk timer is reset after every successful read, so legitimate
+  // large/slow downloads still complete cleanly.
   const reader = response.body?.getReader();
   if (!reader) {
     throw new Error(`Failed to read response body for ${url}`);
   }
   const chunks: Uint8Array[] = [];
   let total = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value) {
-      total += value.length;
-      if (total > MAX_RESPONSE_BYTES) {
-        reader.cancel().catch(() => {});
-        throw new Error(`Response exceeded ${MAX_RESPONSE_BYTES} bytes, aborted`);
+  try {
+    while (true) {
+      let chunkTimer: ReturnType<typeof setTimeout> | undefined;
+      const stallSymbol = Symbol("body-stall");
+      const stallPromise = new Promise<typeof stallSymbol>((resolve) => {
+        chunkTimer = setTimeout(() => resolve(stallSymbol), BODY_CHUNK_TIMEOUT_MS);
+      });
+      type ReadResult = Awaited<ReturnType<typeof reader.read>>;
+      let result: ReadResult | typeof stallSymbol;
+      try {
+        result = await Promise.race([reader.read(), stallPromise]);
+      } finally {
+        if (chunkTimer) clearTimeout(chunkTimer);
       }
-      chunks.push(value);
+      if (result === stallSymbol) {
+        reader.cancel().catch(() => {});
+        throw new Error(
+          `Body read stalled (no data for ${BODY_CHUNK_TIMEOUT_MS}ms) fetching ${url}`,
+        );
+      }
+      const { done, value } = result;
+      if (done) break;
+      if (value) {
+        total += value.length;
+        if (total > MAX_RESPONSE_BYTES) {
+          reader.cancel().catch(() => {});
+          throw new Error(`Response exceeded ${MAX_RESPONSE_BYTES} bytes, aborted`);
+        }
+        chunks.push(value);
+      }
     }
+  } finally {
+    // Defensive: release any held lock so the underlying stream can be GCed
+    // even if a throw skipped the loop's normal exit. `releaseLock` is a no-op
+    // if the reader was already cancelled.
+    try {
+      reader.releaseLock();
+    } catch {}
   }
 
   // Write content and meta atomically

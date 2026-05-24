@@ -87,6 +87,29 @@ describe("Pi background notifications", () => {
     expect(state?.pendingPatternMatches[0]?.reason).toBe("task_exit");
   });
 
+  test("markExplicitControl retroactively converts already-pending completion to pattern match", () => {
+    // Race: bash spawns → trackBgTask, completion push frame arrives →
+    // ingestBgCompletions queues into pendingCompletions, THEN bash_watch
+    // async runs markExplicitControl. Without retroactive conversion the
+    // in-turn-append path would emit both "[BACKGROUND BASH COMPLETED]" and
+    // "[BG BASH NOTIFY]" for the same task.
+    trackBgTask("s1", "task-1");
+    const accepted = ingestBgCompletions("s1", [completion("task-1", "sleep 3 && echo X")]);
+    expect(accepted).toHaveLength(1);
+
+    const stateBefore = sessionBgStates.get("s1");
+    expect(stateBefore?.pendingCompletions).toHaveLength(1);
+    expect(stateBefore?.pendingPatternMatches).toHaveLength(0);
+
+    markExplicitControl("s1", "task-1", false);
+
+    const stateAfter = sessionBgStates.get("s1");
+    expect(stateAfter?.pendingCompletions).toHaveLength(0);
+    expect(stateAfter?.pendingPatternMatches).toHaveLength(1);
+    expect(stateAfter?.pendingPatternMatches[0]?.reason).toBe("task_exit");
+    expect(stateAfter?.wakeDeferredTaskIds.has("task-1")).toBe(false);
+  });
+
   test("tool_result mutation appends a reminder text block", async () => {
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({

@@ -270,6 +270,19 @@ export function markExplicitControl(
   const state = stateFor(sessionID);
   state.explicitControlTasks.add(taskId);
   if (trackOutstanding) state.outstandingTaskIds.add(taskId);
+  // If a push completion already landed for this task before bash_watch
+  // could register the explicit control marker, move it from the default
+  // pendingCompletions queue (which renders as "[BACKGROUND BASH COMPLETED]")
+  // to pendingPatternMatches (which renders as "[BG BASH NOTIFY] task_exit").
+  // Without this, both reminders fire because the in-turn-append path drains
+  // pendingCompletions regardless of wakeDeferredTaskIds filtering.
+  const idx = state.pendingCompletions.findIndex((c) => c.task_id === taskId);
+  if (idx >= 0) {
+    const completion = state.pendingCompletions[idx];
+    state.pendingCompletions.splice(idx, 1);
+    state.pendingPatternMatches.push(completionToExitPattern(completion));
+    state.wakeDeferredTaskIds.delete(taskId);
+  }
 }
 
 export function unmarkExplicitControl(sessionID: string | undefined, taskId: string): void {

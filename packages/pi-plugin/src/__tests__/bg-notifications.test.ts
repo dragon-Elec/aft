@@ -11,6 +11,7 @@ import {
   ingestBgCompletions,
   markBgCompletionDelivered,
   markExplicitControl,
+  markTaskWaiting,
   SESSION_BG_STATE_IDLE_TTL_MS,
   sessionBgStates,
   trackBgTask,
@@ -170,7 +171,7 @@ describe("Pi background notifications", () => {
     expect(sendUserMessage.mock.calls[0][1]).toEqual({ deliverAs: "steer" });
   });
 
-  test("push completion lands in pending and wakes when idle", async () => {
+  test("push completion lands in pending and wakes after the spawn turn is idle", async () => {
     trackBgTask("s1", "task-1");
     const send = mock(async () => ({
       success: true,
@@ -179,6 +180,12 @@ describe("Pi background notifications", () => {
     }));
     const { ctx } = harness(send);
     const sendUserMessage = mock(() => {});
+    await handleTurnEndBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      runtime: { sendUserMessage },
+    });
 
     await handlePushedBgCompletion(
       {
@@ -196,6 +203,33 @@ describe("Pi background notifications", () => {
     expect(sendUserMessage.mock.calls[0][0]).not.toContain(": npm test");
     expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
     expect(send.mock.calls.some((call) => call[0] === "bash_ack_completions")).toBe(true);
+  });
+
+  test("same-turn push completion waits for sync bash_watch instead of waking", async () => {
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
+    const sendUserMessage = mock(() => {});
+
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        runtime: { sendUserMessage },
+      },
+      completion("task-1", "npm test"),
+    );
+    await sleep(300);
+
+    expect(sendUserMessage).toHaveBeenCalledTimes(0);
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(1);
+    expect(sessionBgStates.get("s1")?.debounceTimer).toBeNull();
+
+    markTaskWaiting("s1", "task-1");
+    await sleep(300);
+
+    expect(sendUserMessage).toHaveBeenCalledTimes(0);
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
   });
 
   test("buffers push completion received before task tracking", async () => {
@@ -230,6 +264,12 @@ describe("Pi background notifications", () => {
     const sendUserMessage = mock(() => {
       throw new Error("send failed");
     });
+    await handleTurnEndBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      runtime: { sendUserMessage },
+    });
 
     await handlePushedBgCompletion(
       { ctx, directory: "/tmp/project", sessionID: "s1", runtime: { sendUserMessage } },
@@ -247,6 +287,12 @@ describe("Pi background notifications", () => {
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const sendUserMessage = mock(() => {
       throw new Error("send failed");
+    });
+    await handleTurnEndBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      runtime: { sendUserMessage },
     });
 
     await handlePushedBgCompletion(
@@ -284,13 +330,20 @@ describe("Pi background notifications", () => {
     expect(sessionBgStates.get("__default__")?.outstandingTaskIds.has("task-1")).toBe(false);
   });
 
-  test("push completion still wakes even when bridge is busy with non-agent RPC", async () => {
+  test("post-idle push completion still wakes even when bridge is busy with non-agent RPC", async () => {
     // Regression: previously bailed on `isActive()` (bridge.hasPendingRequests())
     // which returned true for the TUI status poll, orphaning the completion when
-    // no other trigger fired. The wake must always be scheduled.
+    // no other trigger fired. Once the spawn turn has gone idle, the wake must
+    // still be scheduled.
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const sendUserMessage = mock(() => {});
+    await handleTurnEndBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      runtime: { sendUserMessage },
+    });
 
     await handlePushedBgCompletion(
       {

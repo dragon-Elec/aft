@@ -57,6 +57,12 @@ type SessionBgState = {
   forcedDrainCompleted: boolean;
   unknownCompletions: Array<{ completion: BgCompletion; receivedAt: number }>;
   /**
+   * Task IDs spawned since the last session idle boundary. Push completions
+   * for these tasks stay pending but do not send an immediate follow-up;
+   * sync bash_watch may still consume them inline in the same turn.
+   */
+  wakeDeferredTaskIds: Set<string>;
+  /**
    * Task IDs whose completions were consumed inline by an explicit
    * `bash_status({ exit: true, ... })` wait. The bash_completed push
    * frame for these tasks may arrive AFTER the wait poll loop returned;
@@ -109,6 +115,7 @@ export function consumeBgCompletion(sessionID: string | undefined, taskId: strin
   // to drop it. Mirrors the OpenCode fix.
   const state = stateFor(sessionID);
   state.pendingCompletions = state.pendingCompletions.filter((c) => c.task_id !== taskId);
+  state.wakeDeferredTaskIds.delete(taskId);
   if (!state.consumedTaskIds.has(taskId)) {
     state.consumedTaskIds.add(taskId);
     state.consumedTaskOrder.push(taskId);
@@ -121,7 +128,6 @@ export function consumeBgCompletion(sessionID: string | undefined, taskId: strin
   if (
     state.pendingCompletions.length === 0 &&
     state.pendingLongRunning.length === 0 &&
-    state.pendingPatternMatches.length === 0 &&
     state.pendingPatternMatches.length === 0 &&
     state.debounceTimer
   ) {
@@ -148,27 +154,19 @@ export async function markBgCompletionDelivered(
  */
 export function markTaskWaiting(sessionID: string | undefined, taskId: string): void {
   const state = stateFor(sessionID);
-  if (state.consumedTaskIds.has(taskId)) return;
+  state.pendingCompletions = state.pendingCompletions.filter((c) => c.task_id !== taskId);
+  state.wakeDeferredTaskIds.delete(taskId);
+  if (state.consumedTaskIds.has(taskId)) {
+    clearWakeTimerIfNoPending(state);
+    return;
+  }
   state.consumedTaskIds.add(taskId);
   state.consumedTaskOrder.push(taskId);
   while (state.consumedTaskOrder.length > CONSUMED_TASKIDS_CAP) {
     const evicted = state.consumedTaskOrder.shift();
     if (evicted !== undefined) state.consumedTaskIds.delete(evicted);
   }
-  state.pendingCompletions = state.pendingCompletions.filter((c) => c.task_id !== taskId);
-  if (
-    state.pendingCompletions.length === 0 &&
-    state.pendingLongRunning.length === 0 &&
-    state.pendingPatternMatches.length === 0 &&
-    state.pendingPatternMatches.length === 0 &&
-    state.debounceTimer
-  ) {
-    clearTimeout(state.debounceTimer);
-    state.debounceTimer = null;
-    state.firstCompletionAt = null;
-    state.scheduledFireAt = null;
-    state.scheduledCompletionCount = 0;
-  }
+  clearWakeTimerIfNoPending(state);
 }
 
 /**
@@ -178,6 +176,7 @@ export function markTaskWaiting(sessionID: string | undefined, taskId: string): 
  */
 export function unmarkTaskWaiting(sessionID: string | undefined, taskId: string): void {
   const state = stateFor(sessionID);
+  state.wakeDeferredTaskIds.delete(taskId);
   if (!state.consumedTaskIds.has(taskId)) return;
   state.consumedTaskIds.delete(taskId);
   const idx = state.consumedTaskOrder.indexOf(taskId);
@@ -186,6 +185,7 @@ export function unmarkTaskWaiting(sessionID: string | undefined, taskId: string)
 
 export function trackBgTask(sessionID: string | undefined, taskId: string): void {
   const state = stateFor(sessionID);
+  state.wakeDeferredTaskIds.add(taskId);
   pruneUnknownCompletions(state, Date.now());
   const buffered = state.unknownCompletions.filter((entry) => entry.completion.task_id === taskId);
   state.unknownCompletions = state.unknownCompletions.filter(
@@ -268,7 +268,7 @@ export async function handlePushedBgCompletion(
   completion: unknown,
 ): Promise<void> {
   ingestBgCompletions(drainContext.sessionID, [completion]);
-  await triggerWakeIfPending(drainContext, true);
+  await triggerWakeIfPending(drainContext, true, false);
 }
 
 export async function handlePushedBgLongRunning(
@@ -316,6 +316,9 @@ export async function appendToolResultBgCompletions(
     state.pendingPatternMatches,
   );
   state.pendingCompletions = [];
+  for (const completion of deliveredCompletions) {
+    state.wakeDeferredTaskIds.delete(completion.task_id);
+  }
   state.pendingLongRunning = [];
   state.pendingPatternMatches = [];
   state.wakeRetryAttempts = 0;
@@ -337,31 +340,30 @@ export async function appendToolResultBgCompletions(
 export async function handleTurnEndBgCompletions(
   drainContext: DrainContext & { runtime: SendUserMessageRuntime },
 ): Promise<void> {
-  await triggerWakeIfPending(drainContext, false);
+  stateFor(drainContext.sessionID).wakeDeferredTaskIds.clear();
+  await triggerWakeIfPending(drainContext, false, true);
 }
 
 async function triggerWakeIfPending(
   drainContext: DrainContext & { runtime: SendUserMessageRuntime },
   skipDrain: boolean,
+  includeDeferredCompletions = true,
 ): Promise<void> {
   // Note: previously bailed on `isActive()` (bridge.hasPendingRequests())
   // to defer wakes until the bridge was idle. That was wrong: the bridge
   // is busy for any non-agent traffic (status polls, configure work),
   // which orphaned completions when no other trigger fired. Pi's
-  // `sendUserMessage` with `deliverAs: "steer"` already handles mid-turn
-  // delivery cleanly, so suppressing the wake provides no benefit and
-  // creates a hang. Mirrors the OpenCode fix.
+  // `sendUserMessage` with `deliverAs: "steer"` handles ordinary mid-turn
+  // delivery cleanly. For tasks spawned in the current assistant turn,
+  // wakeDeferredTaskIds still suppresses immediate push wakes until an
+  // in-turn append consumes the completion or turn end clears the deferral.
+  // Mirrors the OpenCode fix.
   const state = stateFor(drainContext.sessionID);
 
   if (!skipDrain && (state.outstandingTaskIds.size > 0 || !state.forcedDrainCompleted)) {
     await drainCompletions(drainContext);
   }
-  if (
-    state.pendingCompletions.length === 0 &&
-    state.pendingLongRunning.length === 0 &&
-    state.pendingPatternMatches.length === 0
-  )
-    return;
+  if (!hasWakeEligiblePending(state, includeDeferredCompletions)) return;
 
   scheduleWake(
     state,
@@ -396,6 +398,7 @@ async function triggerWakeIfPending(
           : `${LOG_PREFIX} wake send failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     },
+    includeDeferredCompletions,
   );
 }
 
@@ -499,10 +502,49 @@ async function ackCompletions(
   }
 }
 
+function hasWakeEligiblePending(
+  state: SessionBgState,
+  includeDeferredCompletions: boolean,
+): boolean {
+  return (
+    wakeEligibleCompletions(state, includeDeferredCompletions).length > 0 ||
+    state.pendingLongRunning.length > 0 ||
+    state.pendingPatternMatches.length > 0
+  );
+}
+
+function wakeEligibleCompletions(
+  state: SessionBgState,
+  includeDeferredCompletions: boolean,
+): BgCompletion[] {
+  if (includeDeferredCompletions || state.wakeDeferredTaskIds.size === 0) {
+    return state.pendingCompletions;
+  }
+  return state.pendingCompletions.filter(
+    (completion) => !state.wakeDeferredTaskIds.has(completion.task_id),
+  );
+}
+
+function clearWakeTimerIfNoPending(state: SessionBgState): void {
+  if (
+    state.pendingCompletions.length === 0 &&
+    state.pendingLongRunning.length === 0 &&
+    state.pendingPatternMatches.length === 0 &&
+    state.debounceTimer
+  ) {
+    clearTimeout(state.debounceTimer);
+    state.debounceTimer = null;
+    state.firstCompletionAt = null;
+    state.scheduledFireAt = null;
+    state.scheduledCompletionCount = 0;
+  }
+}
+
 function scheduleWake(
   state: SessionBgState,
   sendWake: (reminder: string, completions: readonly BgCompletion[]) => Promise<void>,
   onSendFailure: (err: unknown, hardStopped: boolean) => void,
+  includeDeferredCompletions = true,
 ): void {
   if (state.wakeHardStopped) return;
   // Race model: JS state changes are synchronous; awaits only happen before scheduling
@@ -510,7 +552,7 @@ function scheduleWake(
   // interleave only at those awaits, so we gate timer extension on completion count.
   const now = Date.now();
   const pendingCount =
-    state.pendingCompletions.length +
+    wakeEligibleCompletions(state, includeDeferredCompletions).length +
     state.pendingLongRunning.length +
     state.pendingPatternMatches.length;
   if (state.debounceTimer && pendingCount <= state.scheduledCompletionCount) {
@@ -531,7 +573,7 @@ function scheduleWake(
   if (state.debounceTimer) clearTimeout(state.debounceTimer);
   const delay = state.retryDelayMs ?? Math.max(0, (state.scheduledFireAt ?? now) - now);
   state.debounceTimer = setTimeout(() => {
-    const pending = state.pendingCompletions;
+    const pending = wakeEligibleCompletions(state, includeDeferredCompletions);
     const pendingLongRunning = state.pendingLongRunning;
     const pendingPatternMatches = state.pendingPatternMatches;
     state.debounceTimer = null;
@@ -553,7 +595,11 @@ function scheduleWake(
       pendingLongRunning,
       pendingPatternMatches,
     );
-    state.pendingCompletions = [];
+    const deliveredTaskIds = new Set(pending.map((completion) => completion.task_id));
+    state.pendingCompletions = state.pendingCompletions.filter(
+      (completion) => !deliveredTaskIds.has(completion.task_id),
+    );
+    for (const taskId of deliveredTaskIds) state.wakeDeferredTaskIds.delete(taskId);
     state.pendingLongRunning = [];
     state.pendingPatternMatches = [];
     void sendWake(reminder, pending)
@@ -575,7 +621,7 @@ function scheduleWake(
         }
         state.retryDelayMs = Math.min((delay || DEBOUNCE_STEP_MS) * 2, DEBOUNCE_CAP_MS);
         onSendFailure(err, false);
-        scheduleWake(state, sendWake, onSendFailure);
+        scheduleWake(state, sendWake, onSendFailure, includeDeferredCompletions);
       });
   }, delay);
   state.debounceTimer.unref?.();
@@ -602,6 +648,7 @@ function stateFor(sessionID: string | undefined): SessionBgState {
       wakeHardStopped: false,
       forcedDrainCompleted: false,
       unknownCompletions: [],
+      wakeDeferredTaskIds: new Set(),
       consumedTaskIds: new Set(),
       consumedTaskOrder: [],
       lastSeenAt: now,

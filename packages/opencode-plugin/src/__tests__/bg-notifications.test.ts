@@ -85,6 +85,7 @@ import {
   ingestBgCompletions,
   markBgCompletionDelivered,
   markExplicitControl,
+  markTaskWaiting,
   SESSION_BG_STATE_IDLE_TTL_MS,
   sessionBgStates,
   trackBgTask,
@@ -474,7 +475,7 @@ describe("OpenCode background notifications", () => {
     expect(state?.pendingPatternMatches[0]?.reason).toBe("task_exit");
   });
 
-  test("push completion lands in pending and wakes when idle", async () => {
+  test("push completion lands in pending and wakes after the spawn turn is idle", async () => {
     trackBgTask("s1", "task-1");
     const send = mock(async () => ({
       success: true,
@@ -484,6 +485,13 @@ describe("OpenCode background notifications", () => {
     const { ctx } = harness(send);
     const promptAsync = mock(async () => {});
     installLiveServerClient(promptAsync);
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: {},
+      serverUrl: TEST_SERVER_URL,
+    });
 
     await handlePushedBgCompletion(
       {
@@ -504,6 +512,35 @@ describe("OpenCode background notifications", () => {
     expect(text).not.toContain(": npm test");
     expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
     expect(send.mock.calls.some((call) => call[0] === "bash_ack_completions")).toBe(true);
+  });
+
+  test("same-turn push completion waits for sync bash_watch instead of waking", async () => {
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
+    const promptAsync = mock(async () => {});
+    installLiveServerClient(promptAsync);
+
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: {},
+        serverUrl: TEST_SERVER_URL,
+      },
+      completion("task-1", "npm test"),
+    );
+    await sleep(300);
+
+    expect(promptAsync).toHaveBeenCalledTimes(0);
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(1);
+    expect(sessionBgStates.get("s1")?.debounceTimer).toBeNull();
+
+    markTaskWaiting("s1", "task-1");
+    await sleep(300);
+
+    expect(promptAsync).toHaveBeenCalledTimes(0);
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
   });
 
   test("buffers push completion received before task tracking", async () => {
@@ -544,6 +581,13 @@ describe("OpenCode background notifications", () => {
       throw new Error("send failed");
     });
     installLiveServerClient(promptAsync);
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: {},
+      serverUrl: TEST_SERVER_URL,
+    });
 
     await handlePushedBgCompletion(
       {
@@ -569,6 +613,13 @@ describe("OpenCode background notifications", () => {
       throw new Error("send failed");
     });
     installLiveServerClient(promptAsync);
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: {},
+      serverUrl: TEST_SERVER_URL,
+    });
 
     await handlePushedBgCompletion(
       {
@@ -590,14 +641,22 @@ describe("OpenCode background notifications", () => {
     expect(sessionBgStates.get("s1")?.debounceTimer).toBeNull();
   });
 
-  test("push completion still wakes even when bridge is busy with non-agent RPC", async () => {
+  test("post-idle push completion still wakes even when bridge is busy with non-agent RPC", async () => {
     // Regression: previously bailed on `isActive()` (bridge.hasPendingRequests())
     // which returned true for the TUI status poll, orphaning the completion when
-    // no other trigger fired. The wake must always be scheduled.
+    // no other trigger fired. Once the spawn turn has gone idle, the wake must
+    // still be scheduled.
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const promptAsync = mock(async () => {});
     installLiveServerClient(promptAsync);
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: {},
+      serverUrl: TEST_SERVER_URL,
+    });
 
     await handlePushedBgCompletion(
       {
@@ -914,6 +973,13 @@ describe("OpenCode background notifications", () => {
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const livePromptAsync = mock(async () => {});
     installLiveServerClient(livePromptAsync);
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: {},
+      serverUrl: TEST_SERVER_URL,
+    });
 
     await handlePushedBgCompletion(
       {

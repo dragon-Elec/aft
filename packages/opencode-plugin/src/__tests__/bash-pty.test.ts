@@ -68,12 +68,20 @@ async function spill(contents: string): Promise<string> {
 }
 
 describe("OpenCode bash PTY layer", () => {
-  test("Test 20: pty true requires background true", async () => {
-    const { ctx: pluginCtx } = ctx(() => ({ success: true }));
+  test("Test 20: pty true implies background true (no explicit flag needed)", async () => {
+    const { ctx: pluginCtx, calls } = ctx(() => ({
+      success: true,
+      status: "running",
+      task_id: "bash-pty-implied-bg",
+    }));
     const bash = createBashTool(pluginCtx);
-    await expect(bash.execute({ command: "python", pty: true }, runtime())).rejects.toThrow(
-      "PTY mode requires background: true",
-    );
+    // Caller omits background: true — plugin must auto-promote because pty:true
+    // requires the polling background lifecycle.
+    const output = await bash.execute({ command: "python", pty: true }, runtime());
+    expect(output).toContain("bash-pty-implied-bg");
+    // Rust spawn payload sees background:true and pty:true.
+    const lastCall = calls.at(-1);
+    expect(lastCall?.params).toMatchObject({ pty: true, background: true });
   });
 
   test("Test 21: subagent pty true is rejected", async () => {

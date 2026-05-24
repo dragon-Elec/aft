@@ -71,15 +71,24 @@ function text(result: unknown): string {
 }
 
 describe("Pi bash PTY layer", () => {
-  test("pty true requires background true", async () => {
+  test("pty true implies background true (no explicit flag needed)", async () => {
     const tools = new Map<string, MockToolDef>();
-    const { ctx: pluginCtx } = ctx(() => ({ success: true }));
+    const { calls, ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "running",
+      task_id: "bash-pty-implied-bg",
+    }));
     registerBashTool(api(tools), pluginCtx);
-    await expect(
-      tools.get("bash")!.execute("call", { command: "python", pty: true }, undefined, undefined, {
+    // Caller omits background: true — plugin must auto-promote because pty:true
+    // requires the polling background lifecycle.
+    const result = await tools
+      .get("bash")!
+      .execute("call", { command: "python", pty: true }, undefined, undefined, {
         cwd: process.cwd(),
-      }),
-    ).rejects.toThrow("PTY mode requires background: true");
+      });
+    expect(text(result)).toContain("bash-pty-implied-bg");
+    // Rust spawn payload sees background:true and pty:true.
+    expect(calls.at(-1)?.[1]).toMatchObject({ pty: true, background: true });
   });
 
   test("bash pty true forwards pty to bridge", async () => {
@@ -100,7 +109,7 @@ describe("Pi bash PTY layer", () => {
     expect(calls[0][1]).toMatchObject({ pty: true, background: true });
   });
 
-  test("bash pty dimensions require pty true and forward to bridge", async () => {
+  test("bash pty dimensions are forwarded when pty:true and silently ignored when pty:false", async () => {
     const tools = new Map<string, MockToolDef>();
     const { calls, ctx: pluginCtx } = ctx(() => ({
       success: true,
@@ -109,13 +118,13 @@ describe("Pi bash PTY layer", () => {
     }));
     registerBashTool(api(tools), pluginCtx);
 
-    await expect(
-      tools
-        .get("bash")!
-        .execute("call", { command: "top", background: true, ptyRows: 50 }, undefined, undefined, {
-          cwd: process.cwd(),
-        }),
-    ).rejects.toThrow("ptyRows/ptyCols require pty: true");
+    // pty:false + ptyRows passed defensively: should NOT throw, dims silently ignored
+    const nonPtyResult = await tools
+      .get("bash")!
+      .execute("call", { command: "top", background: true, ptyRows: 50 }, undefined, undefined, {
+        cwd: process.cwd(),
+      });
+    expect(text(nonPtyResult)).toContain("bash-pty-dims");
 
     const result = await tools
       .get("bash")!

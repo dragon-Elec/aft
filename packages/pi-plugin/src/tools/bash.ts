@@ -96,7 +96,7 @@ const BashParams = Type.Object({
   pty: Type.Optional(
     Type.Boolean({
       description:
-        'Spawn the command in a real PTY for interactive programs. Requires background: true. Inspect with bash_status({ task_id, output_mode: "screen" }) and send input with bash_write.',
+        'Spawn the command in a real PTY for interactive programs. Implies background: true automatically. Inspect with bash_status({ task_id, output_mode: "screen" }) and send input with bash_write.',
     }),
   ),
   ptyRows: Type.Optional(
@@ -104,7 +104,7 @@ const BashParams = Type.Object({
       minimum: 1,
       maximum: 60,
       description:
-        "PTY terminal height in rows. Applies only when pty: true; defaults to 24. Minimum 1, maximum 60.",
+        "PTY terminal height in rows — ignored when pty is false. Defaults to 24 when pty: true. Minimum 1, maximum 60.",
     }),
   ),
   ptyCols: Type.Optional(
@@ -112,7 +112,7 @@ const BashParams = Type.Object({
       minimum: 1,
       maximum: 140,
       description:
-        "PTY terminal width in columns. Applies only when pty: true; defaults to 80. Minimum 1, maximum 140.",
+        "PTY terminal width in columns — ignored when pty is false. Defaults to 80 when pty: true. Minimum 1, maximum 140.",
     }),
   ),
 });
@@ -273,12 +273,12 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
     parameters: BashParams,
     async execute(_toolCallId, params: Static<typeof BashParams>, _signal, onUpdate, extCtx) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
-      if (params.pty !== true && (params.ptyRows !== undefined || params.ptyCols !== undefined)) {
-        throw new Error("invalid_request: ptyRows/ptyCols require pty: true");
-      }
-      if (params.pty === true && params.background !== true) {
-        throw new Error("PTY mode requires background: true");
-      }
+      // ptyRows/ptyCols are silently ignored when pty is false so agents
+      // that defensively pass them on normal bash calls don't get stuck in
+      // a retry loop. pty: true silently implies background: true (Rust
+      // bash.rs handles the auto-promote); we mirror that here so the
+      // Pi-side spawn payload also reflects the auto-promotion.
+      const effectiveBackground = params.background === true || params.pty === true;
 
       // Build spawn context for potential hook modification
       let spawnContext: BashSpawnContext = {
@@ -308,8 +308,8 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
           workdir: spawnContext.cwd ?? params.workdir,
           env: spawnContext.env,
           description: params.description,
-          background: params.background,
-          notify_on_completion: params.background === true,
+          background: effectiveBackground,
+          notify_on_completion: effectiveBackground,
           compressed: params.compressed,
           pty: params.pty,
           pty_rows: params.ptyRows,
@@ -348,7 +348,7 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
 
       const taskId = response.task_id as string | undefined;
       if (response.status === "running" && taskId) {
-        if (params.background === true) {
+        if (effectiveBackground) {
           trackBgTask(resolveSessionId(extCtx), taskId);
           return bashResult(formatBackgroundLaunch(taskId, params.pty === true), {
             task_id: taskId,

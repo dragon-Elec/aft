@@ -116,16 +116,21 @@ describe("OpenCode bash adapter", () => {
     }
   });
 
-  test("pty dimensions require pty true and are forwarded to Rust", async () => {
+  test("pty dimensions are forwarded when pty:true and silently ignored when pty:false", async () => {
     const { calls, tool: bash } = createHarness(() => ({
       success: true,
       status: "running",
       task_id: "bash-pty-dims",
     }));
 
-    await expect(
-      bash.execute({ command: "top", background: true, ptyRows: 50 }, createMockSdkContext()),
-    ).rejects.toThrow("ptyRows/ptyCols require pty: true");
+    // pty:false + ptyRows passed defensively: should NOT throw, dims silently ignored
+    const nonPtyOutput = await bash.execute(
+      { command: "echo hi", background: true, ptyRows: 50 },
+      createMockSdkContext(),
+    );
+    expect(nonPtyOutput).toContain("bash-pty-dims");
+    // The non-pty call still forwards ptyRows in params (Rust silently ignores
+    // when pty:false). We only assert no throw + task_id propagation here.
 
     const output = await bash.execute(
       { command: "top", background: true, pty: true, ptyRows: 50, ptyCols: 120 },

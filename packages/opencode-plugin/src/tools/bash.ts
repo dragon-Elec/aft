@@ -131,7 +131,7 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
         .boolean()
         .optional()
         .describe(
-          'When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Requires background: true and is unavailable in subagent sessions. Inspect with bash_status({ taskId, outputMode: "screen" }) and drive interactively with bash_write — its input accepts either a string OR an array like [ "iHello", { key: "esc" }, ":wq", { key: "enter" } ] for atomic text+key sequences.',
+          'When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Implies background: true automatically. Unavailable in subagent sessions. Inspect with bash_status({ taskId, outputMode: "screen" }) and drive interactively with bash_write — its input accepts either a string OR an array like [ "iHello", { key: "esc" }, ":wq", { key: "enter" } ] for atomic text+key sequences.',
         ),
       ptyRows: z
         .number()
@@ -140,7 +140,7 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
         .max(60)
         .optional()
         .describe(
-          "PTY terminal height in rows. Applies only when pty: true; defaults to 24. Minimum 1, maximum 60.",
+          "PTY terminal height in rows — ignored when pty is false. Defaults to 24 when pty: true. Minimum 1, maximum 60.",
         ),
       ptyCols: z
         .number()
@@ -149,7 +149,7 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
         .max(140)
         .optional()
         .describe(
-          "PTY terminal width in columns. Applies only when pty: true; defaults to 80. Minimum 1, maximum 140.",
+          "PTY terminal width in columns — ignored when pty is false. Defaults to 80 when pty: true. Minimum 1, maximum 140.",
         ),
     },
     execute: async (args, context) => {
@@ -169,14 +169,14 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
       // foreground poll window to the task's full hard-kill timeout — the
       // command still runs to completion, just inline.
       const isSubagent = await resolveIsSubagent(ctx.client, context.sessionID, context.directory);
-      const requestedBackground = args.background === true;
       const requestedPty = args.pty === true;
-      if (!requestedPty && (args.ptyRows !== undefined || args.ptyCols !== undefined)) {
-        throw new Error("invalid_request: ptyRows/ptyCols require pty: true");
-      }
-      if (requestedPty && !requestedBackground) {
-        throw new Error("PTY mode requires background: true");
-      }
+      // pty:true silently implies background:true (Rust bash.rs handles the
+      // auto-promote). Agents don't need to set both flags.
+      const requestedBackground = args.background === true || requestedPty;
+      // ptyRows/ptyCols are silently ignored when pty is false so agents
+      // that defensively pass them on normal bash calls don't get stuck in
+      // a retry loop. pty: true silently implies background: true (Rust
+      // bash.rs handles the auto-promote); no explicit check needed.
       if (requestedPty && isSubagent) {
         throw new Error(
           "PTY mode is not available in subagent sessions; subagents cannot drive interactive terminals.",

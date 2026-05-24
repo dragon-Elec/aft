@@ -30,37 +30,64 @@ import type { PluginContext } from "../types.js";
 
 const z = tool.schema;
 
-// biome-ignore lint/suspicious/noExplicitAny: tool.schema's transform/optional combo widens to an internal type that can't be portably named.
+/**
+ * Optional integer with bounds.
+ *
+ * MUST be JSON-Schema-representable for OpenCode tool registration to
+ * succeed: OpenCode wraps plugin args in a host `z.object()` and runs
+ * `z.toJSONSchema(args, { io: "input" })` at session start. Any node
+ * the host's Zod can't convert (e.g. `.transform()`, `.preprocess()`)
+ * throws "Transforms cannot be represented in JSON Schema" and the
+ * entire plugin fails to load. Keep this a plain schema — no
+ * transforms. Empty-sentinel coercion (null/""/0 → undefined) belongs
+ * in tool handlers via `coerceOptionalInt`, not in the schema.
+ *
+ * Regression guard: `tool-schemas-json-convertible.test.ts` runs
+ * `z.toJSONSchema(z.object(args), { io: "input" })` on every plugin
+ * tool. If anyone reintroduces a `.transform()` here it fails before
+ * shipping.
+ *
+ * Return type is `any` to suppress TS2742 — Zod's inferred type leaks
+ * `.bun/zod@...` paths that aren't portable across the host SDK and
+ * our zod version. The type annotation has no runtime effect; the
+ * contract test is the real invariant.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: tool.schema's bounded-int return type isn't portably nameable; contract test enforces the actual invariant.
 export const optionalInt = (min: number, max: number): any =>
-  z
-    .any()
-    .transform((v, ctx) => {
-      if (
-        v === undefined ||
-        v === null ||
-        v === "" ||
-        (typeof v === "number" && (v === 0 || !Number.isFinite(v)))
-      ) {
-        return undefined;
-      }
-      const n = typeof v === "string" ? Number(v) : v;
-      if (typeof n !== "number" || !Number.isInteger(n)) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: `must be an integer between ${min} and ${max}`,
-        });
-        return z.NEVER;
-      }
-      if (n < min || n > max) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: `must be between ${min} and ${max}`,
-        });
-        return z.NEVER;
-      }
-      return n;
-    })
-    .optional();
+  z.number().int().min(min).max(max).optional();
+
+/**
+ * Runtime coercion for agent-friendly sentinel handling.
+ *
+ * Some agents emit null / "" / 0 when they mean "param not provided".
+ * Use this inside tool handlers BEFORE relying on the value. Returns
+ * `undefined` for all empty sentinels; rejects out-of-bounds with a
+ * clear message.
+ *
+ * Tool handlers that want sentinel tolerance must pass args through
+ * this AFTER Zod validation has accepted the value (or for fields
+ * declared as `z.unknown().optional()` that bypass type validation).
+ * With `optionalInt`'s bounded `z.number().int()` schema, Zod already
+ * rejects the sentinels — call this for defense in depth or for fields
+ * declared more permissively.
+ */
+export function coerceOptionalInt(
+  v: unknown,
+  paramName: string,
+  min: number,
+  max: number,
+): number | undefined {
+  if (v === undefined || v === null || v === "") return undefined;
+  if (typeof v === "number" && (v === 0 || !Number.isFinite(v))) return undefined;
+  const n = typeof v === "string" ? Number(v) : v;
+  if (typeof n !== "number" || !Number.isInteger(n)) {
+    throw new Error(`${paramName} must be an integer between ${min} and ${max}`);
+  }
+  if (n < min || n > max) {
+    throw new Error(`${paramName} must be between ${min} and ${max}`);
+  }
+  return n;
+}
 
 /**
  * Per-command timeout overrides (milliseconds).

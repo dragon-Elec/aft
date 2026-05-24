@@ -105,13 +105,23 @@ describe("OpenCode bash adapter", () => {
     expect(safeParse(bash.args.timeout, "slow").success).toBe(false);
     expect(safeParse(bash.args.background, "yes").success).toBe(false);
     expect(safeParse(bash.args.compressed, "no").success).toBe(false);
-    expect(safeParse(bash.args.ptyRows, 0).success).toBe(true);
+    // optionalInt is a plain bounded `z.number().int().min(...).max(...).optional()`
+    // schema (deliberately NOT a transform; transforms break OpenCode's
+    // z.toJSONSchema and crash plugin load — see
+    // `tool-schemas-json-convertible.test.ts`). Out-of-range and non-integer
+    // values are rejected at Zod parse time.
+    expect(safeParse(bash.args.ptyRows, 0).success).toBe(false);
     expect(safeParse(bash.args.ptyRows, 61).success).toBe(false);
     expect(safeParse(bash.args.ptyRows, 1.5).success).toBe(false);
     expect(safeParse(bash.args.ptyCols, 141).success).toBe(false);
 
+    // Verify the args convert to JSON Schema with the default options
+    // OpenCode uses (`{ io: "input" }`, no `unrepresentable: "any"` escape
+    // hatch). If any arg's schema contains a transform, this throws and
+    // plugin load fails at session start.
     for (const schema of Object.values(bash.args)) {
-      const jsonSchema = tool.schema.toJSONSchema(schema, { unrepresentable: "any" }) as {
+      expect(() => tool.schema.toJSONSchema(schema, { io: "input" })).not.toThrow();
+      const jsonSchema = tool.schema.toJSONSchema(schema, { io: "input" }) as {
         description?: string;
       };
       expect(jsonSchema.description?.length).toBeGreaterThan(20);

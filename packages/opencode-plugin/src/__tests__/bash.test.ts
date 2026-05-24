@@ -98,16 +98,46 @@ describe("OpenCode bash adapter", () => {
     expect(safeParse(bash.args.description, "List files").success).toBe(true);
     expect(safeParse(bash.args.background, true).success).toBe(true);
     expect(safeParse(bash.args.compressed, false).success).toBe(true);
+    expect(safeParse(bash.args.ptyRows, 50).success).toBe(true);
+    expect(safeParse(bash.args.ptyCols, 120).success).toBe(true);
 
     expect(safeParse(bash.args.command, 123).success).toBe(false);
     expect(safeParse(bash.args.timeout, "slow").success).toBe(false);
     expect(safeParse(bash.args.background, "yes").success).toBe(false);
     expect(safeParse(bash.args.compressed, "no").success).toBe(false);
+    expect(safeParse(bash.args.ptyRows, 0).success).toBe(false);
+    expect(safeParse(bash.args.ptyRows, 61).success).toBe(false);
+    expect(safeParse(bash.args.ptyRows, 1.5).success).toBe(false);
+    expect(safeParse(bash.args.ptyCols, 141).success).toBe(false);
 
     for (const schema of Object.values(bash.args)) {
       const jsonSchema = tool.schema.toJSONSchema(schema) as { description?: string };
       expect(jsonSchema.description?.length).toBeGreaterThan(20);
     }
+  });
+
+  test("pty dimensions require pty true and are forwarded to Rust", async () => {
+    const { calls, tool: bash } = createHarness(() => ({
+      success: true,
+      status: "running",
+      task_id: "bash-pty-dims",
+    }));
+
+    await expect(
+      bash.execute({ command: "top", background: true, ptyRows: 50 }, createMockSdkContext()),
+    ).rejects.toThrow("ptyRows/ptyCols require pty: true");
+
+    const output = await bash.execute(
+      { command: "top", background: true, pty: true, ptyRows: 50, ptyCols: 120 },
+      createMockSdkContext(),
+    );
+
+    expect(output).toContain("bash-pty-dims");
+    expect(calls.at(-1)?.params).toMatchObject({
+      pty: true,
+      pty_rows: 50,
+      pty_cols: 120,
+    });
   });
 
   test("permission loop asks for each PermissionAsk and retries with permissions_granted", async () => {

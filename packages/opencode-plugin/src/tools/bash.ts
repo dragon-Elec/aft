@@ -133,6 +133,24 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
         .describe(
           'When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Requires background: true and is unavailable in subagent sessions. Inspect with bash_status({ taskId, outputMode: "screen" }) and drive interactively with bash_write — its input accepts either a string OR an array like [ "iHello", { key: "esc" }, ":wq", { key: "enter" } ] for atomic text+key sequences.',
         ),
+      ptyRows: z
+        .number()
+        .int()
+        .min(1)
+        .max(60)
+        .optional()
+        .describe(
+          "PTY terminal height in rows. Applies only when pty: true; defaults to 24. Minimum 1, maximum 60.",
+        ),
+      ptyCols: z
+        .number()
+        .int()
+        .min(1)
+        .max(140)
+        .optional()
+        .describe(
+          "PTY terminal width in columns. Applies only when pty: true; defaults to 80. Minimum 1, maximum 140.",
+        ),
     },
     execute: async (args, context) => {
       const bashCfg = resolveBashConfig(ctx.config);
@@ -153,6 +171,9 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
       const isSubagent = await resolveIsSubagent(ctx.client, context.sessionID, context.directory);
       const requestedBackground = args.background === true;
       const requestedPty = args.pty === true;
+      if (!requestedPty && (args.ptyRows !== undefined || args.ptyCols !== undefined)) {
+        throw new Error("invalid_request: ptyRows/ptyCols require pty: true");
+      }
       if (requestedPty && !requestedBackground) {
         throw new Error("PTY mode requires background: true");
       }
@@ -192,6 +213,8 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
           notify_on_completion: effectiveBackground,
           compressed: args.compressed,
           pty: requestedPty,
+          pty_rows: args.ptyRows,
+          pty_cols: args.ptyCols,
           permissions_requested: true,
         },
         callBridge,
@@ -446,16 +469,17 @@ async function formatPtyStatus(
   const outputPath = data.output_path as string | undefined;
   if (!outputPath) return "\n[PTY output path unavailable]";
   const key = ptyCacheKey(runtime, taskId);
-  const state = await getOrCreatePtyTerminal(key, outputPath);
+  const { rows, cols } = ptyDimensions(data);
+  const state = await getOrCreatePtyTerminal(key, outputPath, rows, cols);
   const raw = await readPtyBytes(state);
   const outputMode = requestedOutputMode ?? "screen";
   let suffix = "";
   if (outputMode === "raw") {
     suffix = raw.length > 0 ? `\n${raw.toString("utf8")}` : "";
   } else if (outputMode === "both") {
-    suffix = `\n${JSON.stringify({ screen: renderScreen(state, 24, 80), raw: raw.toString("utf8") }, null, 2)}`;
+    suffix = `\n${JSON.stringify({ screen: renderScreen(state, rows, cols), raw: raw.toString("utf8") }, null, 2)}`;
   } else {
-    const screen = renderScreen(state, 24, 80);
+    const screen = renderScreen(state, rows, cols);
     suffix = screen ? `\n${screen}` : "";
   }
   if (data.status === "running") {
@@ -464,6 +488,12 @@ async function formatPtyStatus(
     await disposePtyTerminal(key);
   }
   return suffix;
+}
+
+function ptyDimensions(data: Record<string, unknown>): { rows: number; cols: number } {
+  const rows = typeof data.pty_rows === "number" ? data.pty_rows : 24;
+  const cols = typeof data.pty_cols === "number" ? data.pty_cols : 80;
+  return { rows, cols };
 }
 
 function ptyCacheKey(runtime: ToolContext, taskId: string): string {

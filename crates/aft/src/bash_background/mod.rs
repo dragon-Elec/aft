@@ -68,6 +68,8 @@ pub fn spawn(
     notify_on_completion: bool,
     compressed: bool,
     pty: bool,
+    pty_rows: u16,
+    pty_cols: u16,
 ) -> Response {
     if require_background_flag && !ctx.config().experimental_bash_background {
         return Response::error(
@@ -105,8 +107,8 @@ pub fn spawn(
             notify_on_completion,
             compressed,
             project_root,
-            24,
-            80,
+            pty_rows,
+            pty_cols,
         )
     } else {
         ctx.bash_background().spawn(

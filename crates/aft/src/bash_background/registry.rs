@@ -108,6 +108,10 @@ pub struct BgTaskSnapshot {
     pub output_truncated: bool,
     pub output_path: Option<String>,
     pub stderr_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pty_rows: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pty_cols: Option<u16>,
 }
 
 #[derive(Clone)]
@@ -453,6 +457,8 @@ impl BgTaskRegistry {
             compressed,
         );
         metadata.mode = BgMode::Pty;
+        metadata.pty_rows = Some(rows);
+        metadata.pty_cols = Some(cols);
         self.persist_task(&paths, &metadata)
             .map_err(|e| format!("failed to persist background task metadata: {e}"))?;
         create_capture_file(&paths.pty)
@@ -2788,6 +2794,8 @@ impl BgTask {
                 .buffer
                 .stderr_path()
                 .map(|path| path.display().to_string()),
+            pty_rows: (metadata.mode == BgMode::Pty).then_some(metadata.pty_rows.unwrap_or(24)),
+            pty_cols: (metadata.mode == BgMode::Pty).then_some(metadata.pty_cols.unwrap_or(80)),
         }
     }
 
@@ -3161,6 +3169,44 @@ mod tests {
     const LONG_RUNNING_COMMAND: &str = "sleep 5";
     #[cfg(windows)]
     const LONG_RUNNING_COMMAND: &str = "cmd /c timeout /t 5 /nobreak > nul";
+
+    #[test]
+    fn pty_dimensions_are_persisted_and_returned_in_snapshot() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn_pty(
+                QUICK_SUCCESS_COMMAND,
+                "session".to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                dir.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.path().to_path_buf()),
+                50,
+                120,
+            )
+            .unwrap();
+
+        let paths = task_paths(dir.path(), "session", &task_id);
+        let metadata = read_task(&paths.json).unwrap();
+        assert_eq!(
+            metadata.schema_version,
+            crate::bash_background::persistence::SCHEMA_VERSION
+        );
+        assert_eq!(metadata.mode, BgMode::Pty);
+        assert_eq!(metadata.pty_rows, Some(50));
+        assert_eq!(metadata.pty_cols, Some(120));
+
+        let snapshot = registry
+            .status(&task_id, "session", None, Some(dir.path()), 1024)
+            .unwrap();
+        assert_eq!(snapshot.pty_rows, Some(50));
+        assert_eq!(snapshot.pty_cols, Some(120));
+    }
 
     /// Spawn a child process that exits immediately and return it after
     /// it has terminated. Used by reap_child tests to simulate the

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aft::bash_background::persistence::{
-    task_bundle_files, task_paths, write_task, BgMode, PersistedTask,
+    task_bundle_files, task_paths, write_task, BgMode, PersistedTask, SCHEMA_VERSION,
 };
 use aft::bash_background::pty_runtime::CompletionCoordinator;
 use aft::bash_background::{BgTaskRegistry, BgTaskStatus};
@@ -356,7 +356,7 @@ fn pty_task_bundle_files_includes_pty_spill() {
 }
 
 #[test]
-fn pty_v2_task_rehydrates_then_upgrades_to_v3_on_next_persist() {
+fn pty_v2_task_rehydrates_then_upgrades_to_current_schema_on_next_persist() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let paths = task_paths(storage.path(), SESSION, "v2-upgrade");
@@ -398,7 +398,7 @@ fn pty_v2_task_rehydrates_then_upgrades_to_v3_on_next_persist() {
     assert_eq!(acked, vec!["v2-upgrade".to_string()]);
     let after: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&paths.json).unwrap()).unwrap();
-    assert_eq!(after["schema_version"], 3);
+    assert_eq!(after["schema_version"], SCHEMA_VERSION);
 }
 
 fn spawn_pty_task(

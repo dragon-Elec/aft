@@ -137,6 +137,24 @@ describe("OpenCode bash PTY layer", () => {
     expect(result).toContain("there");
   });
 
+  test("Test 25b: bash_status renders custom PTY dimensions", async () => {
+    const outputPath = await spill("\u001b[2J\u001b[Hleft\u001b[1;100Hwide");
+    const { ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "running",
+      mode: "pty",
+      output_path: outputPath,
+      pty_rows: 50,
+      pty_cols: 120,
+    }));
+    const result = await createBashStatusTool(pluginCtx).execute(
+      { taskId: "bash-wide-screen", outputMode: "screen" },
+      runtime(),
+    );
+    expect(result).toContain("left");
+    expect(result).toContain("wide");
+  });
+
   test("Test 26: bash_status cache reuses terminal across calls", async () => {
     const outputPath = await spill("first");
     const { ctx: pluginCtx } = ctx(() => ({

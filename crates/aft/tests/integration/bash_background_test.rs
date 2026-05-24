@@ -199,6 +199,38 @@ fn background_bash_spawns_and_completes_cross_platform() {
     assert!(aft.shutdown().success());
 }
 
+#[cfg(unix)]
+#[test]
+fn pty_spawn_honors_requested_terminal_dimensions() {
+    let mut aft = AftProcess::spawn();
+    let _dir = configure_background(&mut aft);
+
+    let task_id = spawn_bg_params(
+        &mut aft,
+        "pty-custom-dimensions",
+        json!({
+            "command": "stty size; exit",
+            "background": true,
+            "pty": true,
+            "pty_rows": 50,
+            "pty_cols": 120,
+        }),
+    );
+
+    let completed = wait_for_status(&mut aft, &task_id, "completed");
+    assert_eq!(completed["mode"], "pty");
+    assert_eq!(completed["pty_rows"], 50);
+    assert_eq!(completed["pty_cols"], 120);
+    let output_path = completed["output_path"].as_str().unwrap();
+    let output = std::fs::read_to_string(output_path).unwrap();
+    assert!(
+        output.contains("50 120"),
+        "expected PTY output to report 50x120, got {output:?}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
 #[test]
 fn background_spawn_status_running_and_completion() {
     let mut aft = AftProcess::spawn();

@@ -99,6 +99,22 @@ const BashParams = Type.Object({
         'Spawn the command in a real PTY for interactive programs. Requires background: true. Inspect with bash_status({ task_id, output_mode: "screen" }) and send input with bash_write.',
     }),
   ),
+  ptyRows: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      maximum: 60,
+      description:
+        "PTY terminal height in rows. Applies only when pty: true; defaults to 24. Minimum 1, maximum 60.",
+    }),
+  ),
+  ptyCols: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      maximum: 140,
+      description:
+        "PTY terminal width in columns. Applies only when pty: true; defaults to 80. Minimum 1, maximum 140.",
+    }),
+  ),
 });
 
 const BashTaskParams = Type.Object({
@@ -187,6 +203,8 @@ interface BashStatusDetails {
   command?: string;
   mode?: string;
   output_path?: string;
+  pty_rows?: number;
+  pty_cols?: number;
   waited?: BashStatusWaited;
 }
 
@@ -255,6 +273,9 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
     parameters: BashParams,
     async execute(_toolCallId, params: Static<typeof BashParams>, _signal, onUpdate, extCtx) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
+      if (params.pty !== true && (params.ptyRows !== undefined || params.ptyCols !== undefined)) {
+        throw new Error("invalid_request: ptyRows/ptyCols require pty: true");
+      }
       if (params.pty === true && params.background !== true) {
         throw new Error("PTY mode requires background: true");
       }
@@ -291,6 +312,8 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
           notify_on_completion: params.background === true,
           compressed: params.compressed,
           pty: params.pty,
+          pty_rows: params.ptyRows,
+          pty_cols: params.ptyCols,
         },
         extCtx,
         {
@@ -750,7 +773,8 @@ async function readNewTaskOutput(
   const outputPath = data.output_path as string | undefined;
   if (!outputPath) return undefined;
   if (data.mode === "pty") {
-    const state = await getOrCreatePtyTerminal(ptyCacheKey(extCtx, taskId), outputPath);
+    const { rows, cols } = ptyDimensions(data);
+    const state = await getOrCreatePtyTerminal(ptyCacheKey(extCtx, taskId), outputPath, rows, cols);
     const baseOffset = state.offset;
     const bytes = await readPtyBytes(state);
     return { text: bytes.toString("utf8"), baseOffset, nextCursor: state.offset };
@@ -861,7 +885,8 @@ async function formatPtyStatus(
 ): Promise<string> {
   if (!details.output_path) return "\n[PTY output path unavailable]";
   const key = ptyCacheKey(extCtx, taskId);
-  const state = await getOrCreatePtyTerminal(key, details.output_path);
+  const { rows, cols } = ptyDimensions(details);
+  const state = await getOrCreatePtyTerminal(key, details.output_path, rows, cols);
   const raw = await readPtyBytes(state);
   const outputMode = requestedOutputMode ?? "screen";
   let suffix = "";
@@ -873,9 +898,9 @@ ${raw.toString("utf8")}`
         : "";
   } else if (outputMode === "both") {
     suffix = `
-${JSON.stringify({ screen: renderScreen(state, 24, 80), raw: raw.toString("utf8") }, null, 2)}`;
+${JSON.stringify({ screen: renderScreen(state, rows, cols), raw: raw.toString("utf8") }, null, 2)}`;
   } else {
-    const screen = renderScreen(state, 24, 80);
+    const screen = renderScreen(state, rows, cols);
     suffix = screen
       ? `
 ${screen}`
@@ -887,6 +912,15 @@ ${screen}`
     await disposePtyTerminal(key);
   }
   return suffix;
+}
+
+function ptyDimensions(data: { pty_rows?: unknown; pty_cols?: unknown }): {
+  rows: number;
+  cols: number;
+} {
+  const rows = typeof data.pty_rows === "number" ? data.pty_rows : 24;
+  const cols = typeof data.pty_cols === "number" ? data.pty_cols : 80;
+  return { rows, cols };
 }
 
 function ptyCacheKey(extCtx: ExtensionContext, taskId: string): string {

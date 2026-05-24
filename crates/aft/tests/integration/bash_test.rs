@@ -81,6 +81,85 @@ fn bash_rejects_blocked_env_vars() {
     assert!(aft.shutdown().success());
 }
 
+#[test]
+fn bash_rejects_invalid_pty_dimensions() {
+    let mut aft = AftProcess::spawn();
+
+    let cases = [
+        (
+            "pty-rows-zero",
+            serde_json::json!({
+                "command": "echo nope",
+                "background": true,
+                "pty": true,
+                "pty_rows": 0,
+            }),
+            "ptyRows must be an integer between 1 and 60",
+        ),
+        (
+            "pty-rows-too-large",
+            serde_json::json!({
+                "command": "echo nope",
+                "background": true,
+                "pty": true,
+                "pty_rows": 61,
+            }),
+            "ptyRows must be an integer between 1 and 60",
+        ),
+        (
+            "pty-cols-too-large",
+            serde_json::json!({
+                "command": "echo nope",
+                "background": true,
+                "pty": true,
+                "pty_cols": 141,
+            }),
+            "ptyCols must be an integer between 1 and 140",
+        ),
+        (
+            "pty-dims-without-pty",
+            serde_json::json!({
+                "command": "echo nope",
+                "background": true,
+                "pty_rows": 50,
+            }),
+            "ptyRows/ptyCols require pty: true",
+        ),
+        (
+            "pty-rows-float",
+            serde_json::json!({
+                "command": "echo nope",
+                "background": true,
+                "pty": true,
+                "pty_rows": 1.5,
+            }),
+            "invalid params",
+        ),
+    ];
+
+    for (id, params, message) in cases {
+        let response = aft.send(
+            &serde_json::json!({
+                "id": id,
+                "method": "bash",
+                "params": params
+            })
+            .to_string(),
+        );
+        assert_eq!(response["success"], false, "case {id}: {response:?}");
+        assert_eq!(
+            response["code"], "invalid_request",
+            "case {id}: {response:?}"
+        );
+        assert!(
+            response["message"].as_str().unwrap().contains(message),
+            "case {id}: expected message containing {message:?}, got {response:?}"
+        );
+    }
+
+    assert!(aft.shutdown().success());
+}
+
 #[cfg(unix)]
 #[test]
 fn bash_timeout_terminates_shell_process_group_grandchild() {

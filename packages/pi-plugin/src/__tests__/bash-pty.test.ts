@@ -100,6 +100,36 @@ describe("Pi bash PTY layer", () => {
     expect(calls[0][1]).toMatchObject({ pty: true, background: true });
   });
 
+  test("bash pty dimensions require pty true and forward to bridge", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const { calls, ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "running",
+      task_id: "bash-pty-dims",
+    }));
+    registerBashTool(api(tools), pluginCtx);
+
+    await expect(
+      tools
+        .get("bash")!
+        .execute("call", { command: "top", background: true, ptyRows: 50 }, undefined, undefined, {
+          cwd: process.cwd(),
+        }),
+    ).rejects.toThrow("ptyRows/ptyCols require pty: true");
+
+    const result = await tools
+      .get("bash")!
+      .execute(
+        "call",
+        { command: "top", pty: true, background: true, ptyRows: 50, ptyCols: 120 },
+        undefined,
+        undefined,
+        { cwd: process.cwd() },
+      );
+    expect(text(result)).toContain("bash-pty-dims");
+    expect(calls.at(-1)?.[1]).toMatchObject({ pty_rows: 50, pty_cols: 120 });
+  });
+
   test("bash_write schema accepts task_id/input and returns bridge response", async () => {
     const tools = new Map<string, MockToolDef>();
     const { calls, ctx: pluginCtx } = ctx(() => ({ success: true, bytes_written: 3 }));
@@ -155,6 +185,33 @@ describe("Pi bash PTY layer", () => {
       });
     expect(text(result)).toContain("hello");
     expect(text(result)).toContain("there");
+  });
+
+  test("bash_status output_mode screen uses custom dimensions", async () => {
+    const outputPath = await spill("\u001b[2J\u001b[Hleft\u001b[1;100Hwide");
+    const tools = new Map<string, MockToolDef>();
+    const { ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "running",
+      mode: "pty",
+      output_path: outputPath,
+      pty_rows: 50,
+      pty_cols: 120,
+    }));
+    registerBashTool(api(tools), pluginCtx);
+    const result = await tools
+      .get("bash_status")!
+      .execute(
+        "call",
+        { task_id: "bash-wide-screen", output_mode: "screen" },
+        undefined,
+        undefined,
+        {
+          cwd: process.cwd(),
+        },
+      );
+    expect(text(result)).toContain("left");
+    expect(text(result)).toContain("wide");
   });
 
   test("bash_status cache reuses terminal across calls", async () => {

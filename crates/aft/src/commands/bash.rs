@@ -16,6 +16,11 @@ use crate::protocol::{RawRequest, Response, ERROR_PERMISSION_REQUIRED};
 // for the full rationale.
 #[cfg(test)]
 const INLINE_OUTPUT_LIMIT: usize = 30 * 1024;
+const DEFAULT_PTY_ROWS: u16 = 24;
+const DEFAULT_PTY_COLS: u16 = 80;
+const MAX_PTY_ROWS: u16 = 60;
+const MAX_PTY_COLS: u16 = 140;
+
 const BLOCKED_ENV_VARS: &[&str] = &[
     "LD_PRELOAD",
     "LD_LIBRARY_PATH",
@@ -42,6 +47,10 @@ struct BashParams {
     background: bool,
     #[serde(default)]
     pty: bool,
+    #[serde(default)]
+    pty_rows: Option<u16>,
+    #[serde(default)]
+    pty_cols: Option<u16>,
     #[serde(default = "default_notify_on_completion")]
     notify_on_completion: bool,
     #[serde(default = "default_compressed")]
@@ -81,6 +90,18 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             "invalid_request",
             "PTY mode requires background: true",
         );
+    }
+
+    if !params.pty && (params.pty_rows.is_some() || params.pty_cols.is_some()) {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "ptyRows/ptyCols require pty: true",
+        );
+    }
+
+    if let Err(message) = validate_pty_dimensions(params.pty_rows, params.pty_cols) {
+        return Response::error(&req.id, "invalid_request", message);
     }
 
     if let Some(blocked) = blocked_env_var(&params.env) {
@@ -136,7 +157,19 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         params.notify_on_completion,
         params.compressed,
         params.pty,
+        params.pty_rows.unwrap_or(DEFAULT_PTY_ROWS),
+        params.pty_cols.unwrap_or(DEFAULT_PTY_COLS),
     )
+}
+
+fn validate_pty_dimensions(rows: Option<u16>, cols: Option<u16>) -> Result<(), &'static str> {
+    if rows.is_some_and(|value| value == 0 || value > MAX_PTY_ROWS) {
+        return Err("ptyRows must be an integer between 1 and 60");
+    }
+    if cols.is_some_and(|value| value == 0 || value > MAX_PTY_COLS) {
+        return Err("ptyCols must be an integer between 1 and 140");
+    }
+    Ok(())
 }
 
 fn blocked_env_var(env: &HashMap<String, String>) -> Option<&str> {

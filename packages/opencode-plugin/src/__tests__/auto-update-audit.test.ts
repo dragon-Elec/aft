@@ -131,7 +131,7 @@ describe("auto-update audit regressions", () => {
         }),
     );
     const storageDir = createStorageDir();
-    const lockPath = join(storageDir, "last-update-check.json.lock");
+    const lockPath = join(storageDir, "opencode", "last-update-check.json.lock");
     const { createAutoUpdateCheckerHook } = await freshIndexImport();
     const { ctx: ctx1 } = createCtx();
     const { ctx: ctx2 } = createCtx();

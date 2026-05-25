@@ -65,6 +65,19 @@ description = "Internal test filter"
     assert!(filters
         .iter()
         .any(|f| f["source"] == "user" && f["name"] == "user-build"));
+    assert_eq!(
+        response["user_dir"],
+        storage
+            .path()
+            .join("opencode/filters")
+            .display()
+            .to_string()
+    );
+    assert!(storage
+        .path()
+        .join("opencode/filters/user-build.toml")
+        .exists());
+    assert!(!storage.path().join("filters/user-build.toml").exists());
     let project_filter = filters
         .iter()
         .find(|f| f["source"] == "project" && f["name"] == "internal-test")

@@ -107,7 +107,15 @@ exit 1
   };
 }
 
-async function installPreset(h: Harness, preset: FormatPreset, shims: FakeFormatterShim[] = []) {
+async function installPreset(
+  h: Harness,
+  preset: FormatPreset,
+  shims: FakeFormatterShim[] = [],
+  config: Record<string, unknown> = {
+    format_on_edit: true,
+    validate_on_edit: "syntax",
+  },
+) {
   for (const file of preset.configFiles) {
     await mkdir(join(h.tempDir, file.path, ".."), { recursive: true });
     await writeFile(h.path(file.path), file.content, "utf8");
@@ -127,8 +135,7 @@ async function installPreset(h: Harness, preset: FormatPreset, shims: FakeFormat
   const configureParams: Record<string, unknown> = {
     project_root: h.tempDir,
     harness: "pi",
-    format_on_edit: true,
-    validate_on_edit: "syntax",
+    ...config,
   };
   if (preset.explicitFormatter) configureParams.formatter = preset.explicitFormatter;
   const configured = await h.bridge.send("configure", configureParams);
@@ -167,7 +174,7 @@ maybeDescribe("e2e Pi format_on_edit parity", () => {
       config,
     });
     harnesses.push(h);
-    await installPreset(h, preset, shims);
+    await installPreset(h, preset, shims, config);
     return h;
   }
 

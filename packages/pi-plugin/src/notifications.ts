@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import type { BinaryBridge } from "@cortexkit/aft-bridge";
+import { dirname } from "node:path";
+import { type BinaryBridge, repairRootScopedStorageFile } from "@cortexkit/aft-bridge";
 import { log, sessionLog } from "./logger.js";
 
 const WARNING_MARKER = "🔧 AFT: ⚠️";
@@ -153,7 +153,7 @@ export function sendFeatureAnnouncement(
   // spawn at every plugin init. Deferred to a future version that decides whether
   // to accept that trade-off. The Rust-side dual-write from commit 10 covers any
   // other writer; this file stays in sync via direct legacy-file writes.
-  const versionFile = join(storageDir, "last_announced_version");
+  const versionFile = repairRootScopedStorageFile(storageDir, "pi", "last_announced_version");
   try {
     if (existsSync(versionFile)) {
       const lastVersion = readFileSync(versionFile, "utf-8").trim();
@@ -176,7 +176,7 @@ export function sendFeatureAnnouncement(
   log(sections.join("\n"));
 
   try {
-    mkdirSync(storageDir, { recursive: true });
+    mkdirSync(dirname(versionFile), { recursive: true });
     writeFileSync(versionFile, version);
   } catch {
     // best-effort

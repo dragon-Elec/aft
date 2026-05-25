@@ -16,7 +16,7 @@ describe.serial("OpenCode migration bootstrap", () => {
   let cachedAft: string;
 
   function writeFakeAft(exitCode: number): void {
-    const contents = `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "aft 0.26.4"; exit 0; fi\nprintf "%s\\n" "$@" >> ${JSON.stringify(argsLog)}\nexit ${exitCode}\n`;
+    const contents = `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "aft 0.30.1"; exit 0; fi\nprintf "%s\\n" "$@" >> ${JSON.stringify(argsLog)}\nexit ${exitCode}\n`;
     writeFileSync(aftPath, contents, "utf8");
     chmodSync(aftPath, 0o755);
     writeFileSync(cachedAft, contents, "utf8");
@@ -42,8 +42,8 @@ describe.serial("OpenCode migration bootstrap", () => {
       AFT_MIGRATION_ARGS_LOG: argsLog,
     });
 
-    cachedAft = join(xdgCacheHome, "aft", "bin", "v0.26.4", "aft");
-    mkdirSync(join(xdgCacheHome, "aft", "bin", "v0.26.4"), { recursive: true });
+    cachedAft = join(xdgCacheHome, "aft", "bin", "v0.30.1", "aft");
+    mkdirSync(join(xdgCacheHome, "aft", "bin", "v0.30.1"), { recursive: true });
     writeFakeAft(0);
 
     mkdirSync(opencodeConfigDir, { recursive: true });

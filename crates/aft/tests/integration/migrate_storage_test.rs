@@ -346,6 +346,43 @@ fn status_mode_reports_not_migrated_when_marker_absent() {
 }
 
 #[test]
+fn status_mode_reports_source_marker_only_partial_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let from = temp.path().join("legacy");
+    let to = temp.path().join("new");
+    let source_marker = from.join(".migrated_to_cortexkit");
+    write(&source_marker, "{}\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aft"))
+        .arg("migrate-storage")
+        .arg("--status")
+        .arg("--from")
+        .arg(&from)
+        .arg("--to")
+        .arg(&to)
+        .arg("--harness")
+        .arg("opencode")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["harness"], "opencode");
+    assert_eq!(value["target_root"], to.display().to_string());
+    assert_eq!(value["migrated"], false);
+    assert_eq!(
+        value["source_marker_path"],
+        source_marker.display().to_string()
+    );
+    assert_eq!(value["source_marker_present"], true);
+    assert_eq!(value["partial_state"], true);
+}
+
+#[test]
 fn status_mode_does_not_acquire_lock() {
     let temp = tempfile::tempdir().unwrap();
     let to = temp.path().join("new");

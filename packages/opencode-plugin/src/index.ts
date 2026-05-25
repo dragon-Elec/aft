@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { join } from "node:path";
+import { dirname } from "node:path";
 import {
   BridgePool,
   cleanupUrlCache,
@@ -10,6 +10,7 @@ import {
   findBinary,
   getManualInstallHint,
   isOrtAutoDownloadSupported,
+  repairRootScopedStorageFile,
   resolveCortexKitStorageRoot,
   setActiveLogger,
 } from "@cortexkit/aft-bridge";
@@ -703,8 +704,12 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       // spawn at every plugin init. Deferred to a future version that decides whether
       // to accept that trade-off. The Rust-side dual-write from commit 10 covers any
       // other writer; this file stays in sync via direct legacy-file writes.
-      const versionFile = join(storageDir, "last_announced_version");
       try {
+        const versionFile = repairRootScopedStorageFile(
+          storageDir,
+          "opencode",
+          "last_announced_version",
+        );
         if (existsSync(versionFile)) {
           const lastVersion = readFileSync(versionFile, "utf-8").trim();
           if (lastVersion === ANNOUNCEMENT_VERSION) return { show: false };
@@ -724,8 +729,13 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   rpcServer.handle("mark-announced", async () => {
     if (storageDir && ANNOUNCEMENT_VERSION) {
       try {
-        mkdirSync(storageDir, { recursive: true });
-        writeFileSync(join(storageDir, "last_announced_version"), ANNOUNCEMENT_VERSION);
+        const versionFile = repairRootScopedStorageFile(
+          storageDir,
+          "opencode",
+          "last_announced_version",
+        );
+        mkdirSync(dirname(versionFile), { recursive: true });
+        writeFileSync(versionFile, ANNOUNCEMENT_VERSION);
       } catch {
         // best-effort
       }

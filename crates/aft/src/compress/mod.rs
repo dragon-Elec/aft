@@ -37,6 +37,7 @@ pub mod tsc;
 pub mod vitest;
 
 use crate::context::AppContext;
+use crate::harness::Harness;
 use biome::BiomeCompressor;
 use bun::BunCompressor;
 use cargo::CargoCompressor;
@@ -52,6 +53,7 @@ use pnpm::PnpmCompressor;
 use prettier::PrettierCompressor;
 use pytest::PytestCompressor;
 use ruff::RuffCompressor;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use toml_filter::{apply_filter, FilterRegistry};
@@ -189,15 +191,19 @@ pub fn compress_with_registry(command: &str, output: &str, registry: &FilterRegi
 /// Layering (highest priority first):
 /// 1. Project filters at `<project_root>/.aft/filters/*.toml` — loaded only
 ///    when the project is in the trusted set (see [`trust`]).
-/// 2. User filters at `<storage_dir>/filters/*.toml`.
+/// 2. User filters at `<storage_dir>/<harness>/filters/*.toml`.
 /// 3. Builtin filters compiled into the binary via [`builtin_filters`].
 pub fn build_registry_for_context(ctx: &AppContext) -> FilterRegistry {
+    let harness = ctx.harness.borrow().unwrap_or(Harness::Opencode);
     let config = ctx.config();
     let storage_dir = config.storage_dir.clone();
     let project_root = config.project_root.clone();
     drop(config);
 
-    let user_dir = storage_dir.as_ref().map(|d| d.join("filters"));
+    let user_dir = storage_dir.as_ref().map(|dir| {
+        repair_legacy_user_filter_dir(dir, harness);
+        user_filter_dir(dir, harness)
+    });
     let project_dir = match (project_root.as_ref(), storage_dir.as_ref()) {
         (Some(root), Some(storage)) => {
             if trust::is_project_trusted(Some(storage), root) {
@@ -501,10 +507,53 @@ fn looks_like_duration(token: &str) -> bool {
     }
 }
 
-/// Resolve the user-filter directory for an arbitrary storage_dir. Used by
-/// `aft doctor filters` to inspect filters without needing a live AppContext.
-pub fn user_filter_dir(storage_dir: &Path) -> PathBuf {
+/// Resolve the harness-scoped user-filter directory for an arbitrary storage_dir.
+/// Used by `aft doctor filters` to inspect filters without needing a live AppContext.
+pub fn user_filter_dir(storage_dir: &Path, harness: Harness) -> PathBuf {
+    storage_dir.join(harness.as_str()).join("filters")
+}
+
+fn legacy_user_filter_dir(storage_dir: &Path) -> PathBuf {
     storage_dir.join("filters")
+}
+
+/// Move filters written by the short-lived root-scoped v0.27 layout into the
+/// active harness directory. Existing harness files win; colliding root files
+/// are left in place so we never overwrite user-authored filters.
+pub(crate) fn repair_legacy_user_filter_dir(storage_dir: &Path, harness: Harness) {
+    let legacy_dir = legacy_user_filter_dir(storage_dir);
+    if !legacy_dir.exists() {
+        return;
+    }
+
+    let entries = match fs::read_dir(&legacy_dir) {
+        Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
+        Err(_) => return,
+    };
+    if entries.is_empty() {
+        let _ = fs::remove_dir(&legacy_dir);
+        return;
+    }
+
+    let harness_dir = user_filter_dir(storage_dir, harness);
+    if fs::create_dir_all(&harness_dir).is_err() {
+        return;
+    }
+
+    for entry in entries {
+        let target = harness_dir.join(entry.file_name());
+        if target.exists() {
+            continue;
+        }
+        let _ = fs::rename(entry.path(), target);
+    }
+
+    if fs::read_dir(&legacy_dir)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false)
+    {
+        let _ = fs::remove_dir(&legacy_dir);
+    }
 }
 
 /// Resolve the project-filter directory for an arbitrary project root.
@@ -522,12 +571,39 @@ mod tests {
     fn user_and_project_filter_dir_helpers() {
         let storage = Path::new("/tmp/aft-storage");
         assert_eq!(
-            user_filter_dir(storage),
-            Path::new("/tmp/aft-storage/filters")
+            user_filter_dir(storage, Harness::Opencode),
+            Path::new("/tmp/aft-storage/opencode/filters")
         );
 
         let project = Path::new("/repo");
         assert_eq!(project_filter_dir(project), Path::new("/repo/.aft/filters"));
+    }
+
+    #[test]
+    fn repair_legacy_user_filter_dir_moves_root_filters_without_overwrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path();
+        fs::create_dir_all(storage.join("filters")).unwrap();
+        fs::create_dir_all(storage.join("opencode/filters")).unwrap();
+        fs::write(storage.join("filters/root-only.toml"), "root").unwrap();
+        fs::write(storage.join("filters/collides.toml"), "root").unwrap();
+        fs::write(storage.join("opencode/filters/collides.toml"), "harness").unwrap();
+
+        repair_legacy_user_filter_dir(storage, Harness::Opencode);
+
+        assert_eq!(
+            fs::read_to_string(storage.join("opencode/filters/root-only.toml")).unwrap(),
+            "root"
+        );
+        assert_eq!(
+            fs::read_to_string(storage.join("opencode/filters/collides.toml")).unwrap(),
+            "harness"
+        );
+        assert_eq!(
+            fs::read_to_string(storage.join("filters/collides.toml")).unwrap(),
+            "root"
+        );
+        assert!(!storage.join("filters/root-only.toml").exists());
     }
 }
 

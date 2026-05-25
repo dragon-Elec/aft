@@ -1,10 +1,14 @@
 /// <reference path="../bun-test.d.ts" />
 import { afterEach, describe, expect, mock, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
-import { type ConfigureWarning, deliverConfigureWarnings } from "../notifications.js";
+import {
+  type ConfigureWarning,
+  deliverConfigureWarnings,
+  sendFeatureAnnouncement,
+} from "../notifications.js";
 
 const tempRoots = new Set<string>();
 
@@ -383,5 +387,26 @@ describe("deliverConfigureWarnings", () => {
       ),
     ).resolves.toBeUndefined();
     expect(messages).toHaveLength(1);
+  });
+});
+
+describe("sendFeatureAnnouncement storage", () => {
+  test("repairs root-scoped announcement version into pi harness path", () => {
+    const storageDir = createStorageDir();
+    writeFileSync(join(storageDir, "last_announced_version"), "0.30.0", "utf8");
+
+    sendFeatureAnnouncement("0.30.0", ["Feature"], "", storageDir);
+
+    expect(existsSync(join(storageDir, "last_announced_version"))).toBe(false);
+    expect(readFileSync(join(storageDir, "pi", "last_announced_version"), "utf8")).toBe("0.30.0");
+  });
+
+  test("persists new announcement version under pi harness path", () => {
+    const storageDir = createStorageDir();
+
+    sendFeatureAnnouncement("0.30.1", ["Feature"], "", storageDir);
+
+    expect(readFileSync(join(storageDir, "pi", "last_announced_version"), "utf8")).toBe("0.30.1");
+    expect(existsSync(join(storageDir, "last_announced_version"))).toBe(false);
   });
 });

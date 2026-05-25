@@ -8,7 +8,8 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
+import { repairRootScopedStorageFile } from "@cortexkit/aft-bridge";
 import type { PluginInput } from "@opencode-ai/plugin";
 
 import { log, warn } from "../../logger.js";
@@ -65,7 +66,7 @@ const TIMESTAMP_FILENAME = "last-update-check.json";
  *     `session.created`.
  *
  * Multi-project coordination is now handled by an on-disk timestamp at
- * `<storageDir>/last-update-check.json`. Every plugin instance reads
+ * `<storageDir>/opencode/last-update-check.json`. Every plugin instance reads
  * the timestamp before checking; if it's within `checkIntervalMs` of
  * now, the check is skipped. The first instance to claim the slot
  * writes the timestamp atomically (temp + rename) so concurrent
@@ -172,7 +173,7 @@ async function maybeRunCheck(
 function claimCheckSlot(storageDir: string | null, intervalMs: number): CheckSlotLock | null {
   if (!storageDir) return { release: () => {} }; // No storage available — fail open.
 
-  const file = join(storageDir, TIMESTAMP_FILENAME);
+  const file = repairRootScopedStorageFile(storageDir, "opencode", TIMESTAMP_FILENAME);
   try {
     if (hasRecentCheckTimestamp(file, intervalMs)) return null;
 

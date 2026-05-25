@@ -1,6 +1,6 @@
 /// <reference path="../bun-test.d.ts" />
 import { afterEach, describe, expect, mock, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
@@ -437,6 +437,47 @@ describe("deliverConfigureWarnings", () => {
       ),
     ).resolves.toBeUndefined();
     expect(messages).toHaveLength(1);
+  });
+});
+
+describe("sendFeatureAnnouncement storage", () => {
+  test("repairs root-scoped announcement version into opencode harness path", async () => {
+    const storageDir = createStorageDir();
+    writeFileSync(join(storageDir, "last_announced_version"), "0.30.0", "utf8");
+    const showToast = mock(async () => undefined);
+
+    await sendFeatureAnnouncement(
+      { client: { tui: { showToast } }, directory: "/repo" },
+      "0.30.0",
+      ["Feature"],
+      "",
+      storageDir,
+    );
+
+    expect(showToast).not.toHaveBeenCalled();
+    expect(existsSync(join(storageDir, "last_announced_version"))).toBe(false);
+    expect(readFileSync(join(storageDir, "opencode", "last_announced_version"), "utf8")).toBe(
+      "0.30.0",
+    );
+  });
+
+  test("persists new announcement version under opencode harness path", async () => {
+    const storageDir = createStorageDir();
+    const showToast = mock(async () => undefined);
+
+    await sendFeatureAnnouncement(
+      { client: { tui: { showToast } }, directory: "/repo" },
+      "0.30.1",
+      ["Feature"],
+      "",
+      storageDir,
+    );
+
+    expect(showToast).toHaveBeenCalledTimes(1);
+    expect(readFileSync(join(storageDir, "opencode", "last_announced_version"), "utf8")).toBe(
+      "0.30.1",
+    );
+    expect(existsSync(join(storageDir, "last_announced_version"))).toBe(false);
   });
 });
 

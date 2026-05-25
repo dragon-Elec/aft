@@ -219,11 +219,43 @@ fn parse_params(req: &RawRequest, command: &str) -> Result<StateParams, Response
 fn legacy_harness_path(ctx: &AppContext, key: &str) -> Option<PathBuf> {
     let dir = ctx.harness_dir();
     match key {
-        "last_announced_version" => Some(dir.join("last_announced_version")),
-        "last_update_check" => Some(dir.join("last-update-check.json")),
+        "last_announced_version" => Some(repair_root_scoped_harness_file(
+            ctx,
+            &dir,
+            "last_announced_version",
+        )),
+        "last_update_check" => Some(repair_root_scoped_harness_file(
+            ctx,
+            &dir,
+            "last-update-check.json",
+        )),
         "warned_tools" => Some(dir.join("warned_tools.json")),
         _ => None,
     }
+}
+
+fn repair_root_scoped_harness_file(
+    ctx: &AppContext,
+    harness_dir: &Path,
+    file_name: &str,
+) -> PathBuf {
+    let harness_path = harness_dir.join(file_name);
+    if harness_path.exists() {
+        return harness_path;
+    }
+
+    let root_path = ctx.storage_dir().join(file_name);
+    if !root_path.exists() {
+        return harness_path;
+    }
+
+    if let Some(parent) = harness_path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return harness_path;
+        }
+    }
+    let _ = fs::rename(root_path, &harness_path);
+    harness_path
 }
 
 fn legacy_host_path(ctx: &AppContext, key: &str) -> Option<PathBuf> {

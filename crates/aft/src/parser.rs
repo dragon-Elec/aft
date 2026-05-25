@@ -896,6 +896,22 @@ impl SymbolCache {
         })
     }
 
+    /// Return a cached symbol count when file metadata exactly matches the cache entry.
+    ///
+    /// This is the fast path for directory file-tree summaries: when mtime and
+    /// size are unchanged, callers can use the count without cloning symbols or
+    /// re-reading the file to verify a content hash.
+    pub fn symbol_count_if_metadata_matches(
+        &self,
+        path: &Path,
+        mtime: SystemTime,
+        size: u64,
+    ) -> Option<usize> {
+        self.entries.get(path).and_then(|cached| {
+            (cached.mtime == mtime && cached.size == size).then_some(cached.symbols.len())
+        })
+    }
+
     /// Whether the cache has a still-valid entry for the given file mtime.
     pub fn contains_path_with_mtime(&self, path: &Path, mtime: SystemTime) -> bool {
         self.entries

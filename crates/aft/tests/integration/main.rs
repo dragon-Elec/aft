@@ -59,6 +59,7 @@ mod member_test;
 mod migrate_storage_test;
 mod move_file_test;
 mod move_symbol_test;
+mod outline_files_mode_test;
 mod outline_languages_test;
 mod outline_zoom_test;
 mod parser_audit_fixes_test;

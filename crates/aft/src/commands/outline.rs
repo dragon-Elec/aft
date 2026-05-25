@@ -1,16 +1,20 @@
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
 
 use crate::context::AppContext;
 use crate::edit;
 use crate::error::AftError;
-use crate::parser::detect_language;
+use crate::parser::{detect_language, LangId};
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::{Range, Symbol};
 use crate::url_fetch::{fetch_url_to_cache, is_http_url, UrlFetchOptions};
 
 const MAX_OUTLINE_FILE_BYTES: u64 = 50 * 1024 * 1024;
+const BINARY_SAMPLE_BYTES: usize = 4 * 1024;
 
 /// A single entry in the outline tree.
 ///
@@ -38,6 +42,15 @@ pub struct OutlineEntry {
 /// Output is capped at 30KB; if exceeded, truncates with a narrowing hint.
 pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
     const MAX_OUTPUT_BYTES: usize = 30 * 1024;
+
+    if req
+        .params
+        .get("files")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return handle_outline_files_mode(req, ctx, MAX_OUTPUT_BYTES);
+    }
 
     if let Some(directory) = req.params.get("directory").and_then(|v| v.as_str()) {
         let dir_path = match ctx.validate_path(&req.id, Path::new(directory)) {
@@ -267,6 +280,330 @@ impl SkippedFile {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct OutlineFileEntry {
+    path: String,
+    language: String,
+    symbols: usize,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct OutlineWalkOptions {
+    gitignore: Option<Arc<ignore::gitignore::Gitignore>>,
+    gitignore_root: Option<PathBuf>,
+}
+
+fn handle_outline_files_mode(
+    req: &RawRequest,
+    ctx: &AppContext,
+    max_output_bytes: usize,
+) -> Response {
+    let targets = match outline_files_mode_targets(req) {
+        Ok(targets) => targets,
+        Err(response) => return response,
+    };
+
+    let mut file_entries = Vec::new();
+    let mut walk_truncated = false;
+
+    for target in targets {
+        let dir_path = match ctx.validate_path(&req.id, Path::new(&target)) {
+            Ok(path) => path,
+            Err(response) => return response,
+        };
+
+        if !dir_path.exists() {
+            return Response::error(
+                &req.id,
+                "file_not_found",
+                format!("directory not found: {}", target),
+            );
+        }
+        if !dir_path.is_dir() {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "files mode requires a directory target",
+            );
+        }
+
+        let (files, truncated) = discover_outline_files_for_files_mode(&dir_path, ctx);
+        walk_truncated |= truncated;
+
+        for file in files {
+            let file_path = PathBuf::from(file);
+            if let Some(entry) = outline_file_entry(&file_path, &dir_path, ctx) {
+                file_entries.push(entry);
+            }
+        }
+    }
+
+    file_entries.sort_by(|a, b| a.path.cmp(&b.path));
+    let (text, mut unchecked_files, text_truncated) =
+        format_files_table(&file_entries, max_output_bytes);
+    if walk_truncated && unchecked_files.is_empty() {
+        unchecked_files
+            .push("<additional files not discovered: directory walk limit reached>".to_string());
+    }
+
+    Response::success(
+        &req.id,
+        serde_json::json!({
+            "text": text,
+            "files": file_entries,
+            "complete": !walk_truncated && !text_truncated,
+            "walk_truncated": walk_truncated,
+            "unchecked_files": unchecked_files,
+        }),
+    )
+}
+
+fn outline_files_mode_targets(req: &RawRequest) -> Result<Vec<String>, Response> {
+    if let Some(directory) = req.params.get("directory").and_then(|value| value.as_str()) {
+        return Ok(vec![directory.to_string()]);
+    }
+
+    if let Some(directories) = req
+        .params
+        .get("directories")
+        .and_then(|value| value.as_array())
+    {
+        let targets = directories
+            .iter()
+            .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+            .collect::<Vec<_>>();
+        if !targets.is_empty() {
+            return Ok(targets);
+        }
+    }
+
+    if let Some(target) = req.params.get("target") {
+        if let Some(target) = target.as_str() {
+            return Ok(vec![target.to_string()]);
+        }
+        if let Some(targets) = target.as_array() {
+            let targets = targets
+                .iter()
+                .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                .collect::<Vec<_>>();
+            if !targets.is_empty() {
+                return Ok(targets);
+            }
+        }
+    }
+
+    if let Some(file) = req.params.get("file").and_then(|value| value.as_str()) {
+        return Ok(vec![file.to_string()]);
+    }
+
+    Err(Response::error(
+        &req.id,
+        "invalid_request",
+        "files mode requires a directory target",
+    ))
+}
+
+fn discover_outline_files_for_files_mode(
+    directory: &Path,
+    ctx: &AppContext,
+) -> (Vec<String>, bool) {
+    let gitignore = ctx.gitignore();
+    let gitignore_root = ctx
+        .config()
+        .project_root
+        .as_ref()
+        .and_then(|root| std::fs::canonicalize(root).ok());
+    let options = OutlineWalkOptions {
+        gitignore,
+        gitignore_root,
+    };
+    discover_outline_files_with_options(directory, Some(&options))
+}
+
+fn outline_file_entry(
+    path: &Path,
+    target_root: &Path,
+    ctx: &AppContext,
+) -> Option<OutlineFileEntry> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let rel_path = path
+        .strip_prefix(target_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let bytes = metadata.len();
+    let detected_language = detect_language(path).map(language_id);
+
+    if let Some(symbols) = cached_symbol_count(ctx, path, &metadata) {
+        return Some(OutlineFileEntry {
+            path: rel_path,
+            language: detected_language.unwrap_or("unknown").to_string(),
+            symbols,
+            bytes,
+        });
+    }
+
+    let Some(language) = detected_language else {
+        return Some(OutlineFileEntry {
+            path: rel_path,
+            language: if file_looks_binary(path) {
+                "binary"
+            } else {
+                "unknown"
+            }
+            .to_string(),
+            symbols: 0,
+            bytes,
+        });
+    };
+
+    if file_looks_binary(path) {
+        return Some(OutlineFileEntry {
+            path: rel_path,
+            language: "binary".to_string(),
+            symbols: 0,
+            bytes,
+        });
+    }
+
+    if bytes > MAX_OUTLINE_FILE_BYTES {
+        return Some(OutlineFileEntry {
+            path: rel_path,
+            language: language.to_string(),
+            symbols: 0,
+            bytes,
+        });
+    }
+
+    let symbols = ctx
+        .provider()
+        .list_symbols(path)
+        .map(|symbols| symbols.len())
+        .unwrap_or(0);
+
+    Some(OutlineFileEntry {
+        path: rel_path,
+        language: language.to_string(),
+        symbols,
+        bytes,
+    })
+}
+
+fn cached_symbol_count(
+    ctx: &AppContext,
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Option<usize> {
+    let mtime = metadata.modified().unwrap_or(UNIX_EPOCH);
+    let size = metadata.len();
+    let symbol_cache = ctx.symbol_cache();
+    let cache = symbol_cache.read().ok()?;
+    cache
+        .symbol_count_if_metadata_matches(path, mtime, size)
+        .or_else(|| cache.get(path, mtime).map(|symbols| symbols.len()))
+}
+
+fn file_looks_binary(path: &Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut sample = [0u8; BINARY_SAMPLE_BYTES];
+    let Ok(bytes_read) = file.read(&mut sample) else {
+        return false;
+    };
+    bytes_read > 0 && content_inspector::inspect(&sample[..bytes_read]).is_binary()
+}
+
+fn language_id(lang: LangId) -> &'static str {
+    match lang {
+        LangId::TypeScript => "typescript",
+        LangId::Tsx => "tsx",
+        LangId::JavaScript => "javascript",
+        LangId::Python => "python",
+        LangId::Rust => "rust",
+        LangId::Go => "go",
+        LangId::C => "c",
+        LangId::Cpp => "cpp",
+        LangId::Zig => "zig",
+        LangId::CSharp => "csharp",
+        LangId::Bash => "bash",
+        LangId::Html => "html",
+        LangId::Markdown => "markdown",
+        LangId::Solidity => "solidity",
+        LangId::Vue => "vue",
+        LangId::Json => "json",
+        LangId::Scala => "scala",
+        LangId::Java => "java",
+        LangId::Ruby => "ruby",
+        LangId::Kotlin => "kotlin",
+        LangId::Swift => "swift",
+        LangId::Php => "php",
+        LangId::Lua => "lua",
+        LangId::Perl => "perl",
+    }
+}
+
+fn format_files_table(
+    entries: &[OutlineFileEntry],
+    max_bytes: usize,
+) -> (String, Vec<String>, bool) {
+    let path_width = entries
+        .iter()
+        .map(|entry| entry.path.len())
+        .max()
+        .unwrap_or(0);
+    let language_width = entries
+        .iter()
+        .map(|entry| entry.language.len())
+        .max()
+        .unwrap_or("language".len())
+        .max(8);
+
+    let mut output = String::new();
+    let mut shown = 0usize;
+    let mut truncated = false;
+
+    for entry in entries {
+        let line = format!(
+            "{:<path_width$}  {:<language_width$} {:>5} syms {:>9} bytes\n",
+            entry.path,
+            entry.language,
+            entry.symbols,
+            entry.bytes,
+            path_width = path_width,
+            language_width = language_width,
+        );
+        if output.len() + line.len() > max_bytes {
+            truncated = true;
+            break;
+        }
+        output.push_str(&line);
+        shown += 1;
+    }
+
+    let unchecked_files = if truncated {
+        entries[shown..]
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    if truncated {
+        output.push_str(&format!(
+            "\n... truncated ({}/{} files shown, {}KB limit)\n\
+             Narrow scope with a more specific directory path.\n",
+            shown,
+            entries.len(),
+            max_bytes / 1024,
+        ));
+    }
+
+    (output, unchecked_files, truncated)
+}
+
 fn outline_many_files(
     files: &[String],
     ctx: &AppContext,
@@ -308,14 +645,26 @@ fn outline_many_files(
 }
 
 fn discover_outline_files(directory: &Path) -> (Vec<String>, bool) {
+    discover_outline_files_with_options(directory, None)
+}
+
+fn discover_outline_files_with_options(
+    directory: &Path,
+    options: Option<&OutlineWalkOptions>,
+) -> (Vec<String>, bool) {
     let mut files = Vec::new();
     let mut truncated = false;
-    collect_outline_files(directory, &mut files, &mut truncated);
+    collect_outline_files(directory, &mut files, &mut truncated, options);
     files.sort();
     (files, truncated)
 }
 
-fn collect_outline_files(directory: &Path, files: &mut Vec<String>, truncated: &mut bool) {
+fn collect_outline_files(
+    directory: &Path,
+    files: &mut Vec<String>,
+    truncated: &mut bool,
+    options: Option<&OutlineWalkOptions>,
+) {
     if files.len() >= 200 {
         *truncated = true;
         return;
@@ -335,11 +684,14 @@ fn collect_outline_files(directory: &Path, files: &mut Vec<String>, truncated: &
             continue;
         }
         if path.is_dir() {
-            if should_skip_directory(&path) {
+            if should_skip_directory(&path) || is_ignored_outline_path(&path, true, options) {
                 continue;
             }
-            collect_outline_files(&path, files, truncated);
+            collect_outline_files(&path, files, truncated, options);
         } else if path.is_file() {
+            if is_ignored_outline_path(&path, false, options) {
+                continue;
+            }
             files.push(path.to_string_lossy().to_string());
         }
     }
@@ -349,6 +701,30 @@ fn is_symlink(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
         .map(|metadata| metadata.file_type().is_symlink())
         .unwrap_or(false)
+}
+
+fn is_ignored_outline_path(
+    path: &Path,
+    is_dir: bool,
+    options: Option<&OutlineWalkOptions>,
+) -> bool {
+    let Some(options) = options else {
+        return false;
+    };
+    let Some(gitignore) = options.gitignore.as_ref() else {
+        return false;
+    };
+
+    let candidate = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Some(root) = options.gitignore_root.as_ref() {
+        if !candidate.starts_with(root) {
+            return false;
+        }
+    }
+
+    gitignore
+        .matched_path_or_any_parents(candidate, is_dir)
+        .is_ignore()
 }
 
 fn should_skip_directory(path: &Path) -> bool {

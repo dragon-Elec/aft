@@ -1,0 +1,328 @@
+use super::helpers::AftProcess;
+use filetime::{set_file_mtime, FileTime};
+use serde_json::{json, Value};
+use std::fs;
+use std::path::{Path, PathBuf};
+use tempfile::TempDir;
+
+fn write_file(root: &Path, relative: &str, content: &str) -> PathBuf {
+    write_bytes(root, relative, content.as_bytes())
+}
+
+fn write_bytes(root: &Path, relative: &str, content: &[u8]) -> PathBuf {
+    let path = root.join(relative);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(&path, content).unwrap();
+    path
+}
+
+fn send(aft: &mut AftProcess, request: Value) -> Value {
+    aft.send(&request.to_string())
+}
+
+fn outline_files(aft: &mut AftProcess, directory: &Path) -> Value {
+    send(
+        aft,
+        json!({
+            "id": "outline-files",
+            "command": "outline",
+            "directory": directory,
+            "files": true,
+        }),
+    )
+}
+
+fn files(resp: &Value) -> &Vec<Value> {
+    resp["files"].as_array().expect("files array")
+}
+
+fn file_entry<'a>(resp: &'a Value, path: &str) -> &'a Value {
+    files(resp)
+        .iter()
+        .find(|entry| entry["path"] == path)
+        .unwrap_or_else(|| panic!("missing {path} in files response: {resp:?}"))
+}
+
+fn response_paths(resp: &Value) -> Vec<String> {
+    files(resp)
+        .iter()
+        .map(|entry| entry["path"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn outline_files_mode_returns_file_metadata_with_language_and_symbol_counts() {
+    let dir = TempDir::new().unwrap();
+    let ts = write_file(
+        dir.path(),
+        "src/service.ts",
+        "export function greet() { return 1; }\nexport const answer = 42;\n",
+    );
+    let rs = write_file(
+        dir.path(),
+        "crates/model.rs",
+        "pub struct Config {}\npub fn compute() -> i32 { 1 }\n",
+    );
+    let md = write_file(dir.path(), "docs/readme.md", "# Title\n\n## Details\n");
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = outline_files(&mut aft, dir.path());
+    assert_eq!(
+        resp["success"], true,
+        "outline files should succeed: {resp:?}"
+    );
+    assert_eq!(resp["complete"], true);
+
+    let rs_entry = file_entry(&resp, "crates/model.rs");
+    assert_eq!(rs_entry["language"], "rust");
+    assert_eq!(rs_entry["symbols"], 2);
+    assert_eq!(rs_entry["bytes"], fs::metadata(rs).unwrap().len());
+
+    let ts_entry = file_entry(&resp, "src/service.ts");
+    assert_eq!(ts_entry["language"], "typescript");
+    assert_eq!(ts_entry["symbols"], 2);
+    assert_eq!(ts_entry["bytes"], fs::metadata(ts).unwrap().len());
+
+    let md_entry = file_entry(&resp, "docs/readme.md");
+    assert_eq!(md_entry["language"], "markdown");
+    assert_eq!(md_entry["symbols"], 2);
+    assert_eq!(md_entry["bytes"], fs::metadata(md).unwrap().len());
+
+    let text = resp["text"].as_str().unwrap();
+    assert!(text.contains("src/service.ts"), "missing TS row: {text}");
+    assert!(text.contains("typescript"), "missing language: {text}");
+    assert!(text.contains("2 syms"), "missing symbol count: {text}");
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn outline_files_false_keeps_symbol_focused_directory_output() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        dir.path(),
+        "src/service.ts",
+        "export function greet() { return 1; }\n",
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "outline-directory",
+            "command": "outline",
+            "directory": dir.path(),
+        }),
+    );
+
+    assert_eq!(
+        resp["success"], true,
+        "directory outline should succeed: {resp:?}"
+    );
+    assert!(
+        resp.get("files").is_none(),
+        "default outline must not return files data: {resp:?}"
+    );
+    let text = resp["text"].as_str().unwrap();
+    assert!(text.contains("src/\n"), "missing directory tree: {text}");
+    assert!(text.contains("service.ts"), "missing file in tree: {text}");
+    assert!(text.contains("greet"), "missing symbol in tree: {text}");
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn outline_files_mode_rejects_file_targets() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(dir.path(), "single.ts", "export function single() {}\n");
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "outline-files-file-target",
+            "command": "outline",
+            "file": file,
+            "files": true,
+        }),
+    );
+
+    assert_eq!(resp["success"], false);
+    assert_eq!(resp["code"], "invalid_request");
+    assert_eq!(resp["message"], "files mode requires a directory target");
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn outline_files_mode_lists_binary_unknown_extension_files() {
+    let dir = TempDir::new().unwrap();
+    write_bytes(dir.path(), "assets/blob.dat", &[0, 159, 146, 150, 0, 1]);
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = outline_files(&mut aft, dir.path());
+    assert_eq!(
+        resp["success"], true,
+        "outline files should succeed: {resp:?}"
+    );
+
+    let entry = file_entry(&resp, "assets/blob.dat");
+    assert_eq!(entry["language"], "binary");
+    assert_eq!(entry["symbols"], 0);
+    assert_eq!(entry["bytes"], 6);
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn outline_files_mode_excludes_gitignored_paths_when_matcher_is_active() {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), ".gitignore", "ignored.ts\nignored-dir/\n");
+    write_file(dir.path(), "visible.ts", "export function visible() {}\n");
+    write_file(dir.path(), "ignored.ts", "export function ignored() {}\n");
+    write_file(
+        dir.path(),
+        "ignored-dir/nested.ts",
+        "export function nested() {}\n",
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = outline_files(&mut aft, dir.path());
+    assert_eq!(
+        resp["success"], true,
+        "outline files should succeed: {resp:?}"
+    );
+    let paths = response_paths(&resp);
+
+    assert!(
+        paths.contains(&"visible.ts".to_string()),
+        "visible file missing: {paths:?}"
+    );
+    assert!(
+        !paths.contains(&"ignored.ts".to_string()),
+        "ignored file should be excluded: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|path| path.starts_with("ignored-dir/")),
+        "ignored directory should be excluded: {paths:?}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn outline_files_mode_uses_fresh_symbol_cache_without_reparsing() {
+    let dir = TempDir::new().unwrap();
+    let mut content = String::from("export function cached() { return 1; }\n");
+    content.push_str("//");
+    content.push_str(&"x".repeat(4 * 1024 * 1024 + 32));
+    content.push('\n');
+    let file = write_file(dir.path(), "cached.ts", &content);
+    let original_len = fs::metadata(&file).unwrap().len() as usize;
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let warm = send(
+        &mut aft,
+        json!({
+            "id": "warm-cache",
+            "command": "outline",
+            "file": file,
+        }),
+    );
+    assert_eq!(warm["success"], true, "cache warm outline failed: {warm:?}");
+    let original_mtime = fs::metadata(&file).unwrap().modified().unwrap();
+
+    fs::write(&file, vec![0xff; original_len]).unwrap();
+    set_file_mtime(&file, FileTime::from_system_time(original_mtime)).unwrap();
+
+    let resp = outline_files(&mut aft, dir.path());
+    assert_eq!(
+        resp["success"], true,
+        "outline files should succeed: {resp:?}"
+    );
+    let entry = file_entry(&resp, "cached.ts");
+    assert_eq!(entry["language"], "typescript");
+    assert_eq!(
+        entry["symbols"], 1,
+        "fresh cache count should be used even though the current bytes are not parseable UTF-8"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn outline_files_mode_truncates_text_and_reports_unchecked_files() {
+    let dir = TempDir::new().unwrap();
+    let long_dir = format!("src/{}", "very-long-segment-".repeat(8));
+    for index in 0..200 {
+        write_file(
+            dir.path(),
+            &format!("{long_dir}/file-{index:03}-with-extra-name.txt"),
+            "x\n",
+        );
+    }
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = outline_files(&mut aft, dir.path());
+    assert_eq!(
+        resp["success"], true,
+        "outline files should succeed: {resp:?}"
+    );
+    assert_eq!(resp["complete"], false);
+    assert_eq!(resp["walk_truncated"], false);
+    assert_eq!(files(&resp).len(), 200);
+    assert!(
+        !resp["unchecked_files"].as_array().unwrap().is_empty(),
+        "unchecked_files should list rows omitted by the text cap: {resp:?}"
+    );
+    let text = resp["text"].as_str().unwrap();
+    assert!(
+        text.contains("... truncated ("),
+        "missing truncation marker: {text}"
+    );
+    assert!(
+        text.contains("30KB limit"),
+        "missing cap in truncation marker: {text}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn outline_files_mode_sorts_entries_by_path() {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "zeta.ts", "export function zeta() {}\n");
+    write_file(dir.path(), "alpha.ts", "export function alpha() {}\n");
+    write_file(dir.path(), "nested/beta.ts", "export function beta() {}\n");
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = outline_files(&mut aft, dir.path());
+    assert_eq!(
+        resp["success"], true,
+        "outline files should succeed: {resp:?}"
+    );
+    assert_eq!(
+        response_paths(&resp),
+        vec!["alpha.ts", "nested/beta.ts", "zeta.ts"]
+    );
+
+    assert!(aft.shutdown().success());
+}

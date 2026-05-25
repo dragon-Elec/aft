@@ -29,6 +29,12 @@ const OutlineParams = Type.Object({
     description:
       "What to outline: a file path, directory path, URL (http:// or https://), or array of file paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file. Directory walks cap at 200 files.",
   }),
+  files: Type.Optional(
+    Type.Boolean({
+      description:
+        "Directory-only mode: when true, target must be a directory or array of directories and the result is a flat file tree with path, language, symbol count, and byte size instead of a symbol outline.",
+    }),
+  ),
 });
 
 const ZoomParams = Type.Object({
@@ -190,9 +196,9 @@ export function renderOutlineCall(
   context: RenderContextLike,
 ) {
   const summary = Array.isArray(args.target)
-    ? theme.fg("accent", `${args.target.length} files`)
+    ? theme.fg("accent", `${args.target.length} ${args.files ? "directories" : "files"}`)
     : typeof args.target === "string"
-      ? accentPath(theme, args.target)
+      ? `${accentPath(theme, args.target)}${args.files ? " files" : ""}`
       : undefined;
   return renderToolCall("outline", summary, theme, context);
 }
@@ -247,7 +253,7 @@ export function registerReadingTools(
       name: "aft_outline",
       label: "outline",
       description:
-        "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it (recursively, up to 200 files)\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call",
+        "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. Set `files: true` with a directory target for a flat indexed file tree with language, symbol count, and byte metadata.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it (recursively, up to 200 files)\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory",
       parameters: OutlineParams,
       async execute(
         _toolCallId: string,
@@ -258,7 +264,43 @@ export function registerReadingTools(
       ) {
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const target = params.target;
+        const filesMode = params.files === true;
         const isArray = Array.isArray(target) && target.length > 0;
+
+        if (filesMode) {
+          if (Array.isArray(target)) {
+            if (target.length === 0) {
+              throw new Error("'target' must be a non-empty string or array of strings");
+            }
+            const response = await callBridge(bridge, "outline", { target, files: true }, extCtx);
+            if (response.success === false) {
+              throw new Error((response.message as string) || "outline failed");
+            }
+            return textResult(formatOutlineText(response), response);
+          }
+
+          if (typeof target !== "string" || target.length === 0) {
+            throw new Error("'target' must be a non-empty string or array of strings");
+          }
+
+          let isDirectory = false;
+          try {
+            const resolved = resolve(extCtx.cwd, target);
+            const st = await stat(resolved);
+            isDirectory = st.isDirectory();
+          } catch {
+            // Let Rust report missing paths with its structured error shape.
+          }
+
+          const request = isDirectory
+            ? { directory: resolve(extCtx.cwd, target), files: true }
+            : { file: target, files: true };
+          const response = await callBridge(bridge, "outline", request, extCtx);
+          if (response.success === false) {
+            throw new Error((response.message as string) || "outline failed");
+          }
+          return textResult(formatOutlineText(response), response);
+        }
 
         // URL mode: pass through to Rust; Rust fetches, validates, and caches.
         if (typeof target === "string" && isUrl(target)) {

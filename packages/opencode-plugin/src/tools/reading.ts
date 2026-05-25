@@ -27,25 +27,68 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
   return {
     aft_outline: {
       description:
-        "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom.\n\n" +
+        "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. Set `files: true` with a directory target for a flat indexed file tree with language, symbol count, and byte metadata.\n\n" +
         "Pass a single `target`:\n" +
         "  • file path → outline that file (with signatures)\n" +
         "  • directory path → outline all source files under it (recursively, up to 200 files)\n" +
         "  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n" +
-        "  • array of paths → outline multiple files in one call",
+        "  • array of paths → outline multiple files in one call; with files:true, every path must be a directory",
       args: {
         target: z
           .union([z.string(), z.array(z.string())])
           .describe(
             "What to outline: a file path, directory path, URL, or array of file paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
           ),
+        files: z
+          .boolean()
+          .optional()
+          .describe(
+            "Directory-only mode: when true, target must be a directory or array of directories and the result is a flat file tree with path, language, symbol count, and byte size instead of a symbol outline.",
+          ),
       },
       execute: async (args, context): Promise<string> => {
         const target = args.target;
+        const filesMode = args.files === true;
         const hasUrl =
           typeof target === "string" &&
           (target.startsWith("http://") || target.startsWith("https://"));
         const isArray = Array.isArray(target) && target.length > 0;
+
+        if (filesMode) {
+          if (Array.isArray(target)) {
+            if (target.length === 0) {
+              throw new Error("'target' must be a non-empty string or array of strings");
+            }
+            const response = await callBridge(ctx, context, "outline", { target, files: true });
+            if (response.success === false) {
+              throw new Error((response.message as string) || "outline failed");
+            }
+            return formatOutlineText(response);
+          }
+
+          if (typeof target !== "string" || target.length === 0) {
+            throw new Error("'target' must be a non-empty string or array of strings");
+          }
+
+          let isDirectory = false;
+          try {
+            const { stat } = await import("node:fs/promises");
+            const resolved = resolve(context.directory, target);
+            const st = await stat(resolved);
+            isDirectory = st.isDirectory();
+          } catch {
+            // Let Rust report missing paths with its structured error shape.
+          }
+
+          const params = isDirectory
+            ? { directory: resolve(context.directory, target), files: true }
+            : { file: target, files: true };
+          const response = await callBridge(ctx, context, "outline", params);
+          if (response.success === false) {
+            throw new Error((response.message as string) || "outline failed");
+          }
+          return formatOutlineText(response);
+        }
 
         // URL mode: pass through to Rust; Rust fetches, validates, and caches.
         if (hasUrl) {

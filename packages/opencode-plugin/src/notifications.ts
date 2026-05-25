@@ -19,6 +19,7 @@ import { homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
 import { type BinaryBridge, repairRootScopedStorageFile } from "@cortexkit/aft-bridge";
 import { sessionLog } from "./logger.js";
+import { resolvePromptContext } from "./shared/last-assistant-model.js";
 
 // --- TUI toast helper ---
 
@@ -269,17 +270,30 @@ async function sendIgnoredMessage(
 
     // `noReply: true` means OpenCode appends this as a synthetic user
     // message and does NOT trigger an assistant turn. No LLM call
-    // happens, so model/variant/agent passthrough is unnecessary here.
-    // Keeping the body minimal also avoids OpenCode-side crashes that
-    // surfaced when we passed model/agent on this path. Cache-preserving
-    // model/variant forwarding belongs ONLY on wake-style calls
+    // happens, so model/variant passthrough is unnecessary here, and
+    // earlier attempts to pass model on this path caused OpenCode-side
+    // crashes in some host versions.
+    //
+    // `agent` IS needed for UI attribution: without it, OpenCode renders
+    // configure warnings / auto-update / startup announcements / status
+    // messages under the *default* agent rather than the agent the user
+    // has switched to (e.g. via oh-my-openagent). See issue #62. Passing
+    // agent is safe because OpenCode short-circuits on `noReply: true`
+    // before the LLM turn, but `createUserMessage` still records `agent`
+    // on the appended user message.
+    //
+    // model/variant forwarding still belongs ONLY on wake-style calls
     // (noReply: false), which live in bg-notifications.ts.
+    const agent = await resolveCurrentAgent(c, sessionId);
+    const body: Record<string, unknown> = {
+      noReply: true,
+      parts: [{ type: "text", text, ignored: true }],
+    };
+    if (agent) body.agent = agent;
+
     const promptInput = {
       path: { id: sessionId },
-      body: {
-        noReply: true,
-        parts: [{ type: "text", text, ignored: true }],
-      },
+      body,
     };
 
     if (typeof c.session?.prompt === "function") {
@@ -297,6 +311,29 @@ async function sendIgnoredMessage(
     );
   }
   return false;
+}
+
+/**
+ * Resolve the agent the user is currently using for this session, so
+ * notifications render under the right agent in the OpenCode UI.
+ *
+ * Reads the most recent assistant message's `info.agent`. Returns
+ * `undefined` on any failure — the caller falls back to OpenCode's
+ * default-agent behavior, which is the safest legacy path.
+ */
+async function resolveCurrentAgent(
+  client: unknown,
+  sessionId: string,
+): Promise<string | undefined> {
+  try {
+    const ctx = await resolvePromptContext(
+      client as Parameters<typeof resolvePromptContext>[0],
+      sessionId,
+    );
+    return ctx?.agent;
+  } catch {
+    return undefined;
+  }
 }
 
 async function deleteMessage(

@@ -42,6 +42,7 @@ import {
   sendWarning,
 } from "./notifications.js";
 import { maybeAppendConflictsHint, maybeAppendGrepHint } from "./shared/bash-hints.js";
+import { resolvePromptContext } from "./shared/last-assistant-model.js";
 import { probeServerReachable, setLiveServerWakeAvailable } from "./shared/live-server-client.js";
 import { disposeAllPtyTerminals } from "./shared/pty-cache.js";
 import { AftRpcServer } from "./shared/rpc-server.js";
@@ -133,10 +134,29 @@ async function sendIgnoredMessage(client: unknown, sessionID: string, text: stri
     };
   };
 
-  const body = {
+  // Resolve the current agent (used by the user in this session) so the
+  // notification renders under that agent in the OpenCode UI. Without
+  // `agent`, OpenCode renders under its default agent — which surfaces
+  // as the "AFT uses non-current agent" bug when users switch agents
+  // via oh-my-openagent. See issue #62. `agent` is honored on the
+  // `noReply: true` path too (no LLM call, just appended as a synthetic
+  // user message recorded under that agent).
+  let agent: string | undefined;
+  try {
+    const ctx = await resolvePromptContext(
+      client as Parameters<typeof resolvePromptContext>[0],
+      sessionID,
+    );
+    agent = ctx?.agent;
+  } catch {
+    agent = undefined;
+  }
+
+  const body: Record<string, unknown> = {
     noReply: true,
     parts: [{ type: "text", text, ignored: true }],
   };
+  if (agent) body.agent = agent;
   const promptInput = { path: { id: sessionID }, body };
 
   if (typeof typedClient.session?.prompt === "function") {

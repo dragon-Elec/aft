@@ -184,7 +184,19 @@ fn relative_redirect_permission_grant_matches_absolute_cwd_pattern() {
         response["code"], "permission_required",
         "relative redirect should be canonicalized against workdir: {response:?}"
     );
-    assert!(outside.path().join("file.log").exists());
+    // Foreground bash spawns through bash_background::spawn and returns
+    // immediately on slower CI runners — wait for the file with a deadline
+    // rather than asserting synchronously.
+    let target = outside.path().join("file.log");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline && !target.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        target.exists(),
+        "expected redirect target to exist at {}",
+        target.display()
+    );
 
     assert!(aft.shutdown().success());
 }

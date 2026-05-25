@@ -762,6 +762,9 @@ async function waitForBashStatus(
     }
   } finally {
     if (waitForExit && !sawTerminal) unmarkTaskWaiting(sessionId, taskId);
+    if (waitFor) {
+      await disposePtyTerminal(watchPtyCacheKey(extCtx, taskId));
+    }
   }
 }
 

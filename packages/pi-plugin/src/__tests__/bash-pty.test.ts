@@ -284,6 +284,59 @@ describe("Pi bash PTY layer", () => {
       );
 
     expect(text(result)).toContain('matched "ready" at offset 0');
+    expect(__ptyCacheSizeForTests()).toBe(1);
+  });
+
+  test("bash_watch PTY scan cache disposes on timeout", async () => {
+    const outputPath = await spill("not yet\n");
+    const tools = new Map<string, MockToolDef>();
+    const { ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "running",
+      mode: "pty",
+      output_path: outputPath,
+    }));
+    registerBashTool(api(tools), pluginCtx);
+
+    await tools
+      .get("bash_watch")!
+      .execute(
+        "call",
+        { task_id: "bash-pty-timeout", pattern: "ready", timeout_ms: 1 },
+        undefined,
+        undefined,
+        { cwd: process.cwd() },
+      );
+
+    // One cache entry remains for the rendered bash_watch result. The
+    // independent ::watch scan terminal must not leak as a second entry.
+    expect(__ptyCacheSizeForTests()).toBe(1);
+  });
+
+  test("bash_watch PTY scan cache disposes on terminal status", async () => {
+    const outputPath = await spill("done\n");
+    const tools = new Map<string, MockToolDef>();
+    const { ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "completed",
+      exit_code: 0,
+      mode: "pty",
+      output_path: outputPath,
+    }));
+    registerBashTool(api(tools), pluginCtx);
+
+    const result = await tools
+      .get("bash_watch")!
+      .execute(
+        "call",
+        { task_id: "bash-pty-exited", pattern: "missing", timeout_ms: 50 },
+        undefined,
+        undefined,
+        { cwd: process.cwd() },
+      );
+
+    expect(text(result)).toContain("done");
+    expect(__ptyCacheSizeForTests()).toBe(0);
   });
 
   test("bash_status cache disposes on terminal status", async () => {

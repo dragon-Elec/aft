@@ -47,6 +47,7 @@ import {
   appendToolResultBgCompletions,
   handlePushedBgCompletion,
   handlePushedBgLongRunning,
+  handlePushedPatternMatch,
   handleTurnEndBgCompletions,
 } from "./bg-notifications.js";
 import { registerStatusCommand } from "./commands/aft-status.js";
@@ -100,6 +101,17 @@ type BashLongRunningPayload = {
   command: string;
   elapsed_ms: number;
   mode?: "pipes" | "pty" | string;
+};
+
+type BashPatternMatchPayload = {
+  session_id: string;
+  task_id: string;
+  watch_id: string;
+  match_text: string;
+  match_offset: number;
+  context: string;
+  once: boolean;
+  reason?: "pattern_match" | "task_exit";
 };
 
 type BridgePendingState = {
@@ -226,6 +238,11 @@ function shouldPrepareOnnxRuntime(
 ): boolean {
   const isFastembedSemanticBackend = (config.semantic?.backend ?? "fastembed") === "fastembed";
   return config.semantic_search === true && isFastembedSemanticBackend;
+}
+
+function bridgeDirectoryFromCallback(bridge: unknown, fallback: string): string {
+  const cwd = (bridge as { cwd?: unknown } | undefined)?.cwd;
+  return typeof cwd === "string" && cwd.length > 0 ? cwd : fallback;
 }
 
 // IMPORTANT: NOT exported as a named export — only via the __test__
@@ -549,6 +566,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   let pool: BridgePool;
   const poolOptions: import("@cortexkit/aft-bridge").PoolOptions & {
     onBashLongRunning: (reminder: BashLongRunningPayload, bridge: BridgePendingState) => void;
+    onBashPatternMatch: (frame: BashPatternMatchPayload, bridge: BridgePendingState) => void;
   } = {
     errorPrefix: "[aft-pi]",
     minVersion: PLUGIN_VERSION,
@@ -571,26 +589,40 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         });
       }, 0);
     },
-    onBashCompletion: (completion) => {
+    onBashCompletion: (completion, bridge) => {
+      const directory = bridgeDirectoryFromCallback(bridge, process.cwd());
       void handlePushedBgCompletion(
         {
           ctx,
-          directory: process.cwd(),
+          directory,
           sessionID: completion.session_id,
           runtime: pi,
         },
         completion,
       );
     },
-    onBashLongRunning: (reminder) => {
+    onBashLongRunning: (reminder, bridge) => {
+      const directory = bridgeDirectoryFromCallback(bridge, process.cwd());
       void handlePushedBgLongRunning(
         {
           ctx,
-          directory: process.cwd(),
+          directory,
           sessionID: reminder.session_id,
           runtime: pi,
         },
         reminder,
+      );
+    },
+    onBashPatternMatch: (frame, bridge) => {
+      const directory = bridgeDirectoryFromCallback(bridge, process.cwd());
+      void handlePushedPatternMatch(
+        {
+          ctx,
+          directory,
+          sessionID: frame.session_id,
+          runtime: pi,
+        },
+        frame,
       );
     },
   };
@@ -786,22 +818,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     });
   });
 
-  // Clean up bridges on session shutdown.
-  pi.on("session_shutdown", async () => {
-    try {
-      await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
-      await disposeAllPtyTerminals();
-      await pool.shutdown();
-      log("Bridge pool shut down");
-    } catch (err) {
-      warn(`Error during bridge shutdown: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  });
-
   // Also register process-level signal handlers so children get an orderly
   // shutdown when Pi's host Node process is killed directly (terminal close,
   // Ctrl+C, OS shutdown) rather than through the session_shutdown lifecycle.
-  registerShutdownCleanup(async () => {
+  const unregisterShutdownCleanup = registerShutdownCleanup(async () => {
     try {
       await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
       await disposeAllPtyTerminals();
@@ -811,10 +831,25 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     }
   });
 
+  // Clean up bridges on session shutdown.
+  pi.on("session_shutdown", async () => {
+    try {
+      await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
+      await disposeAllPtyTerminals();
+      await pool.shutdown();
+      log("Bridge pool shut down");
+    } catch (err) {
+      warn(`Error during bridge shutdown: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      unregisterShutdownCleanup();
+    }
+  });
+
   log(`AFT extension ready (surface=${config.tool_surface ?? "recommended"})`);
 }
 
 export const __test__ = {
+  bridgeDirectoryFromCallback,
   resolveToolSurface,
   handleConfigureWarningsForSession,
   shouldPrepareOnnxRuntime,

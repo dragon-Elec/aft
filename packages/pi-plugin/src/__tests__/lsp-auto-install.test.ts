@@ -200,6 +200,7 @@ describe("runAutoInstall", () => {
     // and then read again to see the final post-decrement count for skipped servers.
     await result.installsComplete;
     expect(result.installsStarted).toBe(0);
+    expect(result.installingBinaries).not.toContain("typescript-language-server");
     const tsSkip = result.skipped.find((s) => s.id === "typescript");
     expect(tsSkip).toBeDefined();
     expect(tsSkip?.reason).toContain("grace");
@@ -247,6 +248,7 @@ describe("runAutoInstall", () => {
     await result.installsComplete;
     expect(result.cachedBinDirs).toHaveLength(1);
     expect(result.installsStarted).toBe(0);
+    expect(result.installingBinaries).not.toContain("yaml-language-server");
   });
 
   test("runInstall uses npm for Pi and unreferences spawned children", () => {

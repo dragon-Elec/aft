@@ -32,7 +32,7 @@ import {
   type StatusCompression,
   type StatusCompressionAggregate,
 } from "../shared/status.js";
-import { bridgeFor, callBridge } from "../tools/_shared.js";
+import { bridgeFor, callBridge, resolveSessionId } from "../tools/_shared.js";
 import type { PluginContext } from "../types.js";
 
 const REFRESH_INTERVAL_MS = 1500;
@@ -94,12 +94,19 @@ class AftStatusDialogComponent implements Component {
       const bridge = bridgeFor(this.props.pluginCtx, this.props.extCtx.cwd);
       // Prefer the in-memory push-frame cache — that's the whole reason
       // the v0.24 status-push pipeline exists. Only fall through to the
-      // bridge RPC when the cache is empty (cold path on first call).
+      // bridge RPC when the cache is empty or belongs to another session.
+      const sessionId = resolveSessionId(this.props.extCtx);
       const cached = bridge.getCachedStatus();
-      const response = cached
+      const cachedSession = (cached as Record<string, unknown> | null)?.session as
+        | Record<string, unknown>
+        | undefined;
+      const cachedSessionId = cachedSession?.id as string | undefined;
+      const cacheUsable =
+        cached !== null && cachedSessionId !== undefined && cachedSessionId === sessionId;
+      const response = cacheUsable
         ? { success: true, ...cached }
         : await callBridge(bridge, "status", {}, this.props.extCtx);
-      if (!cached) {
+      if (!cacheUsable) {
         bridge.cacheStatusSnapshot(response);
       }
       if (this.closed) return;

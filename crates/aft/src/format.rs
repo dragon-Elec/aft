@@ -3043,10 +3043,21 @@ mod tests {
         let file = dir.path().join("src/app.ts");
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         fs::write(&file, "const value = 1;\nconsole.log(value);\n").unwrap();
-        let stdout = format!(
-            r#"{{"diagnostics":[{{"severity":"warning","description":"Avoid console.log","location":{{"path":{{"file":"{}"}},"span":[17,28]}}}}]}}"#,
-            file.display()
-        );
+        // Build the JSON via serde so the path is correctly escaped on Windows
+        // (backslashes in paths would otherwise break a raw JSON string literal).
+        let stdout = serde_json::json!({
+            "diagnostics": [
+                {
+                    "severity": "warning",
+                    "description": "Avoid console.log",
+                    "location": {
+                        "path": { "file": file.to_string_lossy() },
+                        "span": [17, 28],
+                    },
+                },
+            ],
+        })
+        .to_string();
 
         let errors = parse_biome_output(&stdout, "", &file);
         assert_eq!(errors.len(), 1);

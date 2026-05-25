@@ -1,6 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
-import { type BinaryBridge, repairRootScopedStorageFile } from "@cortexkit/aft-bridge";
+import {
+  type BinaryBridge,
+  markAnnouncementSeen,
+  shouldShowAnnouncement,
+} from "@cortexkit/aft-bridge";
 import { log, sessionLog } from "./logger.js";
 
 const WARNING_MARKER = "🔧 AFT: ⚠️";
@@ -147,21 +149,11 @@ export function sendFeatureAnnouncement(
   footer: string,
   storageDir: string,
 ): void {
-  // v0.27 commit 11 deferral: the legacy `last_announced_version` file is read at
-  // plugin init, BEFORE any bridge is spawned (lazy-spawn architecture per commit
-  // 29508a5). Refactoring to `bridge.send("db_get_state")` would force eager bridge
-  // spawn at every plugin init. Deferred to a future version that decides whether
-  // to accept that trade-off. The Rust-side dual-write from commit 10 covers any
-  // other writer; this file stays in sync via direct legacy-file writes.
-  const versionFile = repairRootScopedStorageFile(storageDir, "pi", "last_announced_version");
-  try {
-    if (existsSync(versionFile)) {
-      const lastVersion = readFileSync(versionFile, "utf-8").trim();
-      if (lastVersion === version) return;
-    }
-  } catch {
-    // ignore read errors — proceed with announcement
-  }
+  // shouldShowAnnouncement silently seeds the marker on first-install /
+  // ephemeral-sandbox launches, so Docker/CI/disposable-VM users don't get
+  // changelog bullets spammed on every boot (per magic-context#99). Real
+  // upgrades from a persisted older version still surface here.
+  if (!shouldShowAnnouncement(storageDir, "pi", version)) return;
 
   // Blank-line separator pins the persistent footer (Discord invite, etc.)
   // below the version-specific bullets so the footer reads as "always here"
@@ -175,10 +167,5 @@ export function sendFeatureAnnouncement(
   }
   log(sections.join("\n"));
 
-  try {
-    mkdirSync(dirname(versionFile), { recursive: true });
-    writeFileSync(versionFile, version);
-  } catch {
-    // best-effort
-  }
+  markAnnouncementSeen(storageDir, "pi", version);
 }

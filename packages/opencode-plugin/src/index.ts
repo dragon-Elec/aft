@@ -1,6 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname } from "node:path";
 import {
   BridgePool,
   ensureBinary,
@@ -9,9 +7,10 @@ import {
   findBinary,
   getManualInstallHint,
   isOrtAutoDownloadSupported,
-  repairRootScopedStorageFile,
+  markAnnouncementSeen,
   resolveCortexKitStorageRoot,
   setActiveLogger,
+  shouldShowAnnouncement,
 } from "@cortexkit/aft-bridge";
 import type { Plugin } from "@opencode-ai/plugin";
 import {
@@ -720,26 +719,17 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     if (!ANNOUNCEMENT_VERSION || ANNOUNCEMENT_FEATURES.length === 0) {
       return { show: false };
     }
-    if (storageDir) {
-      // v0.27 commit 11 deferral: the legacy `last_announced_version` file is read at
-      // plugin init, BEFORE any bridge is spawned (lazy-spawn architecture per commit
-      // 29508a5). Refactoring to `bridge.send("db_get_state")` would force eager bridge
-      // spawn at every plugin init. Deferred to a future version that decides whether
-      // to accept that trade-off. The Rust-side dual-write from commit 10 covers any
-      // other writer; this file stays in sync via direct legacy-file writes.
-      try {
-        const versionFile = repairRootScopedStorageFile(
-          storageDir,
-          "opencode",
-          "last_announced_version",
-        );
-        if (existsSync(versionFile)) {
-          const lastVersion = readFileSync(versionFile, "utf-8").trim();
-          if (lastVersion === ANNOUNCEMENT_VERSION) return { show: false };
-        }
-      } catch {
-        // proceed
-      }
+    if (!storageDir) {
+      // No storage path → we can't persist "seen" state, so suppress the
+      // announcement to avoid spamming users whose storage isn't configured.
+      return { show: false };
+    }
+    // shouldShowAnnouncement silently seeds the marker on first-install /
+    // ephemeral-sandbox launches, so Docker/CI/disposable-VM users don't
+    // see the changelog dialog every boot (per magic-context#99). Real
+    // upgrades from a persisted older version still surface here.
+    if (!shouldShowAnnouncement(storageDir, "opencode", ANNOUNCEMENT_VERSION)) {
+      return { show: false };
     }
     return {
       show: true,
@@ -751,17 +741,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
 
   rpcServer.handle("mark-announced", async () => {
     if (storageDir && ANNOUNCEMENT_VERSION) {
-      try {
-        const versionFile = repairRootScopedStorageFile(
-          storageDir,
-          "opencode",
-          "last_announced_version",
-        );
-        mkdirSync(dirname(versionFile), { recursive: true });
-        writeFileSync(versionFile, ANNOUNCEMENT_VERSION);
-      } catch {
-        // best-effort
-      }
+      markAnnouncementSeen(storageDir, "opencode", ANNOUNCEMENT_VERSION);
     }
     return { success: true };
   });

@@ -47,7 +47,12 @@ export {
   getManualInstallHint,
   isOrtAutoDownloadSupported,
 } from "./onnx-runtime.js";
-export { repairRootScopedStorageFile, resolveHarnessStoragePath } from "./paths.js";
+export {
+  markAnnouncementSeen,
+  repairRootScopedStorageFile,
+  resolveHarnessStoragePath,
+  shouldShowAnnouncement,
+} from "./paths.js";
 // --- platform helpers ---
 export { PLATFORM_ARCH_MAP, PLATFORM_ASSET_MAP } from "./platform.js";
 export type { PoolOptions } from "./pool.js";

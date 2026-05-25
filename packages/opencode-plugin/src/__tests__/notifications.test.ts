@@ -1,6 +1,6 @@
 /// <reference path="../bun-test.d.ts" />
 import { afterEach, describe, expect, mock, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
@@ -106,6 +106,12 @@ describe("Desktop notification session routing", () => {
     const storageDir = createStorageDir();
     // L7 storage commit moved this file under <storageDir>/opencode/.
     const versionFile = join(storageDir, "opencode", "last_announced_version");
+    // Pre-seed an older version so this is treated as an UPGRADE, not a
+    // fresh install. (Per magic-context#99 / shouldShowAnnouncement, fresh
+    // installs are silently suppressed and seeded — the queue/deliver
+    // round-trip is only exercised on real upgrades.)
+    mkdirSync(join(storageDir, "opencode"), { recursive: true });
+    writeFileSync(versionFile, "0.0.1", "utf8");
     const { client, messages } = createClient();
 
     await sendFeatureAnnouncement(
@@ -117,7 +123,8 @@ describe("Desktop notification session routing", () => {
     );
 
     expect(messages).toHaveLength(0);
-    expect(existsSync(versionFile)).toBe(false);
+    // Queued, not delivered — marker still records the pre-existing version.
+    expect(readFileSync(versionFile, "utf-8")).toBe("0.0.1");
 
     await sendFeatureAnnouncement(
       { client, directory: "/repo", sessionId: "session-1" },
@@ -130,6 +137,40 @@ describe("Desktop notification session routing", () => {
     expect(messages).toHaveLength(1);
     expect(messages[0]).toContain("New in v9.9.9");
     expect(readFileSync(versionFile, "utf-8")).toBe("9.9.9");
+  });
+
+  test("fresh-install session-less call suppresses the announcement and seeds the marker", async () => {
+    // Per magic-context#99: a fresh install or ephemeral sandbox (Docker,
+    // CI, disposable dev container) has no last_announced_version file
+    // yet. The pre-fix behavior queued the changelog dialog and showed it
+    // as soon as a session bound — that spammed every sandbox restart and
+    // confused first-time users with changelog bullets they had no context
+    // to interpret. Post-fix: silently seed and suppress.
+    const storageDir = createStorageDir();
+    const versionFile = join(storageDir, "opencode", "last_announced_version");
+    const { client, messages } = createClient();
+
+    await sendFeatureAnnouncement(
+      { client, directory: "/repo" },
+      "9.9.9",
+      ["Audit fix"],
+      "",
+      storageDir,
+    );
+
+    // Marker is silently seeded so the NEXT launch also stays quiet.
+    expect(readFileSync(versionFile, "utf-8")).toBe("9.9.9");
+
+    // Even when a session binds later, no announcement is delivered for
+    // this fresh-install version.
+    await sendFeatureAnnouncement(
+      { client, directory: "/repo", sessionId: "session-1" },
+      "9.9.9",
+      ["Audit fix"],
+      "",
+      storageDir,
+    );
+    expect(messages).toHaveLength(0);
   });
 });
 
@@ -464,6 +505,11 @@ describe("sendFeatureAnnouncement storage", () => {
 
   test("persists new announcement version under opencode harness path", async () => {
     const storageDir = createStorageDir();
+    // Pre-seed an older version so this is an UPGRADE, not a fresh install.
+    // Fresh installs are silently suppressed by shouldShowAnnouncement
+    // (magic-context#99); only real upgrades fire the toast.
+    mkdirSync(join(storageDir, "opencode"), { recursive: true });
+    writeFileSync(join(storageDir, "opencode", "last_announced_version"), "0.30.0", "utf8");
     const showToast = mock(async () => undefined);
 
     await sendFeatureAnnouncement(

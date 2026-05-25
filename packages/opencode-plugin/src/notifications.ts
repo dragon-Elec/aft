@@ -14,10 +14,14 @@
  * when no longer relevant (Desktop only — TUI toasts are inherently transient).
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
-import { dirname, join } from "node:path";
-import { type BinaryBridge, repairRootScopedStorageFile } from "@cortexkit/aft-bridge";
+import { join } from "node:path";
+import {
+  type BinaryBridge,
+  markAnnouncementSeen,
+  shouldShowAnnouncement,
+} from "@cortexkit/aft-bridge";
 import { sessionLog } from "./logger.js";
 import { resolvePromptContext } from "./shared/last-assistant-model.js";
 
@@ -516,35 +520,26 @@ export async function sendFeatureAnnouncement(
   }
 }
 
+/**
+ * Returns true when the announcement should be suppressed for any reason:
+ *   - storageDir isn't configured (can't persist seen state),
+ *   - the marker file already records this version, or
+ *   - this is a fresh install / ephemeral sandbox (no marker file yet),
+ *     in which case shouldShowAnnouncement silently seeds the marker so the
+ *     next launch stays quiet (per magic-context#99).
+ *
+ * Note the name is retained from the pre-shared-helper version of this
+ * module to minimize call-site churn; semantically it's now "should suppress
+ * announcement" (fresh-install case included).
+ */
 function hasAnnouncedVersion(storageDir: string | undefined, version: string): boolean {
-  if (!storageDir) return false;
-  // v0.27 commit 11 deferral: the legacy `last_announced_version` file is read at
-  // plugin init, BEFORE any bridge is spawned (lazy-spawn architecture per commit
-  // 29508a5). Refactoring to `bridge.send("db_get_state")` would force eager bridge
-  // spawn at every plugin init. Deferred to a future version that decides whether
-  // to accept that trade-off. The Rust-side dual-write from commit 10 covers any
-  // other writer; this file stays in sync via direct legacy-file writes.
-  const versionFile = repairRootScopedStorageFile(storageDir, "opencode", "last_announced_version");
-  try {
-    return existsSync(versionFile) && readFileSync(versionFile, "utf-8").trim() === version;
-  } catch {
-    return false;
-  }
+  if (!storageDir) return true;
+  return !shouldShowAnnouncement(storageDir, "opencode", version);
 }
 
 function persistAnnouncedVersion(storageDir: string | undefined, version: string): void {
   if (!storageDir) return;
-  try {
-    const versionFile = repairRootScopedStorageFile(
-      storageDir,
-      "opencode",
-      "last_announced_version",
-    );
-    mkdirSync(dirname(versionFile), { recursive: true });
-    writeFileSync(versionFile, version);
-  } catch {
-    // best-effort
-  }
+  markAnnouncementSeen(storageDir, "opencode", version);
 }
 
 async function readWarnedTools(

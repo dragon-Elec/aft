@@ -203,6 +203,7 @@ function buildConfigureParams(adapter: HarnessAdapter, projectRoot: string): Aft
     id: "doctor-lsp-configure",
     command: "configure",
     project_root: projectRoot,
+    harness: adapter.kind,
     ...lspConfig,
     lsp_paths_extra: inferLspPathsExtra(lsp),
   };

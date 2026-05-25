@@ -45,6 +45,18 @@ mock.module("../logger.js", () => ({
 let liveServerClient: unknown = null;
 let lastLiveServerArgs: { serverUrl: string; directory: string } | null = null;
 let liveServerAvailable = true;
+// Per-URL availability map — must behave like the real
+// live-server-client implementation so the live-server-client unit
+// tests still pass when Bun's process-global `mock.module()` leaks
+// this stub across test files.
+const perUrlAvailability = new Map<string, boolean>();
+function normalizeServerUrl(serverUrl: string): string {
+  try {
+    return new URL(serverUrl).toString();
+  } catch {
+    return serverUrl;
+  }
+}
 function setTestLiveServerClient(client: unknown): void {
   liveServerClient = client;
 }
@@ -62,26 +74,71 @@ mock.module("../shared/live-server-client.js", () => ({
     }
     return liveServerClient;
   },
-  useLiveServerWake: (_serverUrl?: string) => liveServerAvailable,
+  useLiveServerWake: (serverUrl?: string) => {
+    if (!serverUrl) return liveServerAvailable;
+    const keyed = perUrlAvailability.get(normalizeServerUrl(serverUrl));
+    if (keyed !== undefined) return keyed;
+    // bg-notifications tests use setTestLiveServerAvailable(true) (single
+    // bool) to enable the live-server path for all URLs in one shot,
+    // while live-server-client unit tests use setLiveServerWakeAvailable(url, ...)
+    // to set per-URL state. When per-URL state is unset, fall back to the
+    // single-bool toggle so bg-notifications tests keep working, but only
+    // when it has been set explicitly via setTestLiveServerAvailable() —
+    // the unit tests reset liveServerAvailable to its initial state via
+    // __resetLiveServerWakeForTests(), so any URL they didn't set should
+    // remain false.
+    return liveServerAvailable;
+  },
   setLiveServerWakeAvailable: (
     serverUrlOrAvailable: string | boolean | undefined,
     available?: boolean,
   ) => {
-    liveServerAvailable =
-      typeof serverUrlOrAvailable === "boolean" ? serverUrlOrAvailable : (available ?? false);
+    if (typeof serverUrlOrAvailable === "boolean") {
+      liveServerAvailable = serverUrlOrAvailable;
+      return;
+    }
+    if (!serverUrlOrAvailable) {
+      liveServerAvailable = available ?? false;
+      return;
+    }
+    perUrlAvailability.set(normalizeServerUrl(serverUrlOrAvailable), available ?? false);
   },
   // Bun's `mock.module()` is process-global and partial mocks leak across
   // test files. The probe-related exports MUST be included even though this
   // test file does not exercise them, because the live-server-client unit
   // tests import from the same module path and would otherwise see
   // `undefined` for these symbols when the mock is already installed.
-  probeServerReachable: async (_serverUrl?: string, _timeoutMs?: number) => liveServerAvailable,
+  probeServerReachable: async (serverUrl?: string, _timeoutMs?: number) => {
+    if (!serverUrl) {
+      perUrlAvailability.clear();
+      return false;
+    }
+    // Mirror the real implementation enough that the unit-test fetch stubs
+    // drive this code path correctly: hit the URL, accept 2xx/401/403,
+    // reject 404/5xx and network errors.
+    let reachable = false;
+    try {
+      const probeUrl = new URL("/session", serverUrl).toString();
+      const res = await globalThis.fetch(probeUrl, { method: "GET" });
+      reachable = res.ok || res.status === 401 || res.status === 403;
+    } catch {
+      reachable = false;
+    }
+    perUrlAvailability.set(normalizeServerUrl(serverUrl), reachable);
+    return reachable;
+  },
   __resetLiveServerClientCacheForTests: () => {
     liveServerClient = null;
     lastLiveServerArgs = null;
   },
   __resetLiveServerWakeForTests: () => {
-    liveServerAvailable = true;
+    // Match the real implementation: legacyLiveServerWakeAvailable resets
+    // to false, not true. The bg-notifications tests that need
+    // liveServerAvailable=true explicitly call setTestLiveServerAvailable(true)
+    // in their setup, so this default of false is what the live-server-client
+    // unit tests need without breaking bg-notifications.
+    liveServerAvailable = false;
+    perUrlAvailability.clear();
   },
 }));
 
@@ -1039,7 +1096,9 @@ describe("OpenCode background notifications", () => {
 
     expect(livePromptAsync).toHaveBeenCalledTimes(1);
     expect(fallbackClient.session.promptAsync).toHaveBeenCalledTimes(1);
-    expect(liveServerAvailable).toBe(false);
+    // Production code calls setLiveServerWakeAvailable(serverUrl, false)
+    // (per-URL form), so check the per-URL availability map directly.
+    expect(perUrlAvailability.get(normalizeServerUrl(TEST_SERVER_URL))).toBe(false);
     expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
     expect(send.mock.calls.some((call) => call[0] === "bash_ack_completions")).toBe(true);
 

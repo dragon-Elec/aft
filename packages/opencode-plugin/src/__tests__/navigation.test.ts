@@ -91,17 +91,18 @@ describe("aft_navigate OpenCode adapter", () => {
     });
   });
 
-  test("trace_to_symbol ambiguous_target errors include toFile candidates", async () => {
+  test("trace_to_symbol ambiguous_target errors include candidates (Rust top-level shape)", async () => {
+    // Rust's error_with_data() merges extras into the top-level response,
+    // so production traffic has `candidates` next to `code`/`message`, NOT
+    // nested under `data`.
     const { bridge } = makeMockBridge(() => ({
       success: false,
       code: "ambiguous_target",
       message: 'multiple symbols named "target"',
-      data: {
-        candidates: [
-          { file: "file1.rs", line: 42, symbol: "target" },
-          { file: "file2.rs", line: 78, symbol: "target" },
-        ],
-      },
+      candidates: [
+        { file: "file1.rs", line: 42, symbol: "target" },
+        { file: "file2.rs", line: 78, symbol: "target" },
+      ],
     }));
     const tools = navigationTools(makePluginContext(bridge));
 
@@ -122,12 +123,75 @@ describe("aft_navigate OpenCode adapter", () => {
     );
   });
 
-  test("generic bridge errors keep code, message, and data visible", async () => {
+  test("trace_to_symbol ambiguous_target also works with nested data.candidates (forward compat)", async () => {
+    // Keep parsing nested data.* shape too in case any future handler uses it.
+    const { bridge } = makeMockBridge(() => ({
+      success: false,
+      code: "ambiguous_target",
+      message: 'multiple symbols named "target"',
+      data: {
+        candidates: [{ file: "file1.rs", line: 42 }],
+      },
+    }));
+    const tools = navigationTools(makePluginContext(bridge));
+
+    const message = await expectRejectMessage(() =>
+      tools.aft_navigate.execute(
+        {
+          op: "trace_to_symbol",
+          filePath: "src/app.ts",
+          symbol: "run",
+          toSymbol: "target",
+        },
+        makeToolContext(),
+      ),
+    );
+
+    expect(message).toBe(
+      'trace_to_symbol: ambiguous_target — multiple symbols named "target". Pass toFile to disambiguate:\n  - file1.rs:42',
+    );
+  });
+
+  test("trace_to_symbol target_symbol_not_in_file lists alternate files", async () => {
+    const { bridge } = makeMockBridge(() => ({
+      success: false,
+      code: "target_symbol_not_in_file",
+      message: "trace_to_symbol: target symbol 'foo' is not defined in toFile: wrong.rs",
+      candidates: [
+        { file: "right1.rs", line: 12 },
+        { file: "right2.rs", line: 99 },
+      ],
+    }));
+    const tools = navigationTools(makePluginContext(bridge));
+
+    const message = await expectRejectMessage(() =>
+      tools.aft_navigate.execute(
+        {
+          op: "trace_to_symbol",
+          filePath: "src/app.ts",
+          symbol: "run",
+          toSymbol: "foo",
+          toFile: "wrong.rs",
+        },
+        makeToolContext(),
+      ),
+    );
+
+    expect(message).toContain("target_symbol_not_in_file");
+    expect(message).toContain("Try one of these files for toFile");
+    expect(message).toContain("right1.rs:12");
+    expect(message).toContain("right2.rs:99");
+  });
+
+  test("generic bridge errors keep code, message, and structured extras visible", async () => {
+    // Rust's symbol_not_found also returns top-level extras (`file`, `symbol`)
+    // alongside `code`/`message`, not under `data`.
     const { bridge } = makeMockBridge(() => ({
       success: false,
       code: "symbol_not_found",
       message: "symbol missing",
-      data: { file: "src/app.ts", symbol: "run" },
+      file: "src/app.ts",
+      symbol: "run",
     }));
     const tools = navigationTools(makePluginContext(bridge));
 

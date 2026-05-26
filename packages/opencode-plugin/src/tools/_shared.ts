@@ -150,10 +150,24 @@ export function formatBridgeErrorMessage(
     typeof response.message === "string" && response.message.length > 0
       ? response.message
       : `${command} failed`;
+  // Rust merges error_with_data() extras into the top-level response, NOT under
+  // a nested `data` field. Read structured fields at top-level first; fall back
+  // to `response.data` for forward-compat with any handler that uses nesting.
   const data = asPlainObject(response.data);
+  const rawCandidates = Array.isArray(response.candidates)
+    ? response.candidates
+    : Array.isArray(data?.candidates)
+      ? data.candidates
+      : undefined;
+  const rawSymbol =
+    typeof response.symbol === "string" && response.symbol.length > 0
+      ? response.symbol
+      : typeof data?.symbol === "string" && data.symbol.length > 0
+        ? data.symbol
+        : undefined;
 
-  if (code === "ambiguous_target") {
-    const candidates = (Array.isArray(data?.candidates) ? data.candidates : [])
+  if (code === "ambiguous_target" || code === "target_symbol_not_in_file") {
+    const candidates = (rawCandidates ?? [])
       .map(asPlainObject)
       .filter((candidate): candidate is Record<string, unknown> => candidate !== undefined)
       .map(candidateLocation)
@@ -163,11 +177,13 @@ export function formatBridgeErrorMessage(
       const symbol =
         typeof params.toSymbol === "string" && params.toSymbol.length > 0
           ? params.toSymbol
-          : typeof data?.symbol === "string" && data.symbol.length > 0
-            ? data.symbol
-            : undefined;
+          : rawSymbol;
       const target = symbol ? `multiple symbols named "${symbol}"` : message.replace(/[.!?]+$/, "");
-      return `${command}: ${code} — ${target}. Pass toFile to disambiguate:\n${candidates
+      const action =
+        code === "ambiguous_target"
+          ? "Pass toFile to disambiguate"
+          : "Try one of these files for toFile";
+      return `${command}: ${code} — ${target}. ${action}:\n${candidates
         .map((candidate) => `  - ${candidate}`)
         .join("\n")}`;
     }
@@ -176,9 +192,31 @@ export function formatBridgeErrorMessage(
   if (!code) return message;
 
   const lines = [`${command}: ${code} — ${message}`];
-  const dataText = stringifyData(response.data);
-  if (dataText) lines.push(`data: ${dataText}`);
+  // For unhandled structured error codes, surface any extra fields beyond
+  // code/message/success/id so agents see the full context (not just data.*).
+  const extras = collectStructuredExtras(response);
+  if (extras) lines.push(`data: ${extras}`);
   return lines.join("\n");
+}
+
+/**
+ * Capture any structured fields a Rust error_with_data() merged into the top-level
+ * response, excluding the well-known envelope keys (id/success/code/message) and
+ * already-shown nested `data` (handled separately when present).
+ */
+function collectStructuredExtras(response: Record<string, unknown>): string | undefined {
+  const reserved = new Set(["id", "success", "code", "message", "data"]);
+  const extras: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(response)) {
+    if (reserved.has(key)) continue;
+    extras[key] = value;
+  }
+  if (Object.keys(extras).length === 0) {
+    return stringifyData(response.data);
+  }
+  // Prefer top-level extras; fold any nested data fields beneath.
+  if (response.data !== undefined) extras.data = response.data;
+  return stringifyData(extras);
 }
 
 /**

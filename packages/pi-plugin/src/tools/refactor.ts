@@ -24,7 +24,9 @@ import {
 
 const RefactorParams = Type.Object({
   op: StringEnum(["move", "extract", "inline"] as const, { description: "Refactoring operation" }),
-  filePath: Type.String({ description: "Source file" }),
+  filePath: Type.String({
+    description: "Source file (absolute or relative to project root)",
+  }),
   symbol: Type.Optional(Type.String({ description: "Symbol name (for move, inline)" })),
   destination: Type.Optional(Type.String({ description: "Target file (for move)" })),
   scope: Type.Optional(Type.String({ description: "Disambiguation scope for move op" })),

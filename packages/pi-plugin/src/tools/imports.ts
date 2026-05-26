@@ -23,7 +23,7 @@ import {
 
 const ImportParams = Type.Object({
   op: StringEnum(["add", "remove", "organize"] as const, { description: "Import operation" }),
-  filePath: Type.String({ description: "Path to the file" }),
+  filePath: Type.String({ description: "Path to the file (absolute or relative to project root)" }),
   module: Type.Optional(
     Type.String({ description: "Module path (required for add/remove), e.g. 'react', './utils'" }),
   ),

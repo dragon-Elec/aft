@@ -31,8 +31,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
         "- 'restore': Restore files to a previously saved checkpoint. Requires 'name'.\n" +
         "- 'list': List all available named checkpoints. No extra params needed.\n\n" +
         "Each op requires specific parameters — see parameter descriptions for requirements.\n\n" +
-        "Use checkpoint before risky multi-file changes. Use undo for quick single-file rollback.\n\n" +
-        "Returns: undo { path, backup_id }. history { file, entries }. checkpoint { ok, name }. restore { ok, name }. list { checkpoints }.",
+        "Use checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
       // Parameters are Zod-optional because different ops need different subsets.
       // Runtime guards below validate per-op requirements and give clear errors.
       args: {

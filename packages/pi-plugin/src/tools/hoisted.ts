@@ -65,20 +65,24 @@ async function assertExternalDirectoryPermission(
 }
 
 const ReadParams = Type.Object({
-  path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
+  path: Type.String({
+    description: "Path to the file to read (absolute or relative to project root)",
+  }),
   offset: optionalInt(1, Number.MAX_SAFE_INTEGER),
   limit: optionalInt(1, Number.MAX_SAFE_INTEGER),
 });
 
 const WriteParams = Type.Object({
   filePath: Type.String({
-    description: "Path to the file to write (absolute or project-relative)",
+    description: "Path to the file to write (absolute or relative to project root)",
   }),
   content: Type.String({ description: "Full file contents to write" }),
 });
 
 const EditParams = Type.Object({
-  filePath: Type.String({ description: "Path to the file to edit" }),
+  filePath: Type.String({
+    description: "Path to the file to edit (absolute or relative to project root)",
+  }),
   oldString: Type.Optional(
     Type.String({ description: "Text to find (exact match, fuzzy fallback)" }),
   ),
@@ -95,7 +99,11 @@ const EditParams = Type.Object({
 
 const GrepParams = Type.Object({
   pattern: Type.String({ description: "Regex pattern to search for" }),
-  path: Type.Optional(Type.String({ description: "Path scope (file or directory)" })),
+  path: Type.Optional(
+    Type.String({
+      description: "Path scope (file or directory; absolute or relative to project root)",
+    }),
+  ),
   include: Type.Optional(
     Type.String({ description: "Glob filter for included files (e.g. '*.ts,*.tsx')" }),
   ),

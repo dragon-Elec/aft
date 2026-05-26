@@ -1518,10 +1518,7 @@ const DELETE_DESCRIPTION =
   "Each file is backed up before deletion — use aft_safety undo to recover any of them. " +
   "For directories, every file inside is individually backed up before the tree is removed.\n\n" +
   "Directory deletion requires recursive: true. Without it, passing a directory returns an error.\n\n" +
-  "Returns: { success, complete, deleted: [paths], skipped_files: [{file, reason}] }. " +
-  "Partial success is allowed: files that can be deleted are deleted; files that fail " +
-  "(missing, permission denied, etc.) are reported in skipped_files. " +
-  "`complete: false` indicates at least one file was skipped.";
+  "Partial success is allowed: deletable files are deleted; failed ones are reported in `skipped_files` with `complete: false`.";
 
 function createDeleteTool(ctx: PluginContext): ToolDefinition {
   return {
@@ -1612,8 +1609,12 @@ function createMoveTool(ctx: PluginContext): ToolDefinition {
   return {
     description: MOVE_DESCRIPTION,
     args: {
-      filePath: z.string().describe("Source file path to move"),
-      destination: z.string().describe("Destination file path"),
+      filePath: z
+        .string()
+        .describe("Source file path to move (absolute or relative to project root)"),
+      destination: z
+        .string()
+        .describe("Destination file path (absolute or relative to project root)"),
     },
     execute: async (args, context): Promise<string> => {
       const filePath = path.isAbsolute(args.filePath as string)

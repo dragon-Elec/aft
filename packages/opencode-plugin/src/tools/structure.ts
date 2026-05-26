@@ -28,13 +28,7 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
         "- 'wrap_try_catch': Wrap a TS/JS function body in try/catch. Requires 'target' (function name). Optional 'catchBody'.\n" +
         "- 'add_decorator': Add Python decorator to function/class. Requires 'target' and 'decorator' (without @). Optional 'position'.\n" +
         "- 'add_struct_tags': Add/update Go struct field tags. Requires 'target' (struct name), 'field', 'tag', 'value'.\n\n" +
-        "Each op requires specific parameters — see parameter descriptions for requirements. Use aft_safety checkpoint/undo before risky transforms.\n\n" +
-        "Returns:\n" +
-        "- add_member: { file, scope, position, formatted, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }\n" +
-        "- add_derive: { file, target, derives, formatted, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }\n" +
-        "- wrap_try_catch: { file, target, formatted, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }\n" +
-        "- add_decorator: { file, target, decorator, formatted, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }\n" +
-        "- add_struct_tags: { file, target, field, tag_string, formatted, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }",
+        "Each op requires specific parameters — see parameter descriptions for requirements. Use aft_safety checkpoint/undo before risky transforms.",
       // Parameters are Zod-optional because different ops need different subsets.
       // Runtime guards below validate per-op requirements and give clear errors.
       args: {

@@ -165,7 +165,12 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
       include: arg(
         z.string().optional().describe("File pattern to include (e.g. '*.ts', '*.{ts,tsx}')"),
       ),
-      path: arg(z.string().optional().describe("Directory to search in, relative to project root")),
+      path: arg(
+        z
+          .string()
+          .optional()
+          .describe("Directory to search (absolute or relative to project root)"),
+      ),
     },
     execute: async (args, context): Promise<string> => {
       const pattern = String(args.pattern);
@@ -215,7 +220,12 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
       pattern: arg(
         z.string().describe("Glob pattern to match (e.g. '**/*.ts', 'src/**/*.test.*')"),
       ),
-      path: arg(z.string().optional().describe("Directory to search in, relative to project root")),
+      path: arg(
+        z
+          .string()
+          .optional()
+          .describe("Directory to search (absolute or relative to project root)"),
+      ),
     },
     execute: async (args, context): Promise<string> => {
       // Handle absolute paths embedded in the pattern (e.g. "/abs/path/src/**/*.ts")

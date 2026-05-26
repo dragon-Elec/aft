@@ -31,7 +31,9 @@ function navigateParamsSchema() {
         description: "Navigation operation",
       },
     ),
-    filePath: Type.String({ description: "Source file containing the symbol" }),
+    filePath: Type.String({
+      description: "Source file containing the symbol (absolute or relative to project root)",
+    }),
     symbol: Type.String({ description: "Name of the symbol to analyze" }),
     depth: optionalInt(1, Number.MAX_SAFE_INTEGER),
     expression: Type.Optional(

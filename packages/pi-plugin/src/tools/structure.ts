@@ -24,7 +24,9 @@ const TransformParams = Type.Object({
     ["add_member", "add_derive", "wrap_try_catch", "add_decorator", "add_struct_tags"] as const,
     { description: "Transformation operation" },
   ),
-  filePath: Type.String({ description: "Path to the source file" }),
+  filePath: Type.String({
+    description: "Path to the source file (absolute or relative to project root)",
+  }),
   container: Type.Optional(Type.String({ description: "Class/struct/impl name for add_member" })),
   code: Type.Optional(Type.String({ description: "Member code to insert (add_member)" })),
   target: Type.Optional(Type.String({ description: "Target symbol name" })),

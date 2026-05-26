@@ -66,8 +66,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       "Use meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\n" +
       "IMPORTANT: Patterns must be complete AST nodes (valid code fragments).\n" +
       "For functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\n" +
-      "Examples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python'\n\n" +
-      "Returns: Text summary — 'Found N match(es) across M file(s)' followed by file:line blocks with matched text and captured meta-variables.",
+      "Examples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python'",
     args: {
       pattern: z
         .string()
@@ -171,8 +170,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       "Use meta-variables in the rewrite pattern to preserve matched content from the pattern.\n" +
       "IMPORTANT: Patterns must be complete AST nodes (valid code fragments).\n\n" +
       "Example: pattern='console.log($MSG)' rewrite='logger.info($MSG)' lang='typescript' — replaces all console.log calls with logger.info across TypeScript files.\n\n" +
-      "**Warning: This tool modifies files directly.** Use dryRun=true to preview. Consider creating an aft_safety checkpoint before bulk replacements.\n\n" +
-      "Returns: Text summary — 'Replaced N match(es) across M file(s)' (or '[DRY RUN] Would replace...') followed by per-file output. In dry-run mode, each file is shown with its unified diff so you can verify the rewrite before applying (e.g. catch literal $$$ from anonymous-variadic typos). Diff preview is capped at 8KB total; remaining files are summarized.",
+      "**Warning: This tool modifies files directly.** Use dryRun=true to preview (shows per-file unified diff, capped at 8KB). Consider creating an aft_safety checkpoint before bulk replacements.",
     args: {
       pattern: z
         .string()

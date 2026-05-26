@@ -30,8 +30,12 @@ const DeleteParams = Type.Object({
 });
 
 const MoveParams = Type.Object({
-  filePath: Type.String({ description: "Source file path to move" }),
-  destination: Type.String({ description: "Destination file path" }),
+  filePath: Type.String({
+    description: "Source file path to move (absolute or relative to project root)",
+  }),
+  destination: Type.String({
+    description: "Destination file path (absolute or relative to project root)",
+  }),
 });
 
 export interface FsSurface {

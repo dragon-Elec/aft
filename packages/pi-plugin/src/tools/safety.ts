@@ -27,7 +27,10 @@ const SafetyParams = Type.Object({
     description: "Safety operation",
   }),
   filePath: Type.Optional(
-    Type.String({ description: "File path (required for history, optional for undo)" }),
+    Type.String({
+      description:
+        "File path (required for history, optional for undo). Absolute or relative to project root.",
+    }),
   ),
   name: Type.Optional(
     Type.String({ description: "Checkpoint name (required for checkpoint, restore)" }),

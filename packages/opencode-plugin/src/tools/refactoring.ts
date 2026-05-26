@@ -29,8 +29,7 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
         "- 'extract': Extract a line range into a new function with auto-detected parameters. Requires 'name', 'startLine', 'endLine' (1-based, both inclusive). Supports TS/JS/TSX and Python.\n" +
         "- 'inline': Replace a function call with the function's body, substituting args for params. Requires 'symbol', 'callSiteLine' (1-based). Validates single-return constraint.\n\n" +
         "Each op requires specific parameters — see parameter descriptions for requirements.\n\n" +
-        "All ops need 'filePath'. Use aft_safety checkpoint/undo before risky refactors.\n\n" +
-        "Returns: move { ok, files_modified, consumers_updated, checkpoint_name, results }. extract returns { file, name, parameters, return_type, syntax_valid, formatted, ... }. inline returns { file, symbol, call_context, substitutions, conflicts, syntax_valid, formatted, ... }.",
+        "All ops need 'filePath'. Use aft_safety checkpoint/undo before risky refactors.",
       // Parameters are Zod-optional because different ops need different subsets.
       // Runtime guards below validate per-op requirements and give clear errors.
       args: {

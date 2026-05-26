@@ -174,6 +174,9 @@ fn has_regex_meta_sequences(query: &str) -> bool {
     query.contains(".+")
         || query.contains(".*")
         || query.contains(".?")
+        || query.contains(r"\n")
+        || query.contains(r"\t")
+        || query.contains(r"\r")
         || query.contains(r"\b")
         || query.contains(r"\B")
         || query.contains(r"\w")
@@ -189,6 +192,10 @@ fn has_regex_meta_sequences(query: &str) -> bool {
 }
 
 fn has_path_regex_meta_sequences(query: &str) -> bool {
+    // Note: path-context uses doubled backslashes (Windows-style paths). Pure
+    // `\n`/`\t`/`\r` are NOT included here because they appear in Windows
+    // path segments (e.g. `C:\new\test`, `C:\temp\rs`); only the doubled
+    // forms count as deliberate escape sequences in path-shaped input.
     query.contains(".+")
         || query.contains(".*")
         || query.contains(".?")
@@ -239,7 +246,8 @@ fn tier_a_regex_signal(query: &str) -> bool {
             .iter()
             .any(|signal| query.contains(signal))
         || [
-            r"\b", r"\B", r"\w", r"\W", r"\d", r"\D", r"\s", r"\S", r"\p{", r"\x", r"\u{",
+            r"\b", r"\B", r"\w", r"\W", r"\d", r"\D", r"\s", r"\S", r"\p{", r"\x", r"\u{", r"\n",
+            r"\t", r"\r",
         ]
         .iter()
         .any(|signal| query.contains(signal))
@@ -587,6 +595,14 @@ mod tests {
             r"\xFF",
             r"\u{1F600}",
             "a{3}",
+            // Bare escape sequences route to regex via Tier A. Caveat: `foo\n`
+            // and similar single-backslash-escape after literal text are
+            // genuinely ambiguous with Windows path segments (e.g., file `n`
+            // in directory `foo`) and stay on the path/exemption path.
+            r"\n",
+            r"\t",
+            r"\r",
+            r"\tindent",
         ] {
             assert_eq!(kind(query), QueryKind::Regex, "{query}");
         }

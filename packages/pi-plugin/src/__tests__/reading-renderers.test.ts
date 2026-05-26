@@ -21,9 +21,9 @@ describe("reading renderers", () => {
     );
     const zoom = renderToString(
       renderZoomCall(
-        { filePath: "src/a.ts", symbol: "run" },
+        { filePath: "src/a.ts", symbols: "run" },
         mockTheme,
-        makeContext({ filePath: "src/a.ts", symbol: "run" }),
+        makeContext({ filePath: "src/a.ts", symbols: "run" }),
       ),
     );
 

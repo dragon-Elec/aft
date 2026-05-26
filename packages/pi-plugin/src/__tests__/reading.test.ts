@@ -181,7 +181,7 @@ describe("reading tool adapters", () => {
     expect(result.content[0].text).toContain("src/a.ts:1-2 [function ok]");
   });
 
-  test("aft_zoom targets is mutually exclusive with filePath/symbol/symbols/url", async () => {
+  test("aft_zoom targets is mutually exclusive with filePath/symbols/url", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge();
     registerReadingTools(api, makePluginContext(bridge), { outline: false, zoom: true });
@@ -190,9 +190,54 @@ describe("reading tool adapters", () => {
       executeTool(tools.get("aft_zoom")!, {
         targets: [{ filePath: "src/a.ts", symbol: "foo" }],
         filePath: "src/a.ts",
-        symbol: "foo",
+        symbols: "foo",
       }),
     ).rejects.toThrow(/mutually exclusive/);
     expect(calls).toHaveLength(0);
+  });
+
+  test("aft_zoom symbols accepts string form for single-symbol lookup", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge((_command, params) => ({
+      success: true,
+      name: params.symbol as string,
+      kind: "function",
+      range: { start_line: 1, end_line: 5 },
+      content: "ok\n",
+    }));
+    registerReadingTools(api, makePluginContext(bridge), { outline: false, zoom: true });
+
+    // Single string for `symbols` — no array, no `symbol`.
+    const result = (await executeTool(tools.get("aft_zoom")!, {
+      filePath: "src.ts",
+      symbols: "ok",
+    })) as { content: Array<{ text: string }> };
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.params).toMatchObject({ file: "src.ts", symbol: "ok" });
+    // Single-symbol shortcut returns raw formatZoomText (no "Incomplete" framing).
+    expect(result.content[0].text).not.toContain("Incomplete zoom results");
+    expect(result.content[0].text).toContain("src.ts");
+  });
+
+  test("aft_zoom targets accepts single object form for one-target lookup", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge((_command, params) => ({
+      success: true,
+      name: params.symbol as string,
+      kind: "function",
+      range: { start_line: 1, end_line: 2 },
+      content: "ok\n",
+    }));
+    registerReadingTools(api, makePluginContext(bridge), { outline: false, zoom: true });
+
+    // Single object for `targets` — no array.
+    const result = (await executeTool(tools.get("aft_zoom")!, {
+      targets: { filePath: "src/a.ts", symbol: "foo" },
+    })) as { content: Array<{ text: string }> };
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.params).toMatchObject({ file: "src/a.ts", symbol: "foo" });
+    expect(result.content[0].text).toContain("src/a.ts:1-2 [function foo]");
   });
 });

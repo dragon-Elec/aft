@@ -155,11 +155,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
 
     aft_zoom: {
       description:
-        "Inspect code symbols or documentation sections. For code, returns the full source of a symbol with call-graph annotations (what it calls and what calls it). For Markdown and HTML, returns the section content under the given heading.\n\n" +
-        "Modes (provide ONE):\n" +
-        "  • `filePath` (or `url`) + `symbol` — single symbol in one file/URL\n" +
-        "  • `filePath` (or `url`) + `symbols` — multiple symbols, all in the same file/URL\n" +
-        "  • `targets` — multiple symbols from DIFFERENT files in one call: `[{ filePath, symbol }, ...]`",
+        "Inspect code symbols or documentation sections. For code, returns the full source of a symbol with call-graph annotations (what it calls and what calls it). For Markdown and HTML, returns the section content under the given heading.\n\nProvide exactly ONE of `filePath` or `url`. Pass `symbols` for one or many in the same file/URL (string or array). For symbols from DIFFERENT files in one call, use `targets` instead.",
       args: {
         filePath: z
           .string()
@@ -169,26 +165,30 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           .string()
           .optional()
           .describe("HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into"),
-        symbol: z
-          .string()
-          .optional()
-          .describe("Symbol name for code, or heading text for Markdown/HTML"),
         symbols: z
-          .array(z.string())
+          .union([z.string(), z.array(z.string())])
           .optional()
           .describe(
-            "Array of symbol names or heading texts (all in the same file/URL) for a batched call",
+            "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
           ),
         targets: z
-          .array(
+          .union([
             z.object({
               filePath: z.string().describe("Path to file (absolute or relative to project root)"),
               symbol: z.string().describe("Symbol name in that file"),
             }),
-          )
+            z.array(
+              z.object({
+                filePath: z
+                  .string()
+                  .describe("Path to file (absolute or relative to project root)"),
+                symbol: z.string().describe("Symbol name in that file"),
+              }),
+            ),
+          ])
           .optional()
           .describe(
-            "Array of {filePath, symbol} pairs for batched zoom across DIFFERENT files. Mutually exclusive with filePath/url/symbol/symbols.",
+            "Cross-file batch: `{ filePath, symbol }` or an array of them. Mutually exclusive with filePath/url/symbols.",
           ),
         contextLines: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
           "Lines of context before/after the symbol (default: 3)",
@@ -197,22 +197,31 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
       execute: async (args, context): Promise<string> => {
         const hasFilePath = typeof args.filePath === "string" && args.filePath.length > 0;
         const hasUrl = typeof args.url === "string" && args.url.length > 0;
-        const hasTargets = Array.isArray(args.targets) && args.targets.length > 0;
-        const hasSymbol = typeof args.symbol === "string" && args.symbol.length > 0;
-        const hasSymbols = Array.isArray(args.symbols) && args.symbols.length > 0;
+        const hasTargets = args.targets !== undefined && args.targets !== null;
+        const hasSymbols =
+          args.symbols !== undefined &&
+          args.symbols !== null &&
+          (typeof args.symbols === "string"
+            ? args.symbols.length > 0
+            : Array.isArray(args.symbols) && args.symbols.length > 0);
 
-        // Multi-target mode (different files). Mutually exclusive with the
-        // other modes so the agent doesn't accidentally provide overlapping
-        // inputs that get silently ignored.
+        // Multi-target mode (cross-file). Mutually exclusive with the other
+        // modes so the agent doesn't accidentally provide overlapping inputs
+        // that get silently ignored.
         if (hasTargets) {
-          if (hasFilePath || hasUrl || hasSymbol || hasSymbols) {
+          if (hasFilePath || hasUrl || hasSymbols) {
             throw new Error(
-              "'targets' is mutually exclusive with 'filePath', 'url', 'symbol', and 'symbols'",
+              "'targets' is mutually exclusive with 'filePath', 'url', and 'symbols'",
             );
           }
-          const targets = args.targets as Array<{ filePath: string; symbol: string }>;
+          const targets = Array.isArray(args.targets)
+            ? (args.targets as Array<{ filePath: string; symbol: string }>)
+            : ([args.targets] as Array<{ filePath: string; symbol: string }>);
+          if (targets.length === 0) {
+            throw new Error("'targets' must be a non-empty object or array");
+          }
           for (const [i, entry] of targets.entries()) {
-            if (typeof entry.filePath !== "string" || entry.filePath.length === 0) {
+            if (!entry || typeof entry.filePath !== "string" || entry.filePath.length === 0) {
               throw new Error(`targets[${i}].filePath must be a non-empty string`);
             }
             if (typeof entry.symbol !== "string" || entry.symbol.length === 0) {
@@ -250,11 +259,19 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         // Header label — what the agent typed, not the on-disk cache path.
         const targetLabel = (hasUrl ? (args.url as string) : (args.filePath as string)) ?? file;
 
-        // Multi-symbol mode (same file): make separate zoom calls in parallel
-        // and combine results.
-        if (hasSymbols) {
+        // Normalize symbols → array (or undefined if not provided).
+        // String input is treated as a single-element array; single-string
+        // shortcut still returns the raw zoom text instead of a batch wrapper
+        // so the happy path doesn't show "Incomplete" framing.
+        const symbolsArray: string[] | undefined = hasSymbols
+          ? typeof args.symbols === "string"
+            ? [args.symbols]
+            : (args.symbols as string[])
+          : undefined;
+
+        if (symbolsArray) {
           const results = await Promise.all(
-            (args.symbols as string[]).map((sym) => {
+            symbolsArray.map((sym) => {
               const params: Record<string, unknown> = { file, symbol: sym };
               if (args.contextLines !== undefined) params.context_lines = args.contextLines;
               return callBridge(ctx, context, "zoom", params).catch((err) => ({
@@ -263,12 +280,20 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
               }));
             }),
           );
-          return formatZoomBatchResult(targetLabel, args.symbols as string[], results).text;
+          if (symbolsArray.length === 1) {
+            const response = results[0] ?? { success: false, message: "missing zoom response" };
+            if ((response as { success?: boolean }).success === false) {
+              throw new Error(
+                ((response as { message?: string }).message as string) || "zoom failed",
+              );
+            }
+            return formatZoomText(targetLabel, response as Record<string, unknown>);
+          }
+          return formatZoomBatchResult(targetLabel, symbolsArray, results).text;
         }
 
-        // Single symbol mode
+        // No symbols specified: zoom by line-range fallback (or whole file).
         const params: Record<string, unknown> = { file };
-        if (typeof args.symbol === "string") params.symbol = args.symbol;
         if (args.contextLines !== undefined) params.context_lines = args.contextLines;
 
         const data = await callBridge(ctx, context, "zoom", params);

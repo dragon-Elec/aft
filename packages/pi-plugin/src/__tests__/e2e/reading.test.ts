@@ -161,10 +161,10 @@ maybeDescribe("aft_outline + aft_zoom (real bridge)", () => {
     expect(harness.text(result)).toContain("file-000.ts");
   });
 
-  test("zoom into single symbol returns source", async () => {
+  test("zoom into single symbol returns source (symbols as string)", async () => {
     const result = await harness.callTool("aft_zoom", {
       filePath: "sample.ts",
-      symbol: "funcB",
+      symbols: "funcB",
     });
     const text = harness.text(result);
     expect(text).toContain("funcB");
@@ -185,7 +185,7 @@ maybeDescribe("aft_outline + aft_zoom (real bridge)", () => {
   test("zoom with contextLines expands range", async () => {
     const result = await harness.callTool("aft_zoom", {
       filePath: "sample.ts",
-      symbol: "funcA",
+      symbols: "funcA",
       contextLines: 10,
     });
     const text = harness.text(result);
@@ -289,7 +289,7 @@ urlMaybeDescribe("aft_outline + aft_zoom — URL targets (real bridge + real fet
   test("zoom URL — fetches and zooms into a section", async () => {
     const result = await harness.callTool("aft_zoom", {
       url: `${serverUrl}/doc.md`,
-      symbol: "Section A",
+      symbols: "Section A",
     });
     const text = harness.text(result);
     expect(text).toContain("Section A");
@@ -322,8 +322,19 @@ urlMaybeDescribe("aft_outline + aft_zoom — URL targets (real bridge + real fet
       harness.callTool("aft_zoom", {
         filePath: "sample.ts",
         url: `${serverUrl}/doc.md`,
-        symbol: "anything",
+        symbols: "anything",
       }),
     ).rejects.toThrow(/exactly ONE of 'filePath' or 'url'/);
+  });
+
+  test("zoom URL — multi-section via symbols array", async () => {
+    const result = await harness.callTool("aft_zoom", {
+      url: `${serverUrl}/doc.md`,
+      symbols: ["Section A", "Section B"],
+    });
+    const text = harness.text(result);
+    expect(text).toContain("Section A");
+    expect(text).toContain("Body of section A.");
+    expect(text).toContain("Section B");
   });
 });

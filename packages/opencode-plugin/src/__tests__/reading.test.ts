@@ -243,7 +243,7 @@ describe("reading tool adapters", () => {
     expect(text).toContain("src/a.ts:1-2 [function ok]");
   });
 
-  test("aft_zoom targets is mutually exclusive with filePath/symbol/symbols/url", async () => {
+  test("aft_zoom targets is mutually exclusive with filePath/symbols/url", async () => {
     const root = await tempProject();
     const { sendCalls, tools } = createMockReadingHarness(() => ({ success: true }));
 
@@ -252,7 +252,7 @@ describe("reading tool adapters", () => {
         {
           targets: [{ filePath: "src/a.ts", symbol: "foo" }],
           filePath: "src/a.ts",
-          symbol: "foo",
+          symbols: "foo",
         },
         createMockSdkContext(root),
       ),

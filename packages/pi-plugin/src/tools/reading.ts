@@ -51,18 +51,16 @@ const ZoomParams = Type.Object({
       description: "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
     }),
   ),
-  symbol: Type.Optional(
-    Type.String({ description: "Symbol name (function/class/type) or Markdown heading" }),
-  ),
   symbols: Type.Optional(
-    Type.Array(Type.String(), {
-      description: "Multiple symbols in the same file/URL — returns array of matches",
+    Type.Union([Type.String(), Type.Array(Type.String())], {
+      description:
+        "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
     }),
   ),
   targets: Type.Optional(
-    Type.Array(ZoomTarget, {
+    Type.Union([ZoomTarget, Type.Array(ZoomTarget)], {
       description:
-        "Array of {filePath, symbol} pairs for batched zoom across DIFFERENT files. Mutually exclusive with filePath/url/symbol/symbols.",
+        "Cross-file batch: `{ filePath, symbol }` or an array of them. Mutually exclusive with filePath/url/symbols.",
     }),
   ),
   contextLines: Type.Optional(
@@ -232,14 +230,24 @@ export function renderZoomCall(
   theme: Theme,
   context: RenderContextLike,
 ) {
-  const target = args.symbol
-    ? theme.fg("toolOutput", args.symbol)
-    : args.symbols && args.symbols.length > 0
-      ? theme.fg("toolOutput", `${args.symbols.length} symbols`)
-      : theme.fg("toolOutput", "lines");
+  // `symbols` accepts string OR string[]; renderer adapts to both shapes.
+  const symbols = args.symbols;
+  const targets = args.targets;
+  let summary: string;
+  if (typeof symbols === "string") {
+    summary = theme.fg("toolOutput", symbols);
+  } else if (Array.isArray(symbols) && symbols.length > 0) {
+    summary = theme.fg("toolOutput", `${symbols.length} symbols`);
+  } else if (Array.isArray(targets) && targets.length > 0) {
+    summary = theme.fg("toolOutput", `${targets.length} targets`);
+  } else if (targets && typeof targets === "object" && !Array.isArray(targets)) {
+    summary = theme.fg("toolOutput", (targets as { symbol?: string }).symbol ?? "1 target");
+  } else {
+    summary = theme.fg("toolOutput", "lines");
+  }
   return renderToolCall(
     "zoom",
-    `${accentPath(theme, zoomTargetLabel(args))} ${target}`,
+    `${accentPath(theme, zoomTargetLabel(args))} ${summary}`,
     theme,
     context,
   );
@@ -373,7 +381,7 @@ export function registerReadingTools(
       name: "aft_zoom",
       label: "zoom",
       description:
-        "Inspect a code symbol or Markdown/HTML section. For code, returns the full source of the symbol with call-graph annotations (calls/called-by).\n\nModes (provide ONE):\n  • `filePath` (or `url`) + `symbol` — single symbol in one file/URL\n  • `filePath` (or `url`) + `symbols` — multiple symbols, all in the same file/URL\n  • `targets` — multiple symbols from DIFFERENT files: `[{ filePath, symbol }, ...]`",
+        "Inspect code symbols or documentation sections. For code, returns the full source of a symbol with call-graph annotations (calls/called-by). For Markdown and HTML, returns the section content under the given heading.\n\nProvide exactly ONE of `filePath` or `url`. Pass `symbols` for one or many in the same file/URL (string or array). For symbols from DIFFERENT files in one call, use `targets` instead.",
       parameters: ZoomParams,
       async execute(
         _toolCallId: string,
@@ -385,22 +393,31 @@ export function registerReadingTools(
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const hasFilePath = typeof params.filePath === "string" && params.filePath.length > 0;
         const hasUrl = typeof params.url === "string" && params.url.length > 0;
-        const hasTargets = Array.isArray(params.targets) && params.targets.length > 0;
-        const hasSymbol = typeof params.symbol === "string" && params.symbol.length > 0;
-        const hasSymbols = Array.isArray(params.symbols) && params.symbols.length > 0;
+        const hasTargets = params.targets !== undefined && params.targets !== null;
+        const hasSymbols =
+          params.symbols !== undefined &&
+          params.symbols !== null &&
+          (typeof params.symbols === "string"
+            ? params.symbols.length > 0
+            : Array.isArray(params.symbols) && params.symbols.length > 0);
 
-        // Multi-target mode (different files). Mutually exclusive with the
-        // other modes so the agent doesn't accidentally provide overlapping
-        // inputs that get silently ignored.
+        // Multi-target mode (cross-file). Mutually exclusive with the other
+        // modes so the agent doesn't accidentally provide overlapping inputs
+        // that get silently ignored.
         if (hasTargets) {
-          if (hasFilePath || hasUrl || hasSymbol || hasSymbols) {
+          if (hasFilePath || hasUrl || hasSymbols) {
             throw new Error(
-              "'targets' is mutually exclusive with 'filePath', 'url', 'symbol', and 'symbols'",
+              "'targets' is mutually exclusive with 'filePath', 'url', and 'symbols'",
             );
           }
-          const targets = params.targets as Array<{ filePath: string; symbol: string }>;
+          const targets = Array.isArray(params.targets)
+            ? (params.targets as Array<{ filePath: string; symbol: string }>)
+            : ([params.targets] as Array<{ filePath: string; symbol: string }>);
+          if (targets.length === 0) {
+            throw new Error("'targets' must be a non-empty object or array");
+          }
           for (const [i, entry] of targets.entries()) {
-            if (typeof entry.filePath !== "string" || entry.filePath.length === 0) {
+            if (!entry || typeof entry.filePath !== "string" || entry.filePath.length === 0) {
               throw new Error(`targets[${i}].filePath must be a non-empty string`);
             }
             if (typeof entry.symbol !== "string" || entry.symbol.length === 0) {
@@ -439,14 +456,19 @@ export function registerReadingTools(
         // Header label — what the agent typed, not the on-disk cache path.
         const targetLabel = (hasUrl ? params.url : params.filePath) ?? file;
 
-        // Multi-symbol: fire in parallel and preserve per-symbol failures.
-        // Uses callBridge (not bridge.send directly) so each parallel request
-        // carries Pi's native session_id — otherwise multi-symbol zoom would
-        // bypass per-session undo/checkpoint scoping.
-        if (hasSymbols && params.symbols) {
-          const symbolsList = params.symbols;
+        // Normalize symbols → array (or undefined if not provided).
+        // String input is treated as a single-element array; the single-symbol
+        // shortcut returns the raw zoom text instead of a batch wrapper so the
+        // happy path doesn't show "Incomplete" framing.
+        const symbolsArray: string[] | undefined = hasSymbols
+          ? typeof params.symbols === "string"
+            ? [params.symbols]
+            : (params.symbols as string[])
+          : undefined;
+
+        if (symbolsArray) {
           const results = await Promise.all(
-            symbolsList.map((sym) => {
+            symbolsArray.map((sym) => {
               const req: Record<string, unknown> = { file, symbol: sym };
               if (params.contextLines !== undefined) req.context_lines = params.contextLines;
               return callBridge(bridge, "zoom", req, extCtx).catch((err) => ({
@@ -455,12 +477,24 @@ export function registerReadingTools(
               }));
             }),
           );
-          const batch = formatZoomBatchResult(targetLabel, params.symbols, results);
+          if (symbolsArray.length === 1) {
+            const response = results[0] ?? { success: false, message: "missing zoom response" };
+            if ((response as { success?: boolean }).success === false) {
+              throw new Error(
+                ((response as { message?: string }).message as string) || "zoom failed",
+              );
+            }
+            return textResult(
+              formatZoomText(targetLabel, response as Record<string, unknown>),
+              response,
+            );
+          }
+          const batch = formatZoomBatchResult(targetLabel, symbolsArray, results);
           return textResult(batch.text, batch);
         }
 
+        // No symbols specified: zoom by line-range fallback (or whole file).
         const req: Record<string, unknown> = { file };
-        if (params.symbol) req.symbol = params.symbol;
         if (params.contextLines !== undefined) req.context_lines = params.contextLines;
         const response = await callBridge(bridge, "zoom", req, extCtx);
         if (response.success === false) {

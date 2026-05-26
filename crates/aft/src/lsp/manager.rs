@@ -19,6 +19,10 @@ use crate::lsp::diagnostics::{
 };
 use crate::lsp::document::DocumentStore;
 use crate::lsp::position::{uri_for_path, uri_to_path};
+use crate::lsp::pull_params::{
+    AftDocumentDiagnosticParams, AftDocumentDiagnosticRequest, AftWorkspaceDiagnosticParams,
+    AftWorkspaceDiagnosticRequest,
+};
 use crate::lsp::registry::{resolve_lsp_binary, servers_for_file, ServerDef, ServerKind};
 use crate::lsp::roots::{find_workspace_root, ServerKey};
 use crate::lsp::LspError;
@@ -1050,7 +1054,7 @@ impl LspManager {
                 .and_then(|c| c.diagnostic_capabilities())
                 .and_then(|caps| caps.identifier.clone());
 
-            let params = lsp_types::DocumentDiagnosticParams {
+            let params = AftDocumentDiagnosticParams {
                 text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
                 identifier,
                 previous_result_id,
@@ -1126,7 +1130,7 @@ impl LspManager {
             .and_then(|c| c.diagnostic_capabilities())
             .and_then(|caps| caps.identifier.clone());
 
-        let params = lsp_types::WorkspaceDiagnosticParams {
+        let params = AftWorkspaceDiagnosticParams {
             identifier,
             previous_result_ids: Vec::new(),
             work_done_progress_params: Default::default(),
@@ -1137,9 +1141,8 @@ impl LspManager {
             .clients
             .get_mut(server_key)
             .ok_or_else(|| LspError::ServerNotReady("server not found".into()))?
-            .send_request_with_timeout::<lsp_types::request::WorkspaceDiagnosticRequest>(
-                params, timeout,
-            ) {
+            .send_request_with_timeout::<AftWorkspaceDiagnosticRequest>(params, timeout)
+        {
             Ok(result) => result,
             Err(LspError::Timeout(_)) => {
                 return Ok(PullWorkspaceResult {
@@ -1241,13 +1244,13 @@ impl LspManager {
     fn send_pull_request(
         &mut self,
         key: &ServerKey,
-        params: lsp_types::DocumentDiagnosticParams,
+        params: AftDocumentDiagnosticParams,
     ) -> Result<lsp_types::DocumentDiagnosticReportResult, LspError> {
         let client = self
             .clients
             .get_mut(key)
             .ok_or_else(|| LspError::ServerNotReady("server not found".into()))?;
-        client.send_request::<lsp_types::request::DocumentDiagnosticRequest>(params)
+        client.send_request::<AftDocumentDiagnosticRequest>(params)
     }
 
     /// Store the result of a per-file pull request and return a structured

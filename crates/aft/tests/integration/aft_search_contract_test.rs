@@ -252,3 +252,120 @@ fn hybrid_ready_semantic_reports_complete_success() {
     assert_eq!(response["interpreted_as"], "hybrid");
     handle.join().expect("embedding server thread");
 }
+
+/// Surrounding paired quotes in literal queries are stripped before matching.
+/// Many agents and humans bring the GitHub-code-search / `rg -F "..."`
+/// convention of quoting a phrase, and AFT's pure-substring matching would
+/// otherwise silently return zero matches when the quotes are included.
+#[test]
+fn literal_query_strips_surrounding_double_quotes() {
+    let (project, _source_file, _) = project_with_needle();
+    let ctx = test_context(project.path());
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+
+    let response = response_value(handle_semantic_search(
+        &request_with("\"needle_symbol\"", Some("literal")),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["success"], true,
+        "quoted literal query should succeed after quote-strip: {response:?}"
+    );
+    assert_eq!(response["interpreted_as"], "literal");
+    assert_eq!(
+        response["query"], "needle_symbol",
+        "response query echo should reflect stripped form"
+    );
+    assert!(
+        response["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .any(|r| r["kind"] == "GrepLine"),
+        "stripped query should match needle_symbol in source: {response:?}"
+    );
+}
+
+#[test]
+fn literal_query_strips_surrounding_single_quotes() {
+    let (project, _source_file, _) = project_with_needle();
+    let ctx = test_context(project.path());
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+
+    let response = response_value(handle_semantic_search(
+        &request_with("'needle_symbol'", Some("literal")),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["success"], true,
+        "single-quoted literal query should succeed: {response:?}"
+    );
+    assert_eq!(response["query"], "needle_symbol");
+}
+
+#[test]
+fn literal_query_preserves_unmatched_quotes() {
+    // Mixed quotes (`"foo'` / `'foo"`) are not a balanced outer pair — leave
+    // them alone. Asymmetric stripping would be more confusing than the
+    // matched-pair convention.
+    let project = tempfile::tempdir().expect("create project dir");
+    let source_file = project.path().join("src/lib.rs");
+    std::fs::create_dir_all(source_file.parent().expect("source parent"))
+        .expect("create source dir");
+    std::fs::write(&source_file, "let s = \"'needle\";\n").expect("write source file");
+    let ctx = test_context(project.path());
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+
+    let response = response_value(handle_semantic_search(
+        &request_with("\"'needle", Some("literal")),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["query"], "\"'needle",
+        "unmatched quote should NOT be stripped"
+    );
+    assert_eq!(response["success"], true);
+}
+
+#[test]
+fn quote_strip_does_not_produce_empty_query() {
+    // `""` should be rejected as empty after stripping, not silently routed
+    // into a wildcard search.
+    let project = tempfile::tempdir().expect("create project dir");
+    let ctx = test_context(project.path());
+
+    for query in ["\"\"", "''"] {
+        let response = response_value(handle_semantic_search(
+            &request_with(query, Some("literal")),
+            &ctx,
+        ));
+        assert_eq!(response["success"], false, "query {query:?} should fail");
+        assert_eq!(response["code"], "invalid_request");
+        assert_eq!(response["message"], "query must be non-empty");
+    }
+}
+
+#[test]
+fn quote_strip_only_removes_one_pair() {
+    // Nested quotes: `""needle""` strips outer pair → `"needle"`, leaving the
+    // inner quotes as part of the literal needle. Single-pair stripping
+    // matches GitHub/grep convention and avoids overreach.
+    let (project, source_file, _) = project_with_needle();
+    std::fs::write(&source_file, "let s = \"needle\";\n").expect("write source file");
+    let ctx = test_context(project.path());
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+
+    let response = response_value(handle_semantic_search(
+        &request_with("\"\"needle\"\"", Some("literal")),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["query"], "\"needle\"",
+        "only outer pair should be stripped"
+    );
+    assert_eq!(response["success"], true);
+}

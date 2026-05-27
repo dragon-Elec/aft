@@ -70,7 +70,7 @@ struct LexicalCollection {
 }
 
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
-    let params = match serde_json::from_value::<SemanticSearchParams>(req.params.clone()) {
+    let mut params = match serde_json::from_value::<SemanticSearchParams>(req.params.clone()) {
         Ok(params) => params,
         Err(error) => {
             return Response::error(
@@ -81,6 +81,18 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    if params.query.trim().is_empty() {
+        return Response::error(&req.id, "invalid_request", "query must be non-empty");
+    }
+
+    // Strip a single pair of surrounding paired quotes from the literal needle.
+    // Many agents and humans reach for the GitHub-code-search / `rg -F "..."`
+    // convention of quoting a phrase, but AFT does pure substring matching by
+    // default, so the quotes themselves become part of the needle and silently
+    // produce zero results. Strip only matched leading+trailing pairs of `"`
+    // or `'` (no escape handling — agents that genuinely want literal quotes
+    // can pass `\"foo\"`-style content which won't be a balanced outer pair).
+    params.query = strip_surrounding_quotes(params.query);
     if params.query.trim().is_empty() {
         return Response::error(&req.id, "invalid_request", "query must be non-empty");
     }
@@ -1024,6 +1036,27 @@ fn query_kind_label(kind: QueryKind) -> &'static str {
         QueryKind::Regex => "Regex",
         QueryKind::NaturalLanguage => "NaturalLanguage",
     }
+}
+
+/// Strip a single matched pair of surrounding `"` or `'` from a literal
+/// query, matching the convention agents and humans bring from GitHub code
+/// search, `rg -F "..."`, and most search engines. Only strips ONE pair, and
+/// only when leading + trailing match — `'foo"` is left alone, and pre-stripped
+/// queries like `foo` are returned unchanged.
+fn strip_surrounding_quotes(query: String) -> String {
+    let trimmed = query.trim();
+    if trimmed.len() < 2 {
+        return query;
+    }
+    let first = trimmed.chars().next().unwrap();
+    let last = trimmed.chars().next_back().unwrap();
+    if (first == '"' || first == '\'') && first == last {
+        let mut chars = trimmed.chars();
+        chars.next();
+        chars.next_back();
+        return chars.as_str().to_string();
+    }
+    query
 }
 
 fn literal_tokens_all_short(query: &str) -> bool {

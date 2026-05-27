@@ -77,6 +77,7 @@ mod protocol_test;
 mod query_shape_test;
 mod safety_test;
 mod score_floor_drop_test;
+mod search_index_warm_restart_test;
 mod security_test;
 mod staging_cleanup_test;
 mod state_commands_test;

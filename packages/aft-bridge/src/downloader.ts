@@ -269,7 +269,16 @@ export async function downloadBinary(version?: string): Promise<string | null> {
       chmodSync(tmpPath, 0o755);
     }
 
-    // Atomic rename
+    // Replace binary — on Windows renameSync fails (EEXIST) when the target
+    // exists, so unlink first. This creates a brief window where no binary
+    // exists at binaryPath — callers should handle a missing binary gracefully.
+    if (process.platform === "win32" && existsSync(binaryPath)) {
+      try {
+        unlinkSync(binaryPath);
+      } catch {
+        // best-effort; renameSync will surface the error if unlink fails
+      }
+    }
     renameSync(tmpPath, binaryPath);
 
     log(`AFT binary ready at ${binaryPath}`);

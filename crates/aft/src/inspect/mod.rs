@@ -3,6 +3,7 @@ pub mod dispatch;
 pub mod freshness;
 pub mod job;
 mod manager;
+pub mod scanners;
 
 pub use cache::{ContributionRecord, InspectCache, InspectCacheError};
 pub use dispatch::{DispatchHandles, InspectWorker};

@@ -2,7 +2,12 @@
  * aft_inspect — codebase health snapshot.
  */
 
-import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentToolResult,
+  ExtensionAPI,
+  ExtensionContext,
+  Theme,
+} from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, isEmptyParam, textResult } from "./_shared.js";
@@ -42,6 +47,10 @@ const InspectParams = Type.Object({
 
 type StringOrStringArray = string | string[];
 
+const TIER2_INSPECT_CATEGORIES = new Set(["dead_code", "unused_exports", "duplicates"]);
+const INSPECT_TIER2_RUN_TIMEOUT_MS = 5 * 60_000;
+const runningTier2Categories = new WeakMap<object, Set<string>>();
+
 function normalizeStringOrArray(value: unknown): StringOrStringArray | undefined {
   return isEmptyParam(value) ? undefined : (value as StringOrStringArray);
 }
@@ -60,6 +69,52 @@ function validateOptionalTopK(value: unknown): number | undefined {
 function countFrom(summary: Record<string, unknown> | undefined, key: string): number | undefined {
   const section = asRecord(summary?.[key]);
   return asNumber(section?.count);
+}
+
+function pendingTier2Categories(response: Record<string, unknown>): string[] {
+  const scannerState = asRecord(response.scanner_state);
+  const pending = scannerState?.pending_categories;
+  if (!Array.isArray(pending)) return [];
+
+  const categories = new Set<string>();
+  for (const category of pending) {
+    if (typeof category === "string" && TIER2_INSPECT_CATEGORIES.has(category)) {
+      categories.add(category);
+    }
+  }
+  return [...categories];
+}
+
+function runPendingTier2Categories(
+  bridge: ReturnType<typeof bridgeFor>,
+  categories: string[],
+  extCtx: ExtensionContext,
+): void {
+  const running = runningTier2Categories.get(bridge) ?? new Set<string>();
+  const toRun = categories.filter((category) => !running.has(category));
+  if (toRun.length === 0) return;
+
+  for (const category of toRun) {
+    running.add(category);
+  }
+  runningTier2Categories.set(bridge, running);
+
+  void callBridge(bridge, "inspect_tier2_run", { categories: toRun }, extCtx, {
+    transportTimeoutMs: INSPECT_TIER2_RUN_TIMEOUT_MS,
+  })
+    .catch(() => {
+      // Quiet background warmup: the next aft_inspect call can retry if this fails.
+    })
+    .finally(() => {
+      const active = runningTier2Categories.get(bridge);
+      if (!active) return;
+      for (const category of toRun) {
+        active.delete(category);
+      }
+      if (active.size === 0) {
+        runningTier2Categories.delete(bridge);
+      }
+    });
 }
 
 /** Exported for renderer unit tests. */
@@ -142,7 +197,7 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
     label: "inspect",
     description:
       "Codebase health snapshot. One call returns summary stats for: TODOs, file/symbol metrics, dead code, unused exports, code duplicates. Pass `sections` for per-category drill-down details.\n\n" +
-      "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates) run asynchronously on demand; calls may return cached `stale_categories: [...]` results or `pending_categories: [...]` while the cache warms (waits up to 1s for fresh data before falling back to cached). Pi does not warm Tier 2 automatically between calls.\n\n" +
+      "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates) run asynchronously on demand: when a call sees cold `pending_categories: [...]`, Pi quietly starts a background Tier 2 warmup. The current call may still return pending results while the cache warms; the next call can use cached data.\n\n" +
       "Use when: starting work on unfamiliar code, before a refactor, before review, or to verify cleanup completeness.",
     parameters: InspectParams,
     async execute(
@@ -157,6 +212,7 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
       const scope = normalizeStringOrArray(params.scope);
       const topK = validateOptionalTopK(params.topK);
       const response = await callBridge(bridge, "inspect", { sections, scope, topK }, extCtx);
+      runPendingTier2Categories(bridge, pendingTier2Categories(response), extCtx);
       return textResult(
         (response.text as string | undefined) ?? JSON.stringify(response, null, 2),
         response,

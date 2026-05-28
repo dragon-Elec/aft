@@ -42,7 +42,8 @@ describe("Pi aft_inspect adapter", () => {
     expect(description).not.toContain("triggered on session idle");
     expect(description).not.toContain("prewarm");
     expect(description).toContain("asynchronously on demand");
-    expect(description).toContain("does not warm Tier 2 automatically");
+    expect(description).toContain("quietly starts a background Tier 2 warmup");
+    expect(description).toContain("next call can use cached data");
 
     const parameters = inspect.parameters as {
       properties?: Record<string, Record<string, unknown>>;
@@ -89,6 +90,118 @@ describe("Pi aft_inspect adapter", () => {
     expect(calls[0].params.sections).toBeUndefined();
     expect(calls[0].params.scope).toBeUndefined();
     expect(calls[0].params.topK).toBeUndefined();
+  });
+
+  test("fires a quiet Tier 2 run when inspect returns cold pending categories", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge((command) => {
+      if (command === "inspect_tier2_run") {
+        return new Promise<Record<string, unknown>>(() => {});
+      }
+      return {
+        success: true,
+        summary: {},
+        scanner_state: {
+          stale_categories: [],
+          pending_categories: ["dead_code", "unused_exports", "duplicates"],
+        },
+      };
+    });
+    registerInspectTool(api, makePluginContext(bridge));
+
+    const result = (await executeTool(
+      tools.get("aft_inspect")!,
+      {},
+      makeExtContext("/repo", "pi-session"),
+    )) as { details: { scanner_state: { pending_categories: string[] } } };
+
+    expect(result.details.scanner_state.pending_categories).toEqual([
+      "dead_code",
+      "unused_exports",
+      "duplicates",
+    ]);
+    expect(calls).toHaveLength(2);
+    expect(calls[0].command).toBe("inspect");
+    expect(calls[1].command).toBe("inspect_tier2_run");
+    expect(calls[1].params).toEqual({
+      categories: ["dead_code", "unused_exports", "duplicates"],
+      session_id: "pi-session",
+    });
+  });
+
+  test("second inspect call can read cached Tier 2 data after the trigger starts", async () => {
+    const { api, tools } = makeMockApi();
+    let tier2RunStarted = false;
+    const { bridge, calls } = makeMockBridge((command, params) => {
+      if (command === "inspect_tier2_run") {
+        tier2RunStarted = true;
+        return { success: true, queued_categories: params.categories ?? [] };
+      }
+      if (tier2RunStarted) {
+        return {
+          success: true,
+          summary: {
+            dead_code: { count: 1 },
+            unused_exports: { count: 2 },
+            duplicates: { count: 3 },
+          },
+          scanner_state: {
+            stale_categories: [],
+            pending_categories: [],
+          },
+        };
+      }
+      return {
+        success: true,
+        summary: {},
+        scanner_state: {
+          stale_categories: [],
+          pending_categories: ["dead_code", "unused_exports", "duplicates"],
+        },
+      };
+    });
+    registerInspectTool(api, makePluginContext(bridge));
+
+    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
+    const result = (await executeTool(
+      tools.get("aft_inspect")!,
+      {},
+      makeExtContext("/repo", "pi-session"),
+    )) as {
+      details: {
+        summary: { dead_code: { count: number }; unused_exports: { count: number } };
+        scanner_state: { pending_categories: string[] };
+      };
+    };
+
+    expect(result.details.scanner_state.pending_categories).toEqual([]);
+    expect(result.details.summary.dead_code.count).toBe(1);
+    expect(result.details.summary.unused_exports.count).toBe(2);
+    expect(calls.map((call) => call.command)).toEqual(["inspect", "inspect_tier2_run", "inspect"]);
+  });
+
+  test("does not double-trigger while a Tier 2 run is already in flight", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge((command) => {
+      if (command === "inspect_tier2_run") {
+        return new Promise<Record<string, unknown>>(() => {});
+      }
+      return {
+        success: true,
+        summary: {},
+        scanner_state: {
+          stale_categories: [],
+          pending_categories: ["dead_code", "unused_exports", "duplicates"],
+        },
+      };
+    });
+    registerInspectTool(api, makePluginContext(bridge));
+
+    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
+    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
+
+    expect(calls.map((call) => call.command)).toEqual(["inspect", "inspect_tier2_run", "inspect"]);
+    expect(calls[1].params.categories).toEqual(["dead_code", "unused_exports", "duplicates"]);
   });
 
   test("rejects invalid topK without coercion", async () => {

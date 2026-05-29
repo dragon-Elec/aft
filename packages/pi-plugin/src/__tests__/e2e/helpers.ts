@@ -403,11 +403,25 @@ async function prepareBinaryOnce(): Promise<PreparedBinary> {
   if (await isExecutable(FALLBACK_BINARY)) {
     return { binaryPath: FALLBACK_BINARY };
   }
+  const skipReason = build.ok
+    ? `aft binary not found at ${relative(PROJECT_ROOT, TARGET_DEBUG_BINARY)} or ${FALLBACK_BINARY}`
+    : `cargo build failed and no fallback aft binary was found\n${build.output}`;
+
+  // In CI the aft binary is always built before the Bun suites run, so a missing
+  // binary there means setup broke — fail loud instead of silently
+  // `describe.skipIf(!binaryPath)`-ing e2e coverage into a false green. Locally
+  // (CI unset) keep the quiet skip so the non-e2e suites still run without a build.
+  if (process.env.CI === "true") {
+    throw new Error(
+      `e2e setup failed: ${skipReason}\n` +
+        "The aft binary must be present in CI (built before Bun tests run). " +
+        "Refusing to silently skip e2e coverage.",
+    );
+  }
+
   return {
     binaryPath: null,
-    skipReason: build.ok
-      ? `aft binary not found at ${relative(PROJECT_ROOT, TARGET_DEBUG_BINARY)} or ${FALLBACK_BINARY}`
-      : `cargo build failed and no fallback aft binary was found\n${build.output}`,
+    skipReason,
   };
 }
 

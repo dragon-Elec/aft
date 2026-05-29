@@ -129,6 +129,39 @@ describe("Pi aft_inspect adapter", () => {
     });
   });
 
+  test("fires a quiet Tier 2 run when inspect returns stale categories", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge((command) => {
+      if (command === "inspect_tier2_run") {
+        return new Promise<Record<string, unknown>>(() => {});
+      }
+      return {
+        success: true,
+        summary: {},
+        scanner_state: {
+          stale_categories: ["unused_exports"],
+          pending_categories: [],
+        },
+      };
+    });
+    registerInspectTool(api, makePluginContext(bridge));
+
+    const result = (await executeTool(
+      tools.get("aft_inspect")!,
+      {},
+      makeExtContext("/repo", "pi-session"),
+    )) as { details: { scanner_state: { stale_categories: string[] } } };
+
+    expect(result.details.scanner_state.stale_categories).toEqual(["unused_exports"]);
+    expect(calls).toHaveLength(2);
+    expect(calls[0].command).toBe("inspect");
+    expect(calls[1].command).toBe("inspect_tier2_run");
+    expect(calls[1].params).toEqual({
+      categories: ["unused_exports"],
+      session_id: "pi-session",
+    });
+  });
+
   test("second inspect call can read cached Tier 2 data after the trigger starts", async () => {
     const { api, tools } = makeMockApi();
     let tier2RunStarted = false;
@@ -202,6 +235,30 @@ describe("Pi aft_inspect adapter", () => {
 
     expect(calls.map((call) => call.command)).toEqual(["inspect", "inspect_tier2_run", "inspect"]);
     expect(calls[1].params.categories).toEqual(["dead_code", "unused_exports", "duplicates"]);
+  });
+
+  test("does not double-trigger a stale Tier 2 category already in flight", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge((command) => {
+      if (command === "inspect_tier2_run") {
+        return new Promise<Record<string, unknown>>(() => {});
+      }
+      return {
+        success: true,
+        summary: {},
+        scanner_state: {
+          stale_categories: ["dead_code"],
+          pending_categories: [],
+        },
+      };
+    });
+    registerInspectTool(api, makePluginContext(bridge));
+
+    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
+    await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
+
+    expect(calls.map((call) => call.command)).toEqual(["inspect", "inspect_tier2_run", "inspect"]);
+    expect(calls[1].params.categories).toEqual(["dead_code"]);
   });
 
   test("rejects invalid topK without coercion", async () => {

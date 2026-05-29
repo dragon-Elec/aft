@@ -71,17 +71,21 @@ function countFrom(summary: Record<string, unknown> | undefined, key: string): n
   return asNumber(section?.count);
 }
 
-function pendingTier2Categories(response: Record<string, unknown>): string[] {
+function tier2RefreshCategories(response: Record<string, unknown>): string[] {
   const scannerState = asRecord(response.scanner_state);
-  const pending = scannerState?.pending_categories;
-  if (!Array.isArray(pending)) return [];
-
   const categories = new Set<string>();
-  for (const category of pending) {
-    if (typeof category === "string" && TIER2_INSPECT_CATEGORIES.has(category)) {
-      categories.add(category);
+
+  for (const key of ["pending_categories", "stale_categories"] as const) {
+    const values = scannerState?.[key];
+    if (!Array.isArray(values)) continue;
+
+    for (const category of values) {
+      if (typeof category === "string" && TIER2_INSPECT_CATEGORIES.has(category)) {
+        categories.add(category);
+      }
     }
   }
+
   return [...categories];
 }
 
@@ -197,7 +201,7 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
     label: "inspect",
     description:
       "Codebase health snapshot. One call returns summary stats for: TODOs, file/symbol metrics, dead code, unused exports, code duplicates. Pass `sections` for per-category drill-down details.\n\n" +
-      "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates) run asynchronously on demand: when a call sees cold `pending_categories: [...]`, Pi quietly starts a background Tier 2 warmup. The current call may still return pending results while the cache warms; the next call can use cached data.\n\n" +
+      "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates) run asynchronously on demand: when a call sees cold `pending_categories: [...]` or stale `stale_categories: [...]`, Pi quietly starts a background Tier 2 warmup. The current call may still return pending results while the cache warms; the next call can use cached data.\n\n" +
       "Use when: starting work on unfamiliar code, before a refactor, before review, or to verify cleanup completeness.",
     parameters: InspectParams,
     async execute(
@@ -212,7 +216,7 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
       const scope = normalizeStringOrArray(params.scope);
       const topK = validateOptionalTopK(params.topK);
       const response = await callBridge(bridge, "inspect", { sections, scope, topK }, extCtx);
-      runPendingTier2Categories(bridge, pendingTier2Categories(response), extCtx);
+      runPendingTier2Categories(bridge, tier2RefreshCategories(response), extCtx);
       return textResult(
         (response.text as string | undefined) ?? JSON.stringify(response, null, 2),
         response,

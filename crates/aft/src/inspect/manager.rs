@@ -506,7 +506,7 @@ impl InspectManager {
             }
         }
 
-        let scan_files = scan_by_relative.into_values().collect::<Vec<_>>();
+        let mut scan_files = scan_by_relative.into_values().collect::<Vec<_>>();
         if !scan_files.is_empty() {
             let mut scan_job = job.clone();
             scan_job.job_id = self.next_job_id.fetch_add(1, Ordering::Relaxed);
@@ -548,7 +548,7 @@ impl InspectManager {
             }
         }
 
-        let contribution_set_hash = if has_updates {
+        let mut contribution_set_hash = if has_updates {
             cache
                 .apply_contribution_updates(job.category, updates)
                 .map_err(|error| error.to_string())?
@@ -571,6 +571,56 @@ impl InspectManager {
                 contributions,
                 aggregate,
             });
+        }
+
+        if category_contributions_depend_on_entry_points(job.category) {
+            // Manifest edits can change entry/public roots without touching any
+            // source file. Dead-code and unused-export file contributions embed
+            // those roots, so an aggregate hash miss for these categories must
+            // refresh every current contribution before rolling up again.
+            let full_scan_files = current_by_relative.into_values().collect::<Vec<_>>();
+            if !full_scan_files.is_empty() {
+                let mut rescan_job = job.clone();
+                rescan_job.job_id = self.next_job_id.fetch_add(1, Ordering::Relaxed);
+                rescan_job.scope_files = full_scan_files.clone();
+                if rescan_job.category == InspectCategory::DeadCode
+                    && rescan_job.callgraph_snapshot.is_none()
+                {
+                    rescan_job.callgraph_snapshot =
+                        Some(build_tier2_callgraph_snapshot(&rescan_job.project_root));
+                }
+                let scan_result = run_tier2_scan(&rescan_job);
+                let scan_success = scan_result.outcome.map_err(|message| {
+                    format!(
+                        "{} full rescan after entry-point cache miss failed: {message}",
+                        job.category
+                    )
+                })?;
+                let rescan_updates = Tier2ContributionUpdates {
+                    upserts: scan_success.contributions,
+                    ..Tier2ContributionUpdates::default()
+                };
+                contribution_set_hash = cache
+                    .apply_contribution_updates(job.category, rescan_updates)
+                    .map_err(|error| error.to_string())?;
+                aggregate_job.callgraph_snapshot = rescan_job.callgraph_snapshot.clone();
+                scan_files = full_scan_files;
+
+                if let Some(aggregate) = cache
+                    .load_aggregate_if_hash_matches(job.category, &contribution_set_hash)
+                    .map_err(|error| error.to_string())?
+                {
+                    cache
+                        .touch_tier2_last_full_run(job.category)
+                        .map_err(|error| error.to_string())?;
+                    let contributions = load_contributions(cache, job)?;
+                    return Ok(InspectScanSuccess {
+                        scanned_files: scan_files,
+                        contributions,
+                        aggregate,
+                    });
+                }
+            }
         }
 
         if aggregate_job.category == InspectCategory::DeadCode
@@ -1296,6 +1346,13 @@ enum LanguageSkipMode {
     UnusedExports,
 }
 
+fn category_contributions_depend_on_entry_points(category: InspectCategory) -> bool {
+    matches!(
+        category,
+        InspectCategory::DeadCode | InspectCategory::UnusedExports
+    )
+}
+
 fn skipped_languages(files: &[PathBuf], mode: LanguageSkipMode) -> Vec<String> {
     files
         .iter()
@@ -1446,12 +1503,14 @@ fn filter_payload_for_scope(mut payload: serde_json::Value, scope: &JobScope) ->
         return payload;
     }
 
+    // Scoped Tier 2 callers pass an uncapped rollup into this filter and cap
+    // drill-down only afterwards, so the recomputed count below remains the
+    // true in-scope total rather than the size of a capped sample.
     if let Some(items) = payload
         .get_mut("items")
         .and_then(|value| value.as_array_mut())
     {
-        items.retain(|item| value_matches_scope(item, scope));
-        let count = items.len();
+        let count = filter_values_for_scope(items, scope);
         if let Some(object) = payload.as_object_mut() {
             object.insert("count".to_string(), serde_json::json!(count));
             if object.contains_key("total_groups") {
@@ -1467,28 +1526,81 @@ fn filter_payload_for_scope(mut payload: serde_json::Value, scope: &JobScope) ->
         .get_mut("groups")
         .and_then(|value| value.as_array_mut())
     {
-        groups.retain(|group| value_matches_scope(group, scope));
-        let count = groups.len();
+        let count = filter_values_for_scope(groups, scope);
         if let Some(object) = payload.as_object_mut() {
             object.insert("count".to_string(), serde_json::json!(count));
             object.insert("total_groups".to_string(), serde_json::json!(count));
+            if object.contains_key("groups_count") {
+                object.insert("groups_count".to_string(), serde_json::json!(count));
+            }
         }
     }
 
     payload
 }
 
-fn value_matches_scope(value: &serde_json::Value, scope: &JobScope) -> bool {
+fn filter_values_for_scope(values: &mut Vec<serde_json::Value>, scope: &JobScope) -> usize {
+    values.retain_mut(|value| prune_value_for_scope(value, scope));
+    values.len()
+}
+
+fn prune_value_for_scope(value: &mut serde_json::Value, scope: &JobScope) -> bool {
     if let Some(file) = value.get("file").and_then(|file| file.as_str()) {
         return scope.contains_display_path(file);
     }
-    if let Some(files) = value.get("files").and_then(|files| files.as_array()) {
-        return files
-            .iter()
-            .filter_map(|file| file.as_str())
-            .any(|file| scope.contains_display_path(display_file_from_occurrence(file)));
+
+    let first_scoped_occurrence = if let Some(files) = value
+        .get_mut("files")
+        .and_then(|files| files.as_array_mut())
+    {
+        files.retain(|file| {
+            file.as_str()
+                .is_some_and(|file| scope.contains_display_path(display_file_from_occurrence(file)))
+        });
+        if files.len() < 2 {
+            return false;
+        }
+        files.first().and_then(Value::as_str).map(str::to_string)
+    } else {
+        None
+    };
+
+    if let Some(occurrence) = first_scoped_occurrence {
+        update_duplicate_group_sample(value, &occurrence);
     }
+
     true
+}
+
+fn update_duplicate_group_sample(value: &mut serde_json::Value, occurrence: &str) {
+    let Some((file, start_line, end_line)) = parse_duplicate_occurrence(occurrence) else {
+        return;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    if object.contains_key("sample_file") {
+        object.insert("sample_file".to_string(), json!(file));
+    }
+    if object.contains_key("sample_start_line") {
+        object.insert("sample_start_line".to_string(), json!(start_line));
+    }
+    if object.contains_key("sample_end_line") {
+        object.insert("sample_end_line".to_string(), json!(end_line));
+    }
+}
+
+fn parse_duplicate_occurrence(value: &str) -> Option<(&str, u64, u64)> {
+    let (file, range) = value.rsplit_once(':')?;
+    let (start, end) = range.split_once('-')?;
+    if !start.chars().all(|char| char.is_ascii_digit())
+        || !end.chars().all(|char| char.is_ascii_digit())
+    {
+        return None;
+    }
+
+    Some((file, start.parse().ok()?, end.parse().ok()?))
 }
 
 fn display_file_from_occurrence(value: &str) -> &str {

@@ -4,11 +4,15 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use aft::cache_freshness;
 use aft::commands::configure::handle_configure;
 use aft::commands::inspect::{handle_inspect, handle_inspect_tier2_run};
 use aft::config::Config;
 use aft::context::AppContext;
-use aft::inspect::{InspectCategory, InspectManager, InspectScanSuccess, InspectSnapshot};
+use aft::inspect::{
+    FileContribution, InspectCache, InspectCategory, InspectManager, InspectScanSuccess,
+    InspectSnapshot, JobKey,
+};
 use aft::lsp::registry::ServerKind;
 use aft::parser::{SymbolCache, TreeSitterProvider};
 use aft::protocol::RawRequest;
@@ -721,6 +725,68 @@ fn inspect_command_tier2_changed_file_surfaces_stale_category() {
     assert_summary_status(&response, "duplicates", "stale");
 }
 
+#[test]
+fn inspect_command_tier2_aggregate_hash_mismatch_is_cache_miss() {
+    let (_temp_dir, root) = fixture_project();
+    let file = write_file(&root, "src/foo.ts", duplicate_fixture_source());
+    let inspect_dir = root.join(".aft-cache").join("inspect");
+    let cache = InspectCache::open(inspect_dir.clone(), root.clone()).expect("open cache");
+    let key = JobKey::for_project_category(InspectCategory::Duplicates);
+    let freshness = cache_freshness::collect(&file).expect("collect freshness");
+    let contribution = FileContribution::new(
+        InspectCategory::Duplicates,
+        file.clone(),
+        freshness,
+        json!({"file": "src/foo.ts", "fragments": []}),
+    );
+
+    cache
+        .store_tier2_result(
+            key.clone(),
+            std::slice::from_ref(&file),
+            &[contribution],
+            json!({"count": 1, "items": [{"file": "src/foo.ts"}]}),
+        )
+        .expect("store tier2 aggregate");
+    assert!(
+        cache
+            .get_aggregated(&key)
+            .expect("warm aggregate")
+            .is_some(),
+        "freshly stored aggregate should be readable"
+    );
+
+    write_file(
+        &root,
+        "src/foo.ts",
+        "export function changed(input: number) { return input + 42; }\n",
+    );
+    let changed_freshness = cache_freshness::collect(&file).expect("collect changed freshness");
+    cache
+        .update_content_fresh_metadata(
+            InspectCategory::Duplicates,
+            Path::new("src/foo.ts"),
+            &changed_freshness,
+        )
+        .expect("update cached contribution metadata without aggregate recompute");
+
+    assert!(
+        cache
+            .get_aggregated(&key)
+            .expect("hash-aware memory aggregate read")
+            .is_none(),
+        "in-memory aggregate must miss after contribution_set_hash changes"
+    );
+    let reopened = InspectCache::open(inspect_dir, root).expect("reopen cache");
+    assert!(
+        reopened
+            .get_aggregated(&key)
+            .expect("hash-aware sqlite aggregate read")
+            .is_none(),
+        "persisted aggregate must miss when its stored contribution_set_hash is stale"
+    );
+}
+
 fn dead_code_items(response: &Value) -> Vec<(String, String)> {
     response["details"]["dead_code"]
         .as_array()
@@ -981,6 +1047,116 @@ fn inspect_command_manifestless_projects_keep_conventional_entry_point_fallback(
 }
 
 #[test]
+fn inspect_command_manifest_without_declared_entries_uses_conventional_fallback() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "package.json", r#"{"private":true}"#);
+    write_file(
+        &root,
+        "src/index.ts",
+        "export function fallbackPublicApi() { return 1; }\n",
+    );
+    write_file(
+        &root,
+        "src/internal.ts",
+        "export function fallbackInternal() { return 2; }\n",
+    );
+    let ctx = configured_context(&root);
+
+    tier2_run(&ctx, &["dead_code", "unused_exports"]);
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-manifest-no-entry-fallback",
+            "command": "inspect",
+            "sections": ["dead_code", "unused_exports"],
+            "topK": 10,
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert_eq!(
+        dead_code_items(&response),
+        vec![(
+            "src/internal.ts".to_string(),
+            "fallbackInternal".to_string()
+        )],
+        "manifest presence without declared roots should still use conventional index.ts fallback for dead_code: {response:#}"
+    );
+    assert_eq!(
+        unused_export_items(&response),
+        vec![(
+            "src/internal.ts".to_string(),
+            "fallbackInternal".to_string()
+        )],
+        "manifest presence without declared roots should still use conventional index.ts fallback for unused_exports: {response:#}"
+    );
+}
+
+#[test]
+fn inspect_command_manifest_edit_invalidates_unused_exports_aggregate() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "package.json", r#"{"main":"./src/index.ts"}"#);
+    write_file(
+        &root,
+        "src/index.ts",
+        "export function indexApi() { return 1; }\n",
+    );
+    write_file(
+        &root,
+        "src/public.ts",
+        "export function publicApi() { return 2; }\n",
+    );
+    write_file(
+        &root,
+        "src/internal.ts",
+        "export function internalOnly() { return 3; }\n",
+    );
+    let ctx = configured_context(&root);
+
+    tier2_run(&ctx, &["unused_exports"]);
+    let before = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-unused-exports-before-manifest-edit",
+            "command": "inspect",
+            "sections": "unused_exports",
+            "topK": 10,
+        }),
+    );
+    assert_eq!(before["success"], true, "inspect failed: {before:#}");
+    assert_eq!(
+        unused_export_items(&before),
+        vec![
+            ("src/internal.ts".to_string(), "internalOnly".to_string()),
+            ("src/public.ts".to_string(), "publicApi".to_string()),
+        ],
+        "initial package main should suppress only index.ts: {before:#}"
+    );
+
+    write_file(&root, "package.json", r#"{"main":"./src/public.ts"}"#);
+    tier2_run(&ctx, &["unused_exports"]);
+    let after = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-unused-exports-after-manifest-edit",
+            "command": "inspect",
+            "sections": "unused_exports",
+            "topK": 10,
+        }),
+    );
+
+    assert_eq!(after["success"], true, "inspect failed: {after:#}");
+    assert_eq!(
+        unused_export_items(&after),
+        vec![
+            ("src/index.ts".to_string(), "indexApi".to_string()),
+            ("src/internal.ts".to_string(), "internalOnly".to_string()),
+        ],
+        "manifest edit should change the contribution_set_hash and force aggregate recompute: {after:#}"
+    );
+}
+
+#[test]
 fn inspect_command_dead_code_keeps_same_name_exports_distinct_after_tier2_run() {
     let (_temp_dir, root) = fixture_project();
     write_file(
@@ -1167,8 +1343,9 @@ fn inspect_command_duplicates_summary_count_uses_production_payload() {
 #[test]
 fn inspect_command_duplicates_file_scope_matches_occurrence_labels() {
     let (_temp_dir, root) = fixture_project();
-    write_file(&root, "src/foo.ts", duplicate_fixture_source());
-    write_file(&root, "src/bar.ts", duplicate_fixture_source());
+    write_file(&root, "src/scoped/foo.ts", duplicate_fixture_source());
+    write_file(&root, "src/scoped/baz.ts", duplicate_fixture_source());
+    write_file(&root, "src/outside/bar.ts", duplicate_fixture_source());
     let ctx = configured_context(&root);
 
     tier2_run(&ctx, &["duplicates"]);
@@ -1178,7 +1355,7 @@ fn inspect_command_duplicates_file_scope_matches_occurrence_labels() {
             "id": "inspect-duplicates-scoped",
             "command": "inspect",
             "sections": "duplicates",
-            "scope": "src/foo.ts",
+            "scope": "src/scoped",
             "topK": 10,
         }),
     );
@@ -1189,22 +1366,29 @@ fn inspect_command_duplicates_file_scope_matches_occurrence_labels() {
         .expect("duplicates count");
     assert!(
         count > 0,
-        "scoped duplicates should retain matching groups: {response:#}"
+        "scoped duplicates should retain groups duplicated within scope: {response:#}"
     );
     let details = response["details"]["duplicates"]
         .as_array()
         .expect("duplicates details");
     assert!(
-        details.iter().any(|group| {
-            group["files"]
-                .as_array()
-                .expect("group files")
+        !details.is_empty(),
+        "expected scoped duplicate details: {response:#}"
+    );
+    for group in details {
+        let files = group["files"].as_array().expect("group files");
+        assert!(
+            files.len() >= 2,
+            "duplicate groups with fewer than two in-scope files should be dropped: {response:#}"
+        );
+        assert!(
+            files
                 .iter()
                 .filter_map(Value::as_str)
-                .any(|file| file.starts_with("src/foo.ts:"))
-        }),
-        "scoped duplicates should include foo occurrence labels: {response:#}"
-    );
+                .all(|file| file.starts_with("src/scoped/")),
+            "scoped duplicate groups must prune out-of-scope files: {response:#}"
+        );
+    }
 }
 
 #[test]
@@ -1286,6 +1470,55 @@ fn inspect_command_unused_exports_scope_filters_full_contributions_before_cap() 
             .iter()
             .all(|item| item["file"].as_str().is_some_and(|file| file.starts_with("aaa_global/"))),
         "project-wide cap should be applied before later zzz_scoped files appear in details: {project:#}"
+    );
+}
+
+#[test]
+fn inspect_command_duplicates_scope_filters_full_contributions_before_cap() {
+    let (_temp_dir, root) = fixture_project();
+    let source = many_duplicate_groups_source();
+    write_file(&root, "aaa_global/left.ts", &source);
+    write_file(&root, "aaa_global/right.ts", &source);
+    write_file(&root, "zzz_scoped/left.ts", &source);
+    write_file(&root, "zzz_scoped/right.ts", &source);
+    let ctx = configured_context(&root);
+
+    tier2_run(&ctx, &["duplicates"]);
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-duplicates-scoped-after-cap",
+            "command": "inspect",
+            "sections": "duplicates",
+            "scope": "zzz_scoped",
+            "topK": 100,
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    let count = response["summary"]["duplicates"]["count"]
+        .as_u64()
+        .expect("duplicates count");
+    assert!(
+        count > 100,
+        "scoped duplicate count should come from full contributions, not the capped project aggregate: {response:#}"
+    );
+    let details = response["details"]["duplicates"]
+        .as_array()
+        .expect("duplicates details");
+    assert_eq!(
+        details.len(),
+        100,
+        "scoped duplicate details should be capped after filtering the full rollup: {response:#}"
+    );
+    assert!(
+        details.iter().all(|group| group["files"]
+            .as_array()
+            .expect("group files")
+            .iter()
+            .filter_map(Value::as_str)
+            .all(|file| file.starts_with("zzz_scoped/"))),
+        "scoped duplicate details should only include scoped files: {response:#}"
     );
 }
 

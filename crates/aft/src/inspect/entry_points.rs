@@ -52,6 +52,10 @@ impl EntryPointSet {
     fn warn(&mut self, message: String) {
         self.warnings.push(message);
     }
+
+    fn has_liveness_roots(&self) -> bool {
+        !self.liveness_root_files.is_empty()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -81,11 +85,27 @@ pub(crate) fn resolve_entry_points(project_root: &Path) -> EntryPointSet {
         collect_package_manifest_entry_points(&manifest, &mut entry_points);
     }
 
-    if !manifest_found {
+    // A manifest can be present without declaring any runnable or public root
+    // (for example a private package.json or a virtual Cargo workspace). In
+    // that case, keep the conventional fallback so liveness analysis never
+    // starts from an empty root set solely because a manifest exists.
+    if !manifest_found || !entry_points.has_liveness_roots() {
         collect_fallback_entry_points(&project_root, &mut entry_points);
     }
 
     entry_points
+}
+
+pub(crate) fn collect_entry_point_manifests(project_root: &Path) -> Vec<PathBuf> {
+    let project_root = snapshot_path(project_root);
+    let mut manifests = ManifestPaths::default();
+    collect_manifests(&project_root, &mut manifests);
+
+    let mut paths = manifests.cargo_tomls;
+    paths.extend(manifests.package_jsons);
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn collect_manifests(project_root: &Path, manifests: &mut ManifestPaths) {

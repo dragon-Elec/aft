@@ -1,5 +1,6 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -78,6 +79,7 @@ pub struct ContributionRecord {
 struct MemoryAggregate {
     payload: serde_json::Value,
     generated_at: i64,
+    contribution_set_hash: Option<String>,
 }
 
 const TIER1_FILE_MEMO_MAX_ENTRIES: usize = 4_096;
@@ -86,54 +88,114 @@ const TIER1_FILE_MEMO_MAX_ENTRIES: usize = 4_096;
 struct Tier1MemoEntry<T> {
     freshness: FileFreshness,
     value: T,
+    generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct LruNode {
+    path: PathBuf,
+    generation: u64,
 }
 
 #[derive(Debug)]
 struct Tier1MemoState<T> {
     entries: HashMap<PathBuf, Tier1MemoEntry<T>>,
-    lru: std::collections::VecDeque<PathBuf>,
+    lru: VecDeque<LruNode>,
+    next_generation: u64,
 }
 
 impl<T> Default for Tier1MemoState<T> {
     fn default() -> Self {
         Self {
             entries: HashMap::new(),
-            lru: std::collections::VecDeque::new(),
+            lru: VecDeque::new(),
+            next_generation: 0,
         }
     }
 }
 
 impl<T> Tier1MemoState<T> {
-    fn insert(&mut self, path: PathBuf, entry: Tier1MemoEntry<T>) {
+    fn insert(&mut self, path: PathBuf, mut entry: Tier1MemoEntry<T>) {
+        let generation = self.allocate_generation();
+        entry.generation = generation;
         self.entries.insert(path.clone(), entry);
-        self.touch(&path);
+        self.lru.push_back(LruNode { path, generation });
+        self.compact_lru_if_needed();
         self.evict_lru();
     }
 
     fn remove(&mut self, path: &Path) {
         self.entries.remove(path);
-        self.remove_from_lru(path);
+        self.compact_lru_if_needed();
     }
 
     fn touch(&mut self, path: &Path) {
         if !self.entries.contains_key(path) {
             return;
         }
-        self.remove_from_lru(path);
-        self.lru.push_back(path.to_path_buf());
+
+        let generation = self.allocate_generation();
+        if let Some(entry) = self.entries.get_mut(path) {
+            entry.generation = generation;
+            self.lru.push_back(LruNode {
+                path: path.to_path_buf(),
+                generation,
+            });
+        }
+        self.compact_lru_if_needed();
     }
 
-    fn remove_from_lru(&mut self, path: &Path) {
-        self.lru.retain(|cached_path| cached_path.as_path() != path);
+    fn allocate_generation(&mut self) -> u64 {
+        if self.next_generation == u64::MAX {
+            self.rebuild_lru();
+        }
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        generation
+    }
+
+    fn compact_lru_if_needed(&mut self) {
+        let max_lru_nodes = TIER1_FILE_MEMO_MAX_ENTRIES
+            .saturating_mul(2)
+            .max(self.entries.len());
+        if self.lru.len() > max_lru_nodes {
+            self.rebuild_lru();
+        }
+    }
+
+    fn rebuild_lru(&mut self) {
+        let mut live_nodes = self
+            .entries
+            .iter()
+            .map(|(path, entry)| (entry.generation, path.clone()))
+            .collect::<Vec<_>>();
+        live_nodes.sort_by_key(|(generation, _)| *generation);
+
+        self.lru.clear();
+        for (generation, (_, path)) in live_nodes.into_iter().enumerate() {
+            let generation = generation as u64;
+            if let Some(entry) = self.entries.get_mut(&path) {
+                entry.generation = generation;
+            }
+            self.lru.push_back(LruNode { path, generation });
+        }
+        self.next_generation = self.lru.len() as u64;
     }
 
     fn evict_lru(&mut self) {
         while self.entries.len() > TIER1_FILE_MEMO_MAX_ENTRIES {
-            let Some(path) = self.lru.pop_front() else {
+            let Some(node) = self.lru.pop_front() else {
                 break;
             };
-            self.entries.remove(&path);
+            if self
+                .entries
+                .get(&node.path)
+                .is_some_and(|entry| entry.generation == node.generation)
+            {
+                self.entries.remove(&node.path);
+            }
         }
+        self.compact_lru_if_needed();
     }
 }
 
@@ -167,6 +229,7 @@ impl<T: Clone> Tier1FileMemo<T> {
                     Tier1MemoEntry {
                         freshness,
                         value: value.clone(),
+                        generation: 0,
                     },
                 );
             } else {
@@ -256,6 +319,15 @@ impl InspectCache {
         key: JobKey,
         payload: serde_json::Value,
     ) -> Result<(), InspectCacheError> {
+        self.store_memory_aggregate(key, payload, None)
+    }
+
+    fn store_memory_aggregate(
+        &self,
+        key: JobKey,
+        payload: serde_json::Value,
+        contribution_set_hash: Option<String>,
+    ) -> Result<(), InspectCacheError> {
         self.memory
             .write()
             .map_err(|_| InspectCacheError::LockPoisoned("memory"))?
@@ -264,6 +336,7 @@ impl InspectCache {
                 MemoryAggregate {
                     payload,
                     generated_at: unix_seconds_now(),
+                    contribution_set_hash,
                 },
             );
         Ok(())
@@ -273,18 +346,43 @@ impl InspectCache {
         &self,
         key: &JobKey,
     ) -> Result<Option<serde_json::Value>, InspectCacheError> {
-        if let Some(entry) = self
-            .memory
-            .read()
-            .map_err(|_| InspectCacheError::LockPoisoned("memory"))?
-            .get(key)
-            .cloned()
-        {
-            return Ok(Some(entry.payload));
+        if !key.category.is_tier2() {
+            return Ok(self
+                .memory
+                .read()
+                .map_err(|_| InspectCacheError::LockPoisoned("memory"))?
+                .get(key)
+                .map(|entry| entry.payload.clone()));
         }
 
-        if !key.category.is_tier2() {
-            return Ok(None);
+        let current_hash = {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+            contribution_set_hash_with_conn(
+                &conn,
+                key.category,
+                &self.project_key,
+                &self.project_root,
+            )?
+        };
+
+        let memory_entry = {
+            self.memory
+                .read()
+                .map_err(|_| InspectCacheError::LockPoisoned("memory"))?
+                .get(key)
+                .cloned()
+        };
+        if let Some(entry) = memory_entry {
+            if entry.contribution_set_hash.as_deref() == Some(current_hash.as_str()) {
+                return Ok(Some(entry.payload));
+            }
+            self.memory
+                .write()
+                .map_err(|_| InspectCacheError::LockPoisoned("memory"))?
+                .remove(key);
         }
 
         let payload = {
@@ -293,8 +391,9 @@ impl InspectCache {
                 .lock()
                 .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
             conn.query_row(
-                "SELECT aggregate FROM tier2_aggregates WHERE category = ?1 AND project_key = ?2",
-                params![key.category.as_str(), self.project_key],
+                "SELECT aggregate FROM tier2_aggregates \
+                 WHERE category = ?1 AND project_key = ?2 AND contribution_set_hash = ?3",
+                params![key.category.as_str(), self.project_key, current_hash],
                 |row| row.get::<_, Vec<u8>>(0),
             )
             .optional()?
@@ -303,7 +402,7 @@ impl InspectCache {
         match payload {
             Some(bytes) => {
                 let value = serde_json::from_slice::<serde_json::Value>(&bytes)?;
-                self.store_aggregated(key.clone(), value.clone())?;
+                self.store_memory_aggregate(key.clone(), value.clone(), Some(current_hash))?;
                 Ok(Some(value))
             }
             None => Ok(None),
@@ -369,8 +468,12 @@ impl InspectCache {
             )?;
         }
 
-        let contribution_set_hash =
-            contribution_set_hash_with_conn(&tx, key.category, &self.project_key)?;
+        let contribution_set_hash = contribution_set_hash_with_conn(
+            &tx,
+            key.category,
+            &self.project_key,
+            &self.project_root,
+        )?;
         let aggregate_blob = serde_json::to_vec(&aggregate)?;
         tx.execute(
             "INSERT INTO tier2_aggregates \
@@ -395,7 +498,7 @@ impl InspectCache {
         )?;
         tx.commit()?;
 
-        self.store_aggregated(key, aggregate)
+        self.store_memory_aggregate(key, aggregate, Some(contribution_set_hash))
     }
 
     pub(crate) fn apply_contribution_updates(
@@ -464,7 +567,7 @@ impl InspectCache {
         }
 
         let contribution_set_hash =
-            contribution_set_hash_with_conn(&tx, category, &self.project_key)?;
+            contribution_set_hash_with_conn(&tx, category, &self.project_key, &self.project_root)?;
         tx.commit()?;
 
         self.memory
@@ -497,7 +600,11 @@ impl InspectCache {
         match payload {
             Some(bytes) => {
                 let value = serde_json::from_slice::<serde_json::Value>(&bytes)?;
-                self.store_aggregated(JobKey::for_project_category(category), value.clone())?;
+                self.store_memory_aggregate(
+                    JobKey::for_project_category(category),
+                    value.clone(),
+                    Some(contribution_set_hash.to_string()),
+                )?;
                 Ok(Some(value))
             }
             None => Ok(None),
@@ -571,7 +678,7 @@ impl InspectCache {
         )?;
         tx.commit()?;
 
-        self.store_aggregated(key, aggregate)
+        self.store_memory_aggregate(key, aggregate, Some(contribution_set_hash.to_string()))
     }
 
     pub fn load_tier2_contributions(
@@ -744,7 +851,7 @@ impl InspectCache {
             .conn
             .lock()
             .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
-        contribution_set_hash_with_conn(&conn, category, &self.project_key)
+        contribution_set_hash_with_conn(&conn, category, &self.project_key, &self.project_root)
     }
 
     pub fn last_full_run(
@@ -832,6 +939,7 @@ fn contribution_set_hash_with_conn(
     conn: &Connection,
     category: InspectCategory,
     project_key: &str,
+    project_root: &Path,
 ) -> Result<String, InspectCacheError> {
     let mut stmt = conn.prepare(
         "SELECT file_path, file_hash FROM tier2_contributions \
@@ -842,6 +950,7 @@ fn contribution_set_hash_with_conn(
     })?;
 
     let mut hasher = blake3::Hasher::new();
+    hasher.update(b"tier2-contributions\0");
     for row in rows {
         let (file_path, file_hash) = row?;
         hasher.update(file_path.as_bytes());
@@ -849,7 +958,30 @@ fn contribution_set_hash_with_conn(
         hasher.update(file_hash.as_bytes());
         hasher.update(b"\0");
     }
+    update_manifest_fingerprint_hash(&mut hasher, project_root)?;
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn update_manifest_fingerprint_hash(
+    hasher: &mut blake3::Hasher,
+    project_root: &Path,
+) -> Result<(), InspectCacheError> {
+    let manifest_root =
+        fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    hasher.update(b"entry-point-manifests\0");
+    for manifest in super::entry_points::collect_entry_point_manifests(project_root) {
+        let relative_path = manifest
+            .strip_prefix(&manifest_root)
+            .unwrap_or(manifest.as_path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        let content_hash = blake3::hash(&fs::read(&manifest)?);
+        hasher.update(relative_path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(content_hash.as_bytes());
+        hasher.update(b"\0");
+    }
+    Ok(())
 }
 
 fn update_contribution_fingerprint_hash(
@@ -959,6 +1091,43 @@ mod tests {
             panic!("recently used entry should survive eviction")
         });
         assert_eq!(recent_value, 0);
+    }
+
+    #[test]
+    fn tier1_file_memo_repeated_touches_keep_lazy_lru_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let memo = Tier1FileMemo::<usize>::default();
+        let mut paths = Vec::with_capacity(TIER1_FILE_MEMO_MAX_ENTRIES);
+
+        for index in 0..TIER1_FILE_MEMO_MAX_ENTRIES {
+            let path = temp.path().join(format!("file-{index}.txt"));
+            fs::write(&path, index.to_string()).unwrap();
+            memo.get_or_insert_with(&path, |path| (Some(collect_freshness(path)), index));
+            paths.push(path);
+        }
+
+        for _ in 0..(TIER1_FILE_MEMO_MAX_ENTRIES * 3) {
+            let value = memo.get_or_insert_with(&paths[0], |_| {
+                panic!("hot entry should stay cached while it is repeatedly touched")
+            });
+            assert_eq!(value, 0);
+        }
+
+        let evicting_path = temp.path().join("new-file.txt");
+        fs::write(&evicting_path, "new").unwrap();
+        memo.get_or_insert_with(&evicting_path, |path| {
+            (Some(collect_freshness(path)), TIER1_FILE_MEMO_MAX_ENTRIES)
+        });
+
+        let state = memo.state.lock().unwrap();
+        assert_eq!(state.entries.len(), TIER1_FILE_MEMO_MAX_ENTRIES);
+        assert!(state.entries.contains_key(&paths[0]));
+        assert!(state.entries.contains_key(&evicting_path));
+        assert!(!state.entries.contains_key(&paths[1]));
+        assert!(
+            state.lru.len() <= TIER1_FILE_MEMO_MAX_ENTRIES * 2,
+            "lazy LRU queue should be compacted instead of growing without bound"
+        );
     }
 
     #[test]

@@ -142,7 +142,41 @@ async function prepareArm(
       plugin: ["@cortexkit/aft-opencode@latest"],
       provider,
     });
-    writeFileSync(resolve(opencodeDir, "aft.jsonc"), '{\n  "search_index": true,\n  "semantic_search": true\n}\n');
+    // Fair-comparison surface: keep file/edit/grep/bash mechanics IDENTICAL to the
+    // codegraph arm (native OpenCode tools) so the only difference benchmarked is the
+    // code-intelligence layer — AFT's aft_search/aft_outline/aft_zoom/aft_navigate vs
+    // codegraph's codegraph_* tools.
+    //   - hoist_builtin_tools:false → native read/write/edit (AFT registers aft_* prefixed; disabled below)
+    //   - bash:false                → native bash on both arms (AFT otherwise hoists bash)
+    //   - grep/glob disabled         → native grep/glob (search_index stays true so aft_search keeps its lexical lane)
+    //   - tool_surface:"all"         → expose aft_navigate (the codegraph_trace/callers comparator)
+    //   - everything non-comparison disabled (safety/import/ast-grep/conflicts/lsp/refactor/transform/move/delete)
+    const aftBenchConfig = {
+      search_index: true,
+      semantic_search: true,
+      hoist_builtin_tools: false,
+      bash: false,
+      tool_surface: "all",
+      disabled_tools: [
+        "aft_read",
+        "aft_write",
+        "aft_edit",
+        "aft_apply_patch",
+        "grep",
+        "glob",
+        "aft_safety",
+        "aft_import",
+        "ast_grep_search",
+        "ast_grep_replace",
+        "aft_conflicts",
+        "lsp_diagnostics",
+        "aft_refactor",
+        "aft_transform",
+        "aft_move",
+        "aft_delete",
+      ],
+    };
+    writeFileSync(resolve(opencodeDir, "aft.jsonc"), `${JSON.stringify(aftBenchConfig, null, 2)}\n`);
     if (!dryRun) {
       const storageDir = cortexKitStorageRoot();
       const warmup = await runCommand(
@@ -213,8 +247,8 @@ async function invokeOpencode(task: AgentTask, repoPath: string, configRoot: str
       AFT_WAIT_FOR_SEMANTIC_READY: "1",
       AFT_WAIT_FOR_SEMANTIC_READY_MS: String(timeoutMs),
       FASTEMBED_CACHE_DIR: join(storageDir, "semantic", "models"),
-      OPENAI_API_KEY: apiKey,
-      OPENCODE_API_KEY: apiKey,
+      OPENAI_API_KEY: apiKey ?? undefined,
+      OPENCODE_API_KEY: apiKey ?? undefined,
       AFT_BENCHMARK: "1",
     },
   );

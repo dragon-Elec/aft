@@ -17,6 +17,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
 import { BridgePool, setActiveLogger } from "@cortexkit/aft-bridge";
+import { acquireEnv } from "../../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { bridgeLogger } from "../../logger.js";
 
 // Route aft-bridge log calls (including forwarded Rust child stderr lines like
@@ -139,16 +140,12 @@ export async function createHarness(
   }
 
   const tempDir = await mkdtemp(join(tmpdir(), "aft-pi-e2e-"));
-  const previousCacheDir = process.env.AFT_CACHE_DIR;
-  // Redirect AFT caches/indexes to temp so tests don't pollute user data.
-  process.env.AFT_CACHE_DIR = join(tempDir, ".aft-cache");
 
   try {
     if (!options.noFixtures) {
       await copyFixturesToTempDir(tempDir, options.fixtureNames);
     }
   } catch (err) {
-    restoreAftCacheDir(previousCacheDir);
     await rm(tempDir, { recursive: true, force: true });
     throw err;
   }
@@ -164,14 +161,23 @@ export async function createHarness(
     ...(options.config ?? {}),
   };
 
-  const pool = new BridgePool(
-    preparedBinary.binaryPath,
-    { timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS },
-    // Forward the full config to configure so indexing/restrict/etc. match prod.
-    { ...config, storage_dir: join(tempDir, ".aft-storage"), harness: "pi" },
-  );
+  // Redirect AFT caches/indexes to temp so tests don't pollute user data.
+  // process.env is process-global in Bun, so serialize the env-sensitive bridge startup only.
+  const releaseEnv = await acquireEnv({ AFT_CACHE_DIR: join(tempDir, ".aft-cache") });
+  let pool: BridgePool;
+  let bridge: BinaryBridge;
+  try {
+    pool = new BridgePool(
+      preparedBinary.binaryPath,
+      { timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS },
+      // Forward the full config to configure so indexing/restrict/etc. match prod.
+      { ...config, storage_dir: join(tempDir, ".aft-storage"), harness: "pi" },
+    );
 
-  const bridge = pool.getBridge(tempDir);
+    bridge = pool.getBridge(tempDir);
+  } finally {
+    releaseEnv();
+  }
   const storageDir = join(tempDir, ".aft-storage");
   const ctx: PluginContext = { pool, config, storageDir };
 
@@ -247,11 +253,7 @@ export async function createHarness(
       } catch {
         // ignore
       } finally {
-        try {
-          await rm(tempDir, { recursive: true, force: true }).catch(() => {});
-        } finally {
-          restoreAftCacheDir(previousCacheDir);
-        }
+        await rm(tempDir, { recursive: true, force: true }).catch(() => {});
       }
     },
   };
@@ -363,14 +365,6 @@ function makeMockApi(tools: Map<string, MockToolDef>): AnyExtensionApi {
       },
     },
   );
-}
-
-function restoreAftCacheDir(previous: string | undefined): void {
-  if (previous === undefined) {
-    delete process.env.AFT_CACHE_DIR;
-  } else {
-    process.env.AFT_CACHE_DIR = previous;
-  }
 }
 
 export async function copyFixturesToTempDir(

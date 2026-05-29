@@ -4,6 +4,7 @@ import { access, cp, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { BinaryBridge, type BridgeOptions, setActiveLogger } from "@cortexkit/aft-bridge";
+import { acquireEnv } from "../../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { bridgeLogger } from "../../logger.js";
 
 // Route aft-bridge log calls (including forwarded Rust child stderr lines like
@@ -117,25 +118,28 @@ export async function createHarness(
   }
 
   const tempDir = await mkdtemp(join(tmpdir(), options?.tempPrefix ?? "aft-plugin-e2e-"));
-  const previousCacheDir = process.env.AFT_CACHE_DIR;
-  // Redirect search index cache to temp dir so tests don't pollute user's ~/.cache/aft/index/
-  process.env.AFT_CACHE_DIR = join(tempDir, ".aft-cache");
 
   let bridge: BinaryBridge | undefined;
   try {
     await copyFixturesToTempDir(tempDir, options?.fixtureNames);
 
-    bridge = new BinaryBridge(
-      preparedBinary.binaryPath,
-      tempDir,
-      {
-        timeoutMs: options?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-        ...(options?.bridgeOptions ?? {}),
-      },
-      { harness: "opencode" },
-    );
+    // Redirect search index cache to temp dir so tests don't pollute user's ~/.cache/aft/index/.
+    // process.env is process-global in Bun, so serialize the env-sensitive bridge startup only.
+    const releaseEnv = await acquireEnv({ AFT_CACHE_DIR: join(tempDir, ".aft-cache") });
+    try {
+      bridge = new BinaryBridge(
+        preparedBinary.binaryPath,
+        tempDir,
+        {
+          timeoutMs: options?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+          ...(options?.bridgeOptions ?? {}),
+        },
+        { harness: "opencode" },
+      );
+    } finally {
+      releaseEnv();
+    }
   } catch (err) {
-    restoreAftCacheDir(previousCacheDir);
     await rm(tempDir, { recursive: true, force: true });
     throw err;
   }
@@ -152,22 +156,10 @@ export async function createHarness(
       } catch {
         // ignore cleanup errors
       } finally {
-        try {
-          await rm(tempDir, { recursive: true, force: true });
-        } finally {
-          restoreAftCacheDir(previousCacheDir);
-        }
+        await rm(tempDir, { recursive: true, force: true });
       }
     },
   };
-}
-
-function restoreAftCacheDir(previous: string | undefined): void {
-  if (previous === undefined) {
-    delete process.env.AFT_CACHE_DIR;
-  } else {
-    process.env.AFT_CACHE_DIR = previous;
-  }
 }
 
 export async function cleanupHarnesses(harnesses: E2EHarness[]): Promise<void> {

@@ -22,10 +22,11 @@ describe("Pi buildWorkflowHints", () => {
     expect(out).toContain('`hint: "regex"`');
     expect(out).toContain("auto-routes by query shape");
     expect(out).toContain("Use `aft_navigate`");
-    expect(out).toContain("**Codebase health**");
+    expect(out).toContain("**Codebase health & diagnostics**");
     expect(out).toContain("`aft_inspect`");
     expect(out).toContain("diagnostics");
-    expect(out).toContain("after multi-edit batches");
+    expect(out).toContain("before you run tests or commit");
+    expect(out).toContain("does not surface compile/type errors automatically");
     expect(out).toContain("**Long-running commands**");
     // Anti-polling guidance must be present so agents stop calling
     // bash_status back-to-back. Mirrors OpenCode plugin parity.
@@ -66,7 +67,7 @@ describe("Pi buildWorkflowHints", () => {
       bashBackgroundEnabled: false,
       absentTools: new Set(),
     });
-    expect(registered).toContain("**Codebase health**");
+    expect(registered).toContain("**Codebase health & diagnostics**");
     expect(registered).toContain("aft_inspect");
 
     const minimal = buildWorkflowHints({
@@ -76,7 +77,7 @@ describe("Pi buildWorkflowHints", () => {
       bashBackgroundEnabled: false,
       absentTools: new Set(),
     });
-    expect(minimal).not.toContain("**Codebase health**");
+    expect(minimal).not.toContain("**Codebase health & diagnostics**");
     expect(minimal).not.toContain("aft_inspect");
   });
 
@@ -101,6 +102,6 @@ describe("Pi buildHintsFromConfig", () => {
     const out = buildHintsFromConfig(config, new Set(), true);
     expect(out).not.toBeNull();
     expect(out).toContain("`bash({ background: true })`");
-    expect(out).toContain("**Codebase health**");
+    expect(out).toContain("**Codebase health & diagnostics**");
   });
 });

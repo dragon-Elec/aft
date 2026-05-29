@@ -77,10 +77,14 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
     }
   }
 
-  // Codebase health — needs aft_inspect (recommended+).
+  // Codebase health & diagnostics — needs aft_inspect (recommended+).
+  // Lead with the behavioral change: AFT no longer auto-surfaces compile/type
+  // errors on edit, so the agent MUST pull them. Anchor to the edit→test/commit
+  // moment, and be explicit that aft_inspect diagnostics are a checkpoint, not
+  // the authority (the project checker is).
   if (hasInspect) {
     sections.push(
-      "**Codebase health**: Use `aft_inspect` when starting in unfamiliar code, before refactors/reviews, after multi-edit batches to see diagnostics (compile/type errors), or to verify cleanup completeness. It summarizes TODOs, diagnostics, metrics, dead code, unused exports, and duplicates in one call; pass `sections` for focused drill-down, and treat `stale_categories` as a genuine stale-cache signal while an async Tier 2 refresh catches up.",
+      "**Codebase health & diagnostics**: AFT does not surface compile/type errors automatically after edits — pull them with `aft_inspect`. Run it after a batch of edits and before you run tests or commit, when starting in unfamiliar code, or before a refactor/review. One call summarizes diagnostics (compile/type errors), TODOs, metrics, dead code, unused exports, and duplicates; pass `sections` for focused drill-down and `scope` to actively pull diagnostics for a specific file or directory. Its diagnostics are a fast checkpoint, not the authority — a clean `tsc` / `cargo check` / `pyright` run is the real gate. Treat `stale_categories` as a genuine stale-cache signal while an async Tier 2 refresh catches up.",
     );
   }
 

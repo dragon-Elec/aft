@@ -14,7 +14,7 @@ describe("buildWorkflowHints", () => {
     });
     expect(out).not.toBeNull();
     expect(out).toContain("## Prefer AFT tools for token efficiency");
-    expect(out).toContain("**Codebase health**");
+    expect(out).toContain("**Codebase health & diagnostics**");
     expect(out).toContain("**Web/URL access**");
     expect(out).toContain("**Code exploration**");
     expect(out).toContain("`aft_search` is the primary code-search tool");
@@ -25,10 +25,11 @@ describe("buildWorkflowHints", () => {
     expect(out).toContain("- `impact`");
     expect(out).toContain("- `trace_to`");
     expect(out).toContain("- `trace_data`");
-    expect(out).toContain("**Codebase health**");
+    expect(out).toContain("**Codebase health & diagnostics**");
     expect(out).toContain("`aft_inspect`");
     expect(out).toContain("diagnostics");
-    expect(out).toContain("after multi-edit batches");
+    expect(out).toContain("before you run tests or commit");
+    expect(out).toContain("does not surface compile/type errors automatically");
     expect(out).toContain("**Long-running commands**");
     expect(out).toContain("`bash({ background: true })`");
     // Anti-polling guidance must be present so agents stop calling
@@ -107,7 +108,7 @@ describe("buildWorkflowHints", () => {
       bashBackgroundEnabled: false,
       disabledTools: new Set(),
     });
-    expect(registered).toContain("**Codebase health**");
+    expect(registered).toContain("**Codebase health & diagnostics**");
     expect(registered).toContain("aft_inspect");
 
     const minimal = buildWorkflowHints({
@@ -117,7 +118,7 @@ describe("buildWorkflowHints", () => {
       bashBackgroundEnabled: false,
       disabledTools: new Set(),
     });
-    expect(minimal).not.toContain("**Codebase health**");
+    expect(minimal).not.toContain("**Codebase health & diagnostics**");
     expect(minimal).not.toContain("aft_inspect");
   });
 

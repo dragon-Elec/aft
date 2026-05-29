@@ -193,7 +193,7 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
       "When NOT to use:",
       "- You need exhaustive literal enumeration → use grep directly",
       "- You want the file/module structure → use aft_outline",
-      "- You're following a call chain → use aft_navigate",
+      "- You're following a call chain → use aft_callgraph",
       "",
       "Set hint to 'regex', 'literal', 'semantic', or 'auto' to override or document routing intent.",
     ].join("\n"),

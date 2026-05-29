@@ -32,7 +32,6 @@ import { registerConflictsTool } from "../../tools/conflicts.js";
 import { registerFsTools } from "../../tools/fs.js";
 import { registerHoistedTools } from "../../tools/hoisted.js";
 import { registerImportTools } from "../../tools/imports.js";
-import { registerLspTools } from "../../tools/lsp.js";
 import { registerNavigateTool } from "../../tools/navigate.js";
 import { registerReadingTools } from "../../tools/reading.js";
 import { registerRefactorTool } from "../../tools/refactor.js";
@@ -198,7 +197,6 @@ export async function createHarness(
     move: true,
     astSearch: true,
     astReplace: true,
-    lspDiagnostics: true,
     structure: true,
     refactor: true,
     // E2E surface defaults to restricted mode so the existing tests that
@@ -216,7 +214,6 @@ export async function createHarness(
   registerSafetyTool(api, ctx);
   registerAstTools(api, ctx, surface);
   registerFsTools(api, ctx, surface);
-  registerLspTools(api, ctx);
   registerStructureTool(api, ctx);
   registerRefactorTool(api, ctx);
 

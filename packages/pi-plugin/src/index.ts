@@ -24,7 +24,6 @@
  *   - aft_delete     Delete file with backup
  *   - aft_move       Move/rename file
  *   - ast_grep_search / ast_grep_replace  AST-aware pattern search/rewrite
- *   - lsp_diagnostics On-demand LSP diagnostics
  *
  * Commands:
  *   - /aft-status    Status dialog (index states, LSP servers, storage dir)
@@ -86,7 +85,6 @@ import { registerFsTools } from "./tools/fs.js";
 import { registerHoistedTools } from "./tools/hoisted.js";
 import { registerImportTools } from "./tools/imports.js";
 import { registerInspectTool } from "./tools/inspect.js";
-import { registerLspTools } from "./tools/lsp.js";
 import { registerNavigateTool } from "./tools/navigate.js";
 import { registerReadingTools } from "./tools/reading.js";
 import { registerRefactorTool } from "./tools/refactor.js";
@@ -324,7 +322,6 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
   move: boolean;
   astSearch: boolean;
   astReplace: boolean;
-  lspDiagnostics: boolean;
   structure: boolean;
   refactor: boolean;
 } {
@@ -358,7 +355,6 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
       move: false,
       astSearch: false,
       astReplace: false,
-      lspDiagnostics: false,
       structure: false,
       refactor: false,
     };
@@ -384,7 +380,6 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
     move: false,
     astSearch: ok("ast_grep_search"),
     astReplace: ok("ast_grep_replace"),
-    lspDiagnostics: ok("lsp_diagnostics"),
     structure: false,
     refactor: false,
   };
@@ -774,9 +769,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   }
   if (surface.delete || surface.move) {
     registerFsTools(pi, ctx, surface);
-  }
-  if (surface.lspDiagnostics) {
-    registerLspTools(pi, ctx);
   }
   if (surface.structure) {
     registerStructureTool(pi, ctx);

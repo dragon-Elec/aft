@@ -14,6 +14,7 @@ import { bridgeFor, callBridge, isEmptyParam, textResult } from "./_shared.js";
 import {
   asNumber,
   asRecord,
+  asRecords,
   asString,
   extractStructuredPayload,
   type RenderContextLike,
@@ -64,6 +65,68 @@ function validateOptionalTopK(value: unknown): number | undefined {
     throw new Error("topK must be between 1 and 100");
   }
   return value;
+}
+
+function diagnosticsServerSummary(section: Record<string, unknown>): string {
+  const pending = Array.isArray(section.servers_pending)
+    ? section.servers_pending.filter((item): item is string => typeof item === "string")
+    : [];
+  const notInstalled = Array.isArray(section.servers_not_installed)
+    ? section.servers_not_installed.filter((item): item is string => typeof item === "string")
+    : [];
+  const parts: string[] = [];
+  if (pending.length > 0) parts.push(`pending: ${pending.join(", ")}`);
+  if (notInstalled.length > 0) parts.push(`not installed: ${notInstalled.join(", ")}`);
+  return parts.length > 0 ? parts.join("; ") : "none reported";
+}
+
+function diagnosticsSummaryPart(summary: Record<string, unknown> | undefined): string | undefined {
+  const section = asRecord(summary?.diagnostics);
+  if (!section) return undefined;
+
+  const errors = asNumber(section.errors);
+  const warnings = asNumber(section.warnings);
+  const info = asNumber(section.info);
+  const hints = asNumber(section.hints);
+  if ([errors, warnings, info, hints].some((value) => value !== undefined)) {
+    return `diagnostics ${errors ?? 0} errors/${warnings ?? 0} warnings/${info ?? 0} info/${hints ?? 0} hints`;
+  }
+
+  const status = asString(section.status);
+  if (status === "pending") {
+    return `diagnostics pending (servers: ${diagnosticsServerSummary(section)})`;
+  }
+  if (status === "incomplete") {
+    return `diagnostics unavailable (status incomplete; servers: ${diagnosticsServerSummary(section)})`;
+  }
+
+  return undefined;
+}
+
+function diagnosticLocation(diagnostic: Record<string, unknown>): string {
+  const file = asString(diagnostic.file) ?? "(unknown file)";
+  const line = asNumber(diagnostic.line);
+  const column = asNumber(diagnostic.column);
+  if (line === undefined) return file;
+  if (column === undefined) return `${file}:${line}`;
+  return `${file}:${line}:${column}`;
+}
+
+function diagnosticsDetailSection(
+  details: Record<string, unknown> | undefined,
+): string | undefined {
+  const diagnostics = asRecords(details?.diagnostics);
+  if (diagnostics.length === 0) return undefined;
+
+  const lines = ["diagnostics"];
+  for (const diagnostic of diagnostics) {
+    const severity = asString(diagnostic.severity) ?? "information";
+    const message = asString(diagnostic.message) ?? "(no message)";
+    const source = asString(diagnostic.source);
+    const suffix = source ? ` [${source}]` : "";
+    lines.push(`- ${diagnosticLocation(diagnostic)} ${severity} ${message}${suffix}`);
+  }
+  return lines.join("\n");
 }
 
 function countFrom(summary: Record<string, unknown> | undefined, key: string): number | undefined {
@@ -151,11 +214,12 @@ export function buildInspectSections(payload: unknown, theme: Theme): string[] {
 
   const parts = [
     `todos ${countFrom(summary, "todos") ?? 0}`,
+    diagnosticsSummaryPart(summary),
     `metrics ${asNumber(metrics?.files) ?? 0} files/${asNumber(metrics?.symbols) ?? 0} symbols`,
     tier2SummaryPart(summary, "dead_code", "dead code"),
     tier2SummaryPart(summary, "unused_exports", "unused exports"),
     tier2SummaryPart(summary, "duplicates", "duplicates"),
-  ];
+  ].filter((part): part is string => Boolean(part));
 
   const sections = [theme.fg("accent", parts.join(" · "))];
   if (stale > 0 || pending > 0) {
@@ -170,6 +234,8 @@ export function buildInspectSections(payload: unknown, theme: Theme): string[] {
         ? `details: ${names.join(", ")}`
         : theme.fg("muted", "No drill-down details returned."),
     );
+    const diagnosticsDetails = diagnosticsDetailSection(details);
+    if (diagnosticsDetails) sections.push(diagnosticsDetails);
   }
 
   const text = asString(response.text);
@@ -213,9 +279,9 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
     name: "aft_inspect",
     label: "inspect",
     description:
-      "Codebase health snapshot. One call returns summary stats for: TODOs, file/symbol metrics, dead code, unused exports, code duplicates. Pass `sections` for per-category drill-down details.\n\n" +
+      "Codebase health snapshot. One call returns summary stats for: TODOs, diagnostics, file/symbol metrics, dead code, unused exports, code duplicates. Pass `sections` for per-category drill-down details.\n\n" +
       "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates) run asynchronously on demand: when a call sees cold `pending_categories: [...]` or stale `stale_categories: [...]`, Pi quietly starts a background Tier 2 warmup. The current call may still return pending results while the cache warms; the next call can use cached data.\n\n" +
-      "Use when: starting work on unfamiliar code, before a refactor, before review, or to verify cleanup completeness.",
+      "Use when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.",
     parameters: InspectParams,
     async execute(
       _toolCallId: string,

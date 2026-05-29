@@ -27,7 +27,8 @@ describe("buildWorkflowHints", () => {
     expect(out).toContain("- `trace_data`");
     expect(out).toContain("**Codebase health**");
     expect(out).toContain("`aft_inspect`");
-    expect(out).not.toContain("diagnostics");
+    expect(out).toContain("diagnostics");
+    expect(out).toContain("after multi-edit batches");
     expect(out).toContain("**Long-running commands**");
     expect(out).toContain("`bash({ background: true })`");
     // Anti-polling guidance must be present so agents stop calling

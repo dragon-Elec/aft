@@ -52,7 +52,7 @@ import {
 } from "./shared/session-directory.js";
 import { coerceAftStatus, formatStatusMarkdown } from "./shared/status.js";
 import { ensureTuiPluginEntry } from "./shared/tui-config.js";
-import { registerShutdownCleanup } from "./shutdown-hooks.js";
+import { registerShutdownCleanup, runCleanups } from "./shutdown-hooks.js";
 import { astTools } from "./tools/ast.js";
 import { conflictTools } from "./tools/conflicts.js";
 import { aftPrefixedTools, hoistedTools } from "./tools/hoisted.js";
@@ -62,7 +62,6 @@ import {
   inspectToolSurfaceEnabled,
   inspectTools,
 } from "./tools/inspect.js";
-import { lspTools } from "./tools/lsp.js";
 import { navigationTools } from "./tools/navigation.js";
 import { readingTools } from "./tools/reading.js";
 import { refactoringTools } from "./tools/refactoring.js";
@@ -234,7 +233,6 @@ const ANNOUNCEMENT_FOOTER = "Join us on Discord: https://discord.gg/F2uWxjGnU";
  * - Structure: aft_transform
  * - Navigation: aft_navigate
  * - Refactoring: aft_refactor
- * - LSP: aft_lsp_diagnostics (inline diagnostics on edits are automatic)
  */
 // OpenCode currently calls this function more than once per process when a
 // single plugin is configured — see https://github.com/anomalyco/opencode/issues/26812.
@@ -660,9 +658,12 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // get an orderly shutdown when the Node host receives a termination signal.
   // Without this, OS propagates SIGTERM to children before OpenCode calls dispose,
   // and (together with bridge.ts signal handling) we want the shutdown path we
-  // control, not implicit process-group death. The returned unregister is called
-  // from dispose so plugin reloads don't leak stale cleanup callbacks.
-  const unregisterShutdown = registerShutdownCleanup(async () => {
+  // control, not implicit process-group death. Plugin dispose runs this same
+  // cleanup set through runCleanups("dispose") so reloads do not leak children.
+  let clearInspectTier2Idle = () => {};
+  registerShutdownCleanup(async () => {
+    autoUpdateAbort.abort();
+    clearInspectTier2Idle();
     await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
     try {
       rpcServer.stop();
@@ -831,7 +832,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
 
   // Tool surface tiers:
   //   minimal:     aft_outline, aft_zoom, aft_safety
-  //   recommended: minimal + hoisted + lsp_diagnostics + ast_grep_* + aft_import (default)
+  //   recommended: minimal + hoisted + ast_grep_* + aft_import (default)
   //   all:         recommended + aft_navigate, aft_delete, aft_move, aft_transform, aft_refactor
   const surface = aftConfig.tool_surface ?? "recommended";
 
@@ -863,8 +864,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     // Indexed search tools: recommended+ and opt-in
     ...(surface !== "minimal" && aftConfig.search_index === true && searchTools(ctx)),
     ...refactoringTools(ctx),
-    // LSP diagnostics: recommended+
-    ...(surface !== "minimal" && lspTools(ctx)),
     // Git conflicts: recommended+
     ...(surface !== "minimal" && conflictTools(ctx)),
   });
@@ -946,6 +945,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       }
     },
   });
+  clearInspectTier2Idle = () => inspectTier2Idle.clearAll();
 
   return {
     tool: allTools,
@@ -1075,13 +1075,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       };
     },
     dispose: async () => {
-      autoUpdateAbort.abort();
-      inspectTier2Idle.clearAll();
-      unregisterShutdown();
-      await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
-      rpcServer.stop();
-      await disposeAllPtyTerminals();
-      await pool.shutdown();
+      await runCleanups("dispose");
     },
   };
 }

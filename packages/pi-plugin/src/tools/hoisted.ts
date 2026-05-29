@@ -33,7 +33,11 @@ import { bridgeFor, callBridge, coerceOptionalInt, optionalInt, textResult } fro
 import { formatDiffForPi } from "./diff-format.js";
 
 const DIAGNOSTICS_PARAM_DESCRIPTION =
-  "When true, wait up to 3 seconds for fresh LSP diagnostics on the edited file and include them in the result. Default false — edits return as soon as the write completes. Use aft_inspect to check diagnostics across a batch of edits or before tests/commits.";
+  "When true, wait up to 3 seconds for fresh LSP diagnostics on the edited file and include them in the result. Defaults to the configured `lsp.diagnostics_on_edit` value (false unless configured); per-call true/false overrides. Use aft_inspect to check diagnostics across a batch of edits or before tests/commits.";
+
+function diagnosticsOnEditDefault(ctx: PluginContext): boolean {
+  return ctx.config.lsp?.diagnostics_on_edit ?? false;
+}
 
 /**
  * Local shape for Pi's render context — the real type is exposed by
@@ -311,9 +315,9 @@ export function registerHoistedTools(
       name: "write",
       label: "write",
       description:
-        "Write a file atomically with per-file backup and optional auto-format. Parent directories are created automatically. Overwrites existing files. Uses `filePath` (not `path`). Edits return as soon as the write completes; LSP diagnostics are populated asynchronously. Pass `diagnostics: true` for legacy sync-wait behavior, or call `aft_inspect` afterward to check diagnostics across a batch of edits.",
+        "Write a file atomically with per-file backup and optional auto-format. Parent directories are created automatically. Overwrites existing files. Uses `filePath` (not `path`). Edits return as soon as the write completes unless `lsp.diagnostics_on_edit` or a per-call `diagnostics: true` requests legacy sync-wait behavior. Call `aft_inspect` afterward to check diagnostics across a batch of edits.",
       promptSnippet:
-        "Create or overwrite files (uses filePath; auto-formats; diagnostics are async unless diagnostics: true)",
+        "Create or overwrite files (uses filePath; auto-formats; diagnostics follow lsp.diagnostics_on_edit unless overridden)",
       promptGuidelines: ["Use write only for new files or complete rewrites."],
       parameters: WriteParams,
       async execute(
@@ -333,7 +337,7 @@ export function registerHoistedTools(
           {
             file: params.filePath,
             content: params.content,
-            diagnostics: params.diagnostics ?? false,
+            diagnostics: params.diagnostics ?? diagnosticsOnEditDefault(ctx),
             include_diff: true,
           },
           extCtx,
@@ -354,9 +358,9 @@ export function registerHoistedTools(
       name: "edit",
       label: "edit",
       description:
-        "Find-and-replace edit with progressive fuzzy matching (handles whitespace and Unicode drift). Uses `filePath`, `oldString`, `newString`. Errors on multiple matches — use `occurrence` to pick one, or `replaceAll: true`. Edits return as soon as the write completes; LSP diagnostics are populated asynchronously. Pass `diagnostics: true` for legacy sync-wait behavior, or call `aft_inspect` afterward to check diagnostics across a batch of edits.",
+        "Find-and-replace edit with progressive fuzzy matching (handles whitespace and Unicode drift). Uses `filePath`, `oldString`, `newString`. Errors on multiple matches — use `occurrence` to pick one, or `replaceAll: true`. Edits return as soon as the write completes unless `lsp.diagnostics_on_edit` or a per-call `diagnostics: true` requests legacy sync-wait behavior. Call `aft_inspect` afterward to check diagnostics across a batch of edits.",
       promptSnippet:
-        "Targeted find-and-replace (uses filePath/oldString/newString; occurrence or replaceAll for disambiguation; fuzzy whitespace matching). Pass appendContent to append to a file (creates if missing). Diagnostics are async unless diagnostics: true.",
+        "Targeted find-and-replace (uses filePath/oldString/newString; occurrence or replaceAll for disambiguation; fuzzy whitespace matching). Pass appendContent to append to a file (creates if missing). Diagnostics follow lsp.diagnostics_on_edit unless overridden.",
       promptGuidelines: [
         "Prefer edit over write when changing part of an existing file.",
         "Include enough surrounding context in oldString to make the match unique, or set replaceAll/occurrence explicitly.",
@@ -384,7 +388,7 @@ export function registerHoistedTools(
             op: "append",
             file: params.filePath,
             append_content: params.appendContent,
-            diagnostics: params.diagnostics ?? false,
+            diagnostics: params.diagnostics ?? diagnosticsOnEditDefault(ctx),
             include_diff: true,
           };
           const response = await callBridge(bridge, "edit_match", req, extCtx);
@@ -395,7 +399,7 @@ export function registerHoistedTools(
           file: params.filePath,
           match: params.oldString ?? "",
           replacement: params.newString ?? "",
-          diagnostics: params.diagnostics ?? false,
+          diagnostics: params.diagnostics ?? diagnosticsOnEditDefault(ctx),
           include_diff: true,
         };
         if (params.replaceAll === true) req.replace_all = true;

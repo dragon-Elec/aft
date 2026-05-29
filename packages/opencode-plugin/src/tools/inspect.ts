@@ -9,6 +9,101 @@ type ToolArg = ToolDefinition["args"][string];
 
 type StringOrStringArray = string | string[];
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
+}
+
+function asNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function asStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
+function diagnosticsServerSummary(section: Record<string, unknown>): string {
+  const pending = asStringArray(section.servers_pending);
+  const notInstalled = asStringArray(section.servers_not_installed);
+  const parts: string[] = [];
+  if (pending.length > 0) parts.push(`pending: ${pending.join(", ")}`);
+  if (notInstalled.length > 0) parts.push(`not installed: ${notInstalled.join(", ")}`);
+  return parts.length > 0 ? parts.join("; ") : "none reported";
+}
+
+function formatDiagnosticsSummary(
+  summary: Record<string, unknown> | undefined,
+): string | undefined {
+  const section = asRecord(summary?.diagnostics);
+  if (!section) return undefined;
+
+  const errors = asNumber(section.errors);
+  const warnings = asNumber(section.warnings);
+  const info = asNumber(section.info);
+  const hints = asNumber(section.hints);
+  if ([errors, warnings, info, hints].some((value) => value !== undefined)) {
+    return `diagnostics: ${errors ?? 0} errors, ${warnings ?? 0} warnings, ${info ?? 0} info, ${hints ?? 0} hints`;
+  }
+
+  const status = asString(section.status);
+  if (status === "pending") {
+    return `diagnostics: pending (servers: ${diagnosticsServerSummary(section)})`;
+  }
+  if (status === "incomplete") {
+    return `diagnostics: unavailable (status incomplete; servers: ${diagnosticsServerSummary(section)})`;
+  }
+
+  return undefined;
+}
+
+function formatDiagnosticLocation(diagnostic: Record<string, unknown>): string {
+  const file = asString(diagnostic.file) ?? "(unknown file)";
+  const line = asNumber(diagnostic.line);
+  const column = asNumber(diagnostic.column);
+  if (line === undefined) return file;
+  if (column === undefined) return `${file}:${line}`;
+  return `${file}:${line}:${column}`;
+}
+
+function formatDiagnosticsDetails(details: Record<string, unknown> | undefined): string[] {
+  const diagnostics = Array.isArray(details?.diagnostics)
+    ? (details.diagnostics.map(asRecord).filter(Boolean) as Record<string, unknown>[])
+    : [];
+  return diagnostics.map((diagnostic) => {
+    const severity = asString(diagnostic.severity) ?? "information";
+    const message = asString(diagnostic.message) ?? "(no message)";
+    const source = asString(diagnostic.source);
+    const suffix = source ? ` [${source}]` : "";
+    return `${formatDiagnosticLocation(diagnostic)} ${severity} ${message}${suffix}`;
+  });
+}
+
+export function renderInspectDiagnostics(response: Record<string, unknown>): string {
+  const lines: string[] = [];
+  const summaryLine = formatDiagnosticsSummary(asRecord(response.summary));
+  if (summaryLine) lines.push(summaryLine);
+
+  const detailLines = formatDiagnosticsDetails(asRecord(response.details));
+  if (detailLines.length > 0) {
+    lines.push("diagnostics details:", ...detailLines.map((line) => `- ${line}`));
+  }
+
+  return lines.join("\n");
+}
+
+function appendRenderedDiagnostics(text: string, response: Record<string, unknown>): string {
+  if (/^diagnostics[: ]/im.test(text)) return text;
+  const diagnostics = renderInspectDiagnostics(response);
+  if (!diagnostics) return text;
+  return text ? `${text}\n\n${diagnostics}` : diagnostics;
+}
+
 function arg(schema: unknown): ToolArg {
   return schema as ToolArg;
 }
@@ -88,9 +183,9 @@ export function createInspectTier2IdleScheduler(options: InspectTier2IdleSchedul
 export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const inspectTool: ToolDefinition = {
     description:
-      "Codebase health snapshot. One call returns summary stats for: TODOs, file/symbol metrics, dead code, unused exports, code duplicates. Pass `sections` for per-category drill-down details.\n\n" +
+      "Codebase health snapshot. One call returns summary stats for: TODOs, diagnostics, file/symbol metrics, dead code, unused exports, code duplicates. Pass `sections` for per-category drill-down details.\n\n" +
       "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates) run as background scans triggered on session idle; calls may return cached `stale_categories: [...]` results or `pending_categories: [...]` while a refresh is in progress (waits up to 1s for fresh data before falling back to cached).\n\n" +
-      "Use when: starting work on unfamiliar code, before a refactor, before review, or to verify cleanup completeness.",
+      "Use when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.",
     args: {
       sections: arg(
         z
@@ -128,9 +223,15 @@ export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition>
         throw new Error((response.message as string) || "inspect failed");
       }
       if (typeof response.text === "string") {
-        return response.text;
+        return appendRenderedDiagnostics(response.text, response);
       }
-      return JSON.stringify(response, null, 2);
+      const diagnostics = renderInspectDiagnostics(response);
+      const json = JSON.stringify(response, null, 2);
+      return diagnostics
+        ? `${json}
+
+${diagnostics}`
+        : json;
     },
   };
 

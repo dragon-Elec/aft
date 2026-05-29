@@ -59,6 +59,7 @@ function createMockHoistedHarness(
     command: string,
     params: Record<string, unknown>,
   ) => Promise<BridgeResponse> | BridgeResponse,
+  config: PluginContext["config"] = {} as PluginContext["config"],
 ) {
   const calls: SendCall[] = [];
   const bridge = {
@@ -74,7 +75,7 @@ function createMockHoistedHarness(
 
   return {
     calls,
-    tools: hoistedTools(createPluginContext(pool)),
+    tools: hoistedTools(createPluginContext(pool, config)),
   };
 }
 
@@ -141,6 +142,24 @@ describe("Hoisted tool execute handlers", () => {
         session_id: "test",
       },
     });
+  });
+
+  test("write uses lsp.diagnostics_on_edit as the default", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { calls, tools } = createMockHoistedHarness(async () => ({ success: true }), {
+      lsp: { diagnostics_on_edit: true },
+    } as PluginContext["config"]);
+
+    await tools.write.execute({ filePath: "src/app.ts", content: "export {};\n" }, sdkCtx);
+    expect(calls[0].params.diagnostics).toBe(true);
+
+    await tools.write.execute(
+      { filePath: "src/app.ts", content: "export {};\n", diagnostics: false },
+      sdkCtx,
+    );
+    expect(calls[1].params.diagnostics).toBe(false);
   });
 
   test("write honors diagnostics true and includes LSP payload", async () => {

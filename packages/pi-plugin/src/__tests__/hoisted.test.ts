@@ -235,6 +235,35 @@ describe("hoisted tool adapters", () => {
     expect(result.details.diagnostics).toBeUndefined();
   });
 
+  test("write uses lsp.diagnostics_on_edit as the default", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, diff: { additions: 1 } }));
+    registerHoistedTools(
+      api,
+      makePluginContext(bridge, { config: { lsp: { diagnostics_on_edit: true } } }),
+      {
+        hoistRead: false,
+        hoistWrite: true,
+        hoistEdit: false,
+        hoistGrep: false,
+        restrictToProjectRoot: true,
+      },
+    );
+
+    await executeTool(tools.get("write")!, {
+      filePath: "src/app.ts",
+      content: "export {};\n",
+    });
+    expect(calls[0].params.diagnostics).toBe(true);
+
+    await executeTool(tools.get("write")!, {
+      filePath: "src/app.ts",
+      content: "export {};\n",
+      diagnostics: false,
+    });
+    expect(calls[1].params.diagnostics).toBe(false);
+  });
+
   test("write honors diagnostics true and includes LSP payload", async () => {
     const diagnostics = [{ severity: "error", line: 11, message: "Broken write" }];
     const { api, tools } = makeMockApi();

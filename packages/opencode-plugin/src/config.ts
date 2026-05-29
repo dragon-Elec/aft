@@ -80,6 +80,12 @@ const LspConfigSchema = z.object({
   disabled: z.array(z.string().trim().min(1)).optional(),
   python: z.enum(["pyright", "ty", "auto"]).optional(),
   /**
+   * Restore legacy edit behavior by waiting for inline LSP diagnostics on every
+   * edit/write/apply_patch call unless the tool call overrides diagnostics.
+   * Default: false.
+   */
+  diagnostics_on_edit: z.boolean().optional(),
+  /**
    * Auto-install npm-distributed and GitHub-release language servers when
    * the project needs them. Default: true. Set false to require manual
    * install via PATH.
@@ -212,7 +218,7 @@ export const AftConfigSchema = z
     /**
      * Tool surface level. Controls which tools are registered:
      * - "minimal":     aft_outline, aft_zoom, aft_safety (no hoisting)
-     * - "recommended": minimal + hoisted read/write/edit/apply_patch + lsp_diagnostics
+     * - "recommended": minimal + hoisted read/write/edit/apply_patch
      *                  + ast_grep_search/replace + aft_import (default)
      * - "all":         recommended + aft_navigate, aft_delete, aft_move, aft_transform, aft_refactor
      */
@@ -955,10 +961,14 @@ function mergeLspConfig(
   // relies on, suppressing diagnostics for its own malicious code
   // (audit v0.17 #5).
   //
-  // SAFE project-level fields: `python` (per-language preference, no
-  //   executable origin) and (none right now).
+  // SAFE project-level fields:
+  //   - `python` (per-language preference, no executable origin)
+  //   - `diagnostics_on_edit` (agent workflow/latency preference only)
   const projectLsp: AftConfig["lsp"] = {};
   if (overrideLsp?.python !== undefined) projectLsp.python = overrideLsp.python;
+  if (overrideLsp?.diagnostics_on_edit !== undefined) {
+    projectLsp.diagnostics_on_edit = overrideLsp.diagnostics_on_edit;
+  }
 
   // disabled comes from user config ONLY.
   const userDisabled = baseLsp?.disabled ?? [];

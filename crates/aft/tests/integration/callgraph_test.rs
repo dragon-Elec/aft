@@ -1380,6 +1380,216 @@ fn callgraph_keeps_external_member_call_with_same_short_name_as_caller() {
     aft.shutdown();
 }
 
+fn write_rust_manifest(root: &Path, package_name: &str) {
+    fs::write(
+        root.join("Cargo.toml"),
+        format!("[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+    )
+    .unwrap();
+}
+
+fn assert_single_caller(
+    resp: &serde_json::Value,
+    expected_file_suffix: &str,
+    expected_symbol: &str,
+) {
+    assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
+    assert_eq!(
+        resp["total_callers"], 1,
+        "expected exactly one caller: {resp:?}"
+    );
+    let callers = resp["callers"].as_array().expect("callers array");
+    let group = callers
+        .iter()
+        .find(|group| {
+            group["file"]
+                .as_str()
+                .unwrap_or("")
+                .ends_with(expected_file_suffix)
+        })
+        .unwrap_or_else(|| panic!("caller should include {expected_file_suffix}: {callers:?}"));
+    let entries = group["callers"].as_array().expect("caller entries");
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["symbol"].as_str().unwrap_or("") == expected_symbol),
+        "caller should include symbol {expected_symbol}: {entries:?}"
+    );
+}
+
+#[test]
+fn callgraph_rust_crate_qualified_callers_resolve() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write_rust_manifest(root, "rust-qualified-fixture");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub mod caller;\npub mod target;\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/target.rs"),
+        "pub fn crate_qualified_target() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/caller.rs"),
+        "pub fn run_crate_qualified() {\n    crate::target::crate_qualified_target();\n}\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"callers","file":{},"symbol":"crate_qualified_target","depth":1}}"#,
+        crate::helpers::json_string(&root.join("src/target.rs").display())
+    ));
+    assert_single_caller(&resp, "src/caller.rs", "run_crate_qualified");
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_rust_use_imported_short_callers_resolve() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write_rust_manifest(root, "rust-use-fixture");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub mod caller;\npub mod target;\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/target.rs"), "pub fn imported_target() {}\n").unwrap();
+    fs::write(
+        root.join("src/caller.rs"),
+        "use crate::target::imported_target;\n\npub fn run_imported() {\n    imported_target();\n}\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"callers","file":{},"symbol":"imported_target","depth":1}}"#,
+        crate::helpers::json_string(&root.join("src/target.rs").display())
+    ));
+    assert_single_caller(&resp, "src/caller.rs", "run_imported");
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_rust_self_and_super_callers_resolve() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write_rust_manifest(root, "rust-relative-fixture");
+    fs::create_dir_all(root.join("src/parent")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub mod current;\npub mod parent;\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/current.rs"),
+        "pub fn self_target() {}\n\npub fn run_self() {\n    self::self_target();\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/parent.rs"),
+        "pub mod child;\n\npub fn super_target() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/parent/child.rs"),
+        "pub fn run_super() {\n    super::super_target();\n}\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let self_resp = aft.send(&format!(
+        r#"{{"id":"1","command":"callers","file":{},"symbol":"self_target","depth":1}}"#,
+        crate::helpers::json_string(&root.join("src/current.rs").display())
+    ));
+    assert_single_caller(&self_resp, "src/current.rs", "run_self");
+
+    let super_resp = aft.send(&format!(
+        r#"{{"id":"2","command":"callers","file":{},"symbol":"super_target","depth":1}}"#,
+        crate::helpers::json_string(&root.join("src/parent.rs").display())
+    ));
+    assert_single_caller(&super_resp, "src/parent/child.rs", "run_super");
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_rust_workspace_lib_name_callers_resolve() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"libpkg\", \"app\"]\n",
+    )
+    .unwrap();
+
+    let libpkg = root.join("libpkg");
+    let app = root.join("app");
+    fs::create_dir_all(libpkg.join("src")).unwrap();
+    fs::create_dir_all(app.join("src")).unwrap();
+    fs::write(
+        libpkg.join("Cargo.toml"),
+        "[package]\nname = \"lib-package\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nname = \"fixture_lib\"\n",
+    )
+    .unwrap();
+    fs::write(libpkg.join("src/lib.rs"), "pub mod api;\n").unwrap();
+    fs::write(libpkg.join("src/api.rs"), "pub fn workspace_target() {}\n").unwrap();
+    write_rust_manifest(&app, "app");
+    fs::write(
+        app.join("src/main.rs"),
+        "pub fn dispatch() {\n    fixture_lib::api::workspace_target();\n}\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"callers","file":{},"symbol":"workspace_target","depth":1}}"#,
+        crate::helpers::json_string(&libpkg.join("src/api.rs").display())
+    ));
+    assert_single_caller(&resp, "app/src/main.rs", "dispatch");
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_rust_external_paths_stay_unresolved() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write_rust_manifest(root, "rust-external-fixture");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub mod caller;\npub mod target;\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/target.rs"), "pub fn new() {}\n").unwrap();
+    fs::write(
+        root.join("src/caller.rs"),
+        "use std::collections::HashMap;\n\npub fn run_external() {\n    let _map: HashMap<String, String> = HashMap::new();\n    unknown_crate::target::new();\n}\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"callers","file":{},"symbol":"new","depth":1}}"#,
+        crate::helpers::json_string(&root.join("src/target.rs").display())
+    ));
+    assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
+    assert_eq!(
+        resp["total_callers"], 0,
+        "std and unknown external paths must not become callers: {resp:?}"
+    );
+    aft.shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // trace_to command
 // ---------------------------------------------------------------------------

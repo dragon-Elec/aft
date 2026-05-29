@@ -493,6 +493,109 @@ fn lexical_only_fallback_reports_more_available_when_capped_or_over_top_k() {
 }
 
 #[test]
+fn hybrid_ready_reports_more_available_when_lexical_engine_capped() {
+    let (project, entries) = project_with_repeated_needle_files(210);
+    let (base_url, handle) = start_mock_embedding_server();
+    let ctx = openai_context(project.path(), base_url);
+    install_lexical_index_entries(&ctx, &entries);
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+    *ctx.semantic_index().borrow_mut() = Some(SemanticIndex::new(project.path().to_path_buf(), 3));
+
+    let response = response_value(handle_semantic_search(
+        &request_with_top_k("needle_symbol", None, 100),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["success"], true,
+        "ready hybrid query should succeed: {response:?}"
+    );
+    assert_eq!(response["status"], "ready");
+    assert_eq!(response["complete"], true);
+    assert_eq!(response["interpreted_as"], "hybrid");
+    assert_eq!(response["engine_capped"], true);
+    assert_eq!(response["more_available"], true);
+    handle.join().expect("embedding server thread");
+}
+
+#[test]
+fn semantic_ready_reports_more_available_when_semantic_lane_overflows() {
+    let (project, entries) = project_with_repeated_needle_files(101);
+    let files = entries
+        .iter()
+        .map(|(source_file, _)| source_file.clone())
+        .collect::<Vec<_>>();
+    let mut embed =
+        |texts: Vec<String>| Ok::<Vec<Vec<f32>>, String>(vec![vec![0.1, 0.2, 0.3]; texts.len()]);
+    let semantic_index =
+        SemanticIndex::build(project.path(), &files, &mut embed, 16).expect("build semantic index");
+    assert!(
+        semantic_index.entry_count() > 100,
+        "test setup must exceed the response limit"
+    );
+    let (base_url, handle) = start_mock_embedding_server();
+    let ctx = openai_context(project.path(), base_url);
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+    *ctx.semantic_index().borrow_mut() = Some(semantic_index);
+
+    let response = response_value(handle_semantic_search(
+        &request_with_top_k("needle_symbol", Some("semantic"), 100),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["success"], true,
+        "ready semantic query should succeed: {response:?}"
+    );
+    assert_eq!(response["status"], "ready");
+    assert_eq!(response["complete"], true);
+    assert_eq!(response["interpreted_as"], "semantic");
+    assert_eq!(response["engine_capped"], false);
+    assert_eq!(response["result_count"], 100);
+    assert_eq!(response["more_available"], true);
+    handle.join().expect("embedding server thread");
+}
+
+#[test]
+fn hybrid_ready_reports_no_more_available_when_under_top_k_without_caps() {
+    let (project, source_file, source) = project_with_needle();
+    let mut embed =
+        |texts: Vec<String>| Ok::<Vec<Vec<f32>>, String>(vec![vec![0.1, 0.2, 0.3]; texts.len()]);
+    let semantic_index = SemanticIndex::build(
+        project.path(),
+        std::slice::from_ref(&source_file),
+        &mut embed,
+        16,
+    )
+    .expect("build semantic index");
+    let (base_url, handle) = start_mock_embedding_server();
+    let ctx = openai_context(project.path(), base_url);
+    install_lexical_index(&ctx, &source_file, source);
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+    *ctx.semantic_index().borrow_mut() = Some(semantic_index);
+
+    let response = response_value(handle_semantic_search(
+        &request_with_top_k("needle_symbol", None, 5),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["success"], true,
+        "ready hybrid query should succeed: {response:?}"
+    );
+    assert_eq!(response["status"], "ready");
+    assert_eq!(response["complete"], true);
+    assert_eq!(response["interpreted_as"], "hybrid");
+    assert_eq!(response["engine_capped"], false);
+    assert!(
+        response["result_count"].as_u64().expect("result_count") < 5,
+        "test setup should stay under top_k: {response:?}"
+    );
+    assert_eq!(response["more_available"], false);
+    handle.join().expect("embedding server thread");
+}
+
+#[test]
 fn auto_bare_quantifier_queries_route_to_regex_grep() {
     let project = tempfile::tempdir().expect("create project dir");
     let source_file = project.path().join("src/lib.rs");

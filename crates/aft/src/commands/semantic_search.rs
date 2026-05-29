@@ -460,16 +460,30 @@ fn handle_semantic_or_hybrid_search(
     };
 
     let semantic_limit = top_k.clamp(50, MAX_TOP_K);
-    let semantic_results = {
+    let semantic_fetch_limit = semantic_limit.saturating_add(1);
+    let mut semantic_results = {
         let semantic_index = ctx.semantic_index().borrow();
         semantic_index
             .as_ref()
-            .map(|index| index.search(&query_vector, semantic_limit))
+            .map(|index| index.search(&query_vector, semantic_fetch_limit))
             .unwrap_or_default()
     };
+    let semantic_more_available = semantic_results.len() > semantic_limit;
+    if semantic_more_available {
+        semantic_results.truncate(semantic_limit);
+    }
 
-    let pre_fuse_count = semantic_results.len().saturating_add(lexical.files.len());
-    let results = fuse_hybrid_results(semantic_results, lexical.files, &shape, top_k);
+    let mut results = fuse_hybrid_results(
+        semantic_results,
+        lexical.files,
+        &shape,
+        top_k.saturating_add(1),
+    );
+    let fused_more_available = results.len() > top_k;
+    if fused_more_available {
+        results.truncate(top_k);
+    }
+    let more_available = fused_more_available || semantic_more_available || lexical.engine_capped;
 
     // No score threshold: silent filtering produced "0 results" even when the
     // model had reasonable matches the agent could have judged. Surface every
@@ -486,7 +500,7 @@ fn handle_semantic_or_hybrid_search(
             complete: true,
             text: format_semantic_text(&results, project_root),
             results: results.iter().map(result_to_json).collect::<Vec<_>>(),
-            more_available: pre_fuse_count > top_k,
+            more_available,
             engine_capped: lexical.engine_capped,
             fully_degraded: false,
             warnings,

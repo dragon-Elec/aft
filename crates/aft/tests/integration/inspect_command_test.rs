@@ -1914,6 +1914,101 @@ fn inspect_command_diagnostics_no_server_for_filetype_reports_no_server_not_pend
 }
 
 #[test]
+fn inspect_command_diagnostics_inapplicable_root_marker_reports_no_server_not_pending() {
+    // Regression: a server registered for the file's extension whose root
+    // markers are ABSENT from the project (e.g. oxlint registered for `.ts`
+    // with no `.oxlintrc.json`) returned ServerAttemptResult::NoRootMarker,
+    // which was bucketed into servers_pending. Because a missing root marker is
+    // a filesystem fact that never changes mid-scan, scoped diagnostics then
+    // reported status: "pending" forever — even after every truly-applicable
+    // server answered — telling the agent to re-run indefinitely. Such a file
+    // has no applicable server: it must report terminal "no_server", carry a
+    // files_without_server count, and NOT appear pending.
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root = temp_dir.path().join("project");
+    let storage_dir = root.join(".aft-test-storage");
+    fs::create_dir_all(&root).expect("create project root");
+    // Source matches the custom server's extension, but the required root
+    // marker (`needs-this-marker.json`) is deliberately NOT written.
+    write_file(&root, "src/app.customts", "export const value = 1;\n");
+
+    let server_id = "needs-marker-ls";
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            storage_dir: Some(storage_dir.clone()),
+            lsp_servers: vec![aft::config::UserServerDef {
+                id: server_id.to_string(),
+                extensions: vec!["customts".to_string()],
+                binary: "needs-marker-ls".to_string(),
+                args: Vec::new(),
+                root_markers: vec!["needs-this-marker.json".to_string()],
+                env: Default::default(),
+                initialization_options: None,
+                disabled: false,
+            }],
+            ..Config::default()
+        },
+    );
+    let configure = request(json!({
+        "id": "configure",
+        "command": "configure",
+        "harness": "opencode",
+        "project_root": root.to_string_lossy(),
+        "storage_dir": storage_dir.to_string_lossy(),
+        "search_index": false,
+        "semantic_search": false,
+    }));
+    let configure_response = serde_json::to_value(handle_configure(&configure, &ctx))
+        .expect("configure response serializes");
+    assert_eq!(
+        configure_response["success"], true,
+        "configure failed: {configure_response:#}"
+    );
+    // Mark the binary as installed so the attempt reaches the root-marker check
+    // (NoRootMarker), not BinaryNotInstalled.
+    ctx.lsp().override_binary(
+        ServerKind::Custom(std::sync::Arc::from(server_id)),
+        fake_server_path(),
+    );
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-diagnostics-inapplicable-marker",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "scope": "src/app.customts",
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    let summary = response["summary"]["diagnostics"].as_object().unwrap();
+    assert_eq!(
+        summary.get("status").and_then(Value::as_str),
+        Some("no_server"),
+        "an inapplicable root-marker server must report terminal no_server, not pending: {response:#}"
+    );
+    assert!(
+        summary
+            .get("files_without_server")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count >= 1),
+        "files_without_server must count the inapplicable file: {response:#}"
+    );
+    assert!(
+        summary["servers_pending"]
+            .as_array()
+            .is_some_and(|servers| servers.is_empty()),
+        "the inapplicable server must NOT be pending — nothing is coming: {response:#}"
+    );
+    assert!(
+        !scanner_state_contains(&response, "pending_categories", "diagnostics"),
+        "inapplicable-marker diagnostics must not be reported as pending: {response:#}"
+    );
+}
+
+#[test]
 fn inspect_command_diagnostics_details_honor_top_k() {
     let (_temp_dir, root) = fixture_project();
     write_file(&root, "Cargo.toml", "[package]\nname = \"diag-top-k\"\n");

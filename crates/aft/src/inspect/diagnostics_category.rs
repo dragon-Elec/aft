@@ -147,6 +147,15 @@ fn collect_scoped_file(
     };
 
     record_attempt_gaps(&outcomes, collection);
+    if outcomes.only_inapplicable_root_markers() {
+        // Every server registered for this file's extension failed the root
+        // marker check (e.g. a `.ts` file in a project with no `.oxlintrc.json`
+        // for oxlint). No applicable server will ever answer for this file, so
+        // count it as a no-server file — otherwise the status falls through to
+        // "pending" forever even after every truly-applicable server answered.
+        collection.files_without_server += 1;
+        return;
+    }
     if outcomes.no_server_registered() || outcomes.successful.is_empty() {
         // No-server files are already excluded from the candidate set by
         // scoped_lsp_files (which counts explicit file-roots into
@@ -216,7 +225,16 @@ fn record_attempt_gaps(outcomes: &EnsureServerOutcomes, collection: &mut Diagnos
                     .insert(attempt.server_id.clone());
             }
             ServerAttemptResult::NoRootMarker { .. } => {
-                collection.servers_pending.insert(attempt.server_id.clone());
+                // The server is registered for this file's extension but none of
+                // its root markers exist in the project (e.g. oxlint registered
+                // for `.ts` with no `.oxlintrc.json`). That's a filesystem fact
+                // that never changes mid-scan — the server simply does not apply
+                // to this project. It is NOT "pending" (results are never
+                // coming), so treating it as a gap would leave scoped diagnostics
+                // reporting `pending` forever even after every applicable server
+                // answered. Ignore it. The all-not-applicable edge (a file whose
+                // only registered servers all lack root markers) is handled by
+                // the caller, which counts it into `files_without_server`.
             }
         }
     }

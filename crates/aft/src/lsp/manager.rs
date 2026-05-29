@@ -77,6 +77,22 @@ impl EnsureServerOutcomes {
     pub fn no_server_registered(&self) -> bool {
         self.attempts.is_empty()
     }
+
+    /// True when servers matched the file's extension but none actually apply
+    /// to this project — i.e. nothing started and every attempt failed the root
+    /// marker check (e.g. oxlint registered for `.ts` with no `.oxlintrc.json`).
+    /// Distinct from `no_server_registered` (extension unsupported) and from a
+    /// real outage (binary missing / spawn failed): a missing root marker is a
+    /// filesystem fact that never changes mid-scan, so such a file will never
+    /// produce diagnostics and must not be reported as "pending".
+    pub fn only_inapplicable_root_markers(&self) -> bool {
+        self.successful.is_empty()
+            && !self.attempts.is_empty()
+            && self
+                .attempts
+                .iter()
+                .all(|attempt| matches!(attempt.result, ServerAttemptResult::NoRootMarker { .. }))
+    }
 }
 
 /// Outcome of a post-edit diagnostics wait. Reports the per-server status

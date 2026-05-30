@@ -212,16 +212,135 @@ pub fn specifier_matches(spec: &str, target: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Core API
+// Per-language engine: the ImportSyntax trait + registry
 // ---------------------------------------------------------------------------
 
-/// Parse imports from source using the provided tree-sitter tree.
-pub fn parse_imports(source: &str, tree: &Tree, lang: LangId) -> ImportBlock {
+/// Per-language import engine. One impl per supported language; [`syntax_for`]
+/// maps a [`LangId`] to its `&'static dyn ImportSyntax`. This is the single
+/// plug-in point that replaces the scattered `match lang` dispatch in
+/// `parse_imports` / `generate_import_line_with_namespace` / `classify_group` /
+/// `is_supported`. Adding a language is a new impl + one registry arm.
+///
+/// The existing engines are thin wrappers over the free functions they already
+/// used, so routing through the trait is behavior-preserving (golden-gated).
+pub trait ImportSyntax: Sync {
+    /// Parse all imports from a file's already-parsed tree.
+    fn parse(&self, source: &str, tree: &Tree) -> ImportBlock;
+
+    /// Generate a single import line. `namespace_import` is ES-only; engines
+    /// that do not support a given parameter ignore it.
+    fn generate_line(
+        &self,
+        module_path: &str,
+        names: &[String],
+        default_import: Option<&str>,
+        namespace_import: Option<&str>,
+        type_only: bool,
+    ) -> String;
+
+    /// Classify a module path into stdlib / external / internal.
+    fn classify_group(&self, module_path: &str) -> ImportGroup;
+}
+
+/// ES modules engine: TypeScript, TSX, JavaScript.
+struct EsSyntax;
+impl ImportSyntax for EsSyntax {
+    fn parse(&self, source: &str, tree: &Tree) -> ImportBlock {
+        parse_ts_imports(source, tree)
+    }
+    fn generate_line(
+        &self,
+        module_path: &str,
+        names: &[String],
+        default_import: Option<&str>,
+        namespace_import: Option<&str>,
+        type_only: bool,
+    ) -> String {
+        generate_ts_import_line(
+            module_path,
+            names,
+            default_import,
+            namespace_import,
+            type_only,
+        )
+    }
+    fn classify_group(&self, module_path: &str) -> ImportGroup {
+        classify_group_ts(module_path)
+    }
+}
+
+struct PythonSyntax;
+impl ImportSyntax for PythonSyntax {
+    fn parse(&self, source: &str, tree: &Tree) -> ImportBlock {
+        parse_py_imports(source, tree)
+    }
+    fn generate_line(
+        &self,
+        module_path: &str,
+        names: &[String],
+        default_import: Option<&str>,
+        _namespace_import: Option<&str>,
+        _type_only: bool,
+    ) -> String {
+        generate_py_import_line(module_path, names, default_import)
+    }
+    fn classify_group(&self, module_path: &str) -> ImportGroup {
+        classify_group_py(module_path)
+    }
+}
+
+struct RustSyntax;
+impl ImportSyntax for RustSyntax {
+    fn parse(&self, source: &str, tree: &Tree) -> ImportBlock {
+        parse_rs_imports(source, tree)
+    }
+    fn generate_line(
+        &self,
+        module_path: &str,
+        names: &[String],
+        _default_import: Option<&str>,
+        _namespace_import: Option<&str>,
+        type_only: bool,
+    ) -> String {
+        generate_rs_import_line(module_path, names, type_only)
+    }
+    fn classify_group(&self, module_path: &str) -> ImportGroup {
+        classify_group_rs(module_path)
+    }
+}
+
+struct GoSyntax;
+impl ImportSyntax for GoSyntax {
+    fn parse(&self, source: &str, tree: &Tree) -> ImportBlock {
+        parse_go_imports(source, tree)
+    }
+    fn generate_line(
+        &self,
+        module_path: &str,
+        _names: &[String],
+        default_import: Option<&str>,
+        _namespace_import: Option<&str>,
+        _type_only: bool,
+    ) -> String {
+        generate_go_import_line(module_path, default_import, false)
+    }
+    fn classify_group(&self, module_path: &str) -> ImportGroup {
+        classify_group_go(module_path)
+    }
+}
+
+static ES_SYNTAX: EsSyntax = EsSyntax;
+static PYTHON_SYNTAX: PythonSyntax = PythonSyntax;
+static RUST_SYNTAX: RustSyntax = RustSyntax;
+static GO_SYNTAX: GoSyntax = GoSyntax;
+
+/// Map a language to its import engine, or `None` when imports are unsupported.
+pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
     match lang {
-        LangId::TypeScript | LangId::Tsx | LangId::JavaScript => parse_ts_imports(source, tree),
-        LangId::Python => parse_py_imports(source, tree),
-        LangId::Rust => parse_rs_imports(source, tree),
-        LangId::Go => parse_go_imports(source, tree),
+        LangId::TypeScript | LangId::Tsx | LangId::JavaScript => Some(&ES_SYNTAX),
+        LangId::Python => Some(&PYTHON_SYNTAX),
+        LangId::Rust => Some(&RUST_SYNTAX),
+        LangId::Go => Some(&GO_SYNTAX),
         LangId::C
         | LangId::Cpp
         | LangId::Zig
@@ -237,8 +356,21 @@ pub fn parse_imports(source: &str, tree: &Tree, lang: LangId) -> ImportBlock {
         | LangId::Swift
         | LangId::Php
         | LangId::Lua
-        | LangId::Perl => ImportBlock::empty(),
-        LangId::Html | LangId::Markdown => ImportBlock::empty(),
+        | LangId::Perl
+        | LangId::Html
+        | LangId::Markdown => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Core API
+// ---------------------------------------------------------------------------
+
+/// Parse imports from source using the provided tree-sitter tree.
+pub fn parse_imports(source: &str, tree: &Tree, lang: LangId) -> ImportBlock {
+    match syntax_for(lang) {
+        Some(engine) => engine.parse(source, tree),
+        None => ImportBlock::empty(),
     }
 }
 
@@ -464,48 +596,21 @@ pub fn generate_import_line_with_namespace(
     namespace_import: Option<&str>,
     type_only: bool,
 ) -> String {
-    match lang {
-        LangId::TypeScript | LangId::Tsx | LangId::JavaScript => generate_ts_import_line(
+    match syntax_for(lang) {
+        Some(engine) => engine.generate_line(
             module_path,
             names,
             default_import,
             namespace_import,
             type_only,
         ),
-        LangId::Python => generate_py_import_line(module_path, names, default_import),
-        LangId::Rust => generate_rs_import_line(module_path, names, type_only),
-        LangId::Go => generate_go_import_line(module_path, default_import, false),
-        LangId::C
-        | LangId::Cpp
-        | LangId::Zig
-        | LangId::CSharp
-        | LangId::Bash
-        | LangId::Solidity
-        | LangId::Vue
-        | LangId::Json
-        | LangId::Scala
-        | LangId::Java
-        | LangId::Ruby
-        | LangId::Kotlin
-        | LangId::Swift
-        | LangId::Php
-        | LangId::Lua
-        | LangId::Perl => String::new(),
-        LangId::Html | LangId::Markdown => String::new(),
+        None => String::new(),
     }
 }
 
 /// Check if the given language is supported by the import engine.
 pub fn is_supported(lang: LangId) -> bool {
-    matches!(
-        lang,
-        LangId::TypeScript
-            | LangId::Tsx
-            | LangId::JavaScript
-            | LangId::Python
-            | LangId::Rust
-            | LangId::Go
-    )
+    syntax_for(lang).is_some()
 }
 
 /// Classify a module path into a group for TS/JS/TSX.
@@ -519,28 +624,11 @@ pub fn classify_group_ts(module_path: &str) -> ImportGroup {
 
 /// Classify a module path into a group for the given language.
 pub fn classify_group(lang: LangId, module_path: &str) -> ImportGroup {
-    match lang {
-        LangId::TypeScript | LangId::Tsx | LangId::JavaScript => classify_group_ts(module_path),
-        LangId::Python => classify_group_py(module_path),
-        LangId::Rust => classify_group_rs(module_path),
-        LangId::Go => classify_group_go(module_path),
-        LangId::C
-        | LangId::Cpp
-        | LangId::Zig
-        | LangId::CSharp
-        | LangId::Bash
-        | LangId::Solidity
-        | LangId::Vue
-        | LangId::Json
-        | LangId::Scala
-        | LangId::Java
-        | LangId::Ruby
-        | LangId::Kotlin
-        | LangId::Swift
-        | LangId::Php
-        | LangId::Lua
-        | LangId::Perl => ImportGroup::External,
-        LangId::Html | LangId::Markdown => ImportGroup::External,
+    match syntax_for(lang) {
+        Some(engine) => engine.classify_group(module_path),
+        // Unsupported languages have no grouping policy; External is the
+        // historical neutral default.
+        None => ImportGroup::External,
     }
 }
 

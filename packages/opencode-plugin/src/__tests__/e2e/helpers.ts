@@ -13,6 +13,25 @@ import { bridgeLogger } from "../../logger.js";
 // pollutes the bash background-completion output preview.
 setActiveLogger(bridgeLogger);
 
+// Remove a temp dir, tolerating the Windows `EBUSY: resource busy or locked`
+// race: a detached background-bash child (or the bridge's own handles) can keep
+// the temp directory open for a brief window after shutdown, so a single `rm`
+// in a test's teardown throws and fails an otherwise-passing test. Cleanup
+// failures must never fail a test — retry a few times, then give up silently
+// (the OS reaps the temp dir, and a leaked temp dir is harmless in CI).
+async function safeRemoveDir(dir: string): Promise<void> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      await rm(dir, { recursive: true, force: true });
+      return;
+    } catch {
+      // Most commonly EBUSY on Windows while a detached child still holds a
+      // handle. Back off briefly and retry; ignore if it never frees up.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+}
+
 // Windows cargo produces `aft.exe`; Unix produces `aft`. Resolve the
 // platform-correct name so CI's fail-loud "binary must be present" guard does
 // not trip on a name mismatch (Windows previously silent-skipped into a false
@@ -148,7 +167,7 @@ export async function createHarness(
       { harness: "opencode" },
     );
   } catch (err) {
-    await rm(tempDir, { recursive: true, force: true });
+    await safeRemoveDir(tempDir);
     throw err;
   }
 
@@ -164,7 +183,7 @@ export async function createHarness(
       } catch {
         // ignore cleanup errors
       } finally {
-        await rm(tempDir, { recursive: true, force: true });
+        await safeRemoveDir(tempDir);
       }
     },
   };

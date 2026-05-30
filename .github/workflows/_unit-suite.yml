@@ -193,6 +193,13 @@ jobs:
   # individually — Effect-runtime semantics under bun's Windows process
   # spawn implementation.
   #
+  # Within bash.test.ts, tests asserting Unix-shell OUTPUT SEMANTICS (exact raw
+  # byte equality, POSIX `pwd` shape, cat/grep rewrite over forward-slash paths)
+  # are skipOnWindows-skipped by design: AFT's hoisted bash runs through
+  # PowerShell with backslash Windows paths, those rewrite scenarios are already
+  # Unix-only (crates/aft/tests/integration/bash_rewrite_test.rs), and Linux+macOS
+  # cover them. The permission-flow tests this job exists for run and gate here.
+  #
   # PR mode (strict=false): non-blocking.
   # Release mode (strict=true): blocking.
   # ---------------------------------------------------------------------------

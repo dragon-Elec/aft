@@ -30,13 +30,16 @@ enum Op {
         default_import: Option<&'static str>,
         type_only: bool,
     },
-    /// Add with the structured namespace/alias fields (ES namespace, Solidity
-    /// namespace + whole-file alias) — exercises the new schema params end-to-end.
+    /// Add with the structured schema fields (ES/Solidity namespace + alias,
+    /// Java/C# `modifiers`, PHP `import_kind`) — exercises the new schema params
+    /// end-to-end through the command path.
     AddForm {
         module: &'static str,
         names: &'static [&'static str],
         namespace: Option<&'static str>,
         alias: Option<&'static str>,
+        modifiers: &'static [&'static str],
+        import_kind: Option<&'static str>,
     },
     Remove {
         module: &'static str,
@@ -98,6 +101,8 @@ fn run_scenario(aft: &mut AftProcess, scenario: &Scenario) -> String {
                 names,
                 namespace,
                 alias,
+                modifiers,
+                import_kind,
             } => {
                 let mut p = serde_json::json!({
                     "id": format!("{}-{}", scenario.name, idx),
@@ -113,6 +118,12 @@ fn run_scenario(aft: &mut AftProcess, scenario: &Scenario) -> String {
                 }
                 if let Some(al) = alias {
                     p["alias"] = serde_json::json!(al);
+                }
+                if !modifiers.is_empty() {
+                    p["modifiers"] = serde_json::json!(modifiers);
+                }
+                if let Some(kind) = import_kind {
+                    p["import_kind"] = serde_json::json!(kind);
                 }
                 p
             }
@@ -404,6 +415,8 @@ fn scenarios() -> Vec<Scenario> {
                 names: &[],
                 namespace: Some("Math"),
                 alias: None,
+                modifiers: &[],
+                import_kind: None,
             }],
         },
         Scenario {
@@ -415,6 +428,8 @@ fn scenarios() -> Vec<Scenario> {
                 names: &[],
                 namespace: None,
                 alias: Some("Utils"),
+                modifiers: &[],
+                import_kind: None,
             }],
         },
     ]

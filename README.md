@@ -1,4 +1,4 @@
-<h1 align="center">AFT — Agent File Toolkit</h1>
+<h1 align="center">AFT</h1>
 
 <p align="center">
   <a href="https://crates.io/crates/agent-file-tools"><img src="https://img.shields.io/crates/v/agent-file-tools?label=crate&color=blue&style=flat-square" alt="crates.io"></a>

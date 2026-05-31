@@ -660,7 +660,10 @@ function validateExtractedTree(stagingRoot: string): void {
         const linkTarget = readlinkSync(fullPath);
         const resolvedTarget = resolve(dirname(fullPath), linkTarget);
         const rel = relative(realRoot, resolvedTarget);
-        if (rel.startsWith("..") || (process.platform !== "win32" && rel.startsWith("/"))) {
+        // A target inside realRoot yields a relative path. If `relative()`
+        // returns an absolute path it escaped the root — on POSIX (`/...`) or
+        // across Windows drives (`D:\...`, where the win32 check is essential).
+        if (rel.startsWith("..") || isAbsolute(rel) || win32.isAbsolute(rel)) {
           throw new Error(
             `extracted symlink ${fullPath} points outside staging root: ${linkTarget}`,
           );
@@ -669,7 +672,7 @@ function validateExtractedTree(stagingRoot: string): void {
       }
 
       const rel = relative(realRoot, fullPath);
-      if (rel.startsWith("..") || (process.platform !== "win32" && rel.startsWith("/"))) {
+      if (rel.startsWith("..") || isAbsolute(rel) || win32.isAbsolute(rel)) {
         throw new Error(`extracted entry ${fullPath} escapes staging root`);
       }
 

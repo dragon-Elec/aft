@@ -144,6 +144,19 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
     // Must have at least one of: names, default_import, or neither (side-effect)
     // All combinations are valid.
 
+    // C/C++ ergonomics: agents pass includes with their delimiter (`<vector>`
+    // or `"foo.h"`). Strip it and infer the include kind so dedup,
+    // classification, generation, and the reported module path all see the bare
+    // header — otherwise generation double-wraps into `#include <<vector>>`,
+    // which fails validation and silently rolls back.
+    let (module_owned, inferred_import_kind) = if matches!(lang, LangId::C | LangId::Cpp) {
+        imports::normalize_include_module(module)
+    } else {
+        (module.to_string(), None)
+    };
+    let module = module_owned.as_str();
+    let import_kind = import_kind.or_else(|| inferred_import_kind.map(String::from));
+
     // --- Parse file and imports ---
     let (source, tree, block) = match imports::parse_file_imports(&path, lang) {
         Ok(result) => result,
@@ -337,6 +350,19 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     log::debug!("add_import: {}", file);
+
+    // A rollback means post-write syntax validation failed and the file was
+    // restored to its original content — the import was NOT added. Report that
+    // honestly with an error instead of claiming success with `added: true`.
+    if write_result.rolled_back {
+        return Response::error(
+            &req.id,
+            "generated_invalid_syntax",
+            format!(
+                "add_import: adding '{module}' to {file} would produce invalid syntax; file left unchanged"
+            ),
+        );
+    }
 
     // --- Build response ---
     let mut result = serde_json::json!({

@@ -7,6 +7,28 @@ use tree_sitter::{Node, Tree};
 const C_INCLUDE_SYSTEM_KIND: &str = "system";
 const C_INCLUDE_LOCAL_KIND: &str = "local";
 
+/// Normalize an agent-supplied C/C++ include module.
+///
+/// Agents naturally pass the include with its delimiter (`<vector>` or
+/// `"foo.h"`) because that is how includes are written. Strip the delimiter and
+/// infer the include kind so dedup, classification, and generation all see the
+/// bare header path — otherwise generation double-wraps into `#include
+/// <<vector>>`, which fails syntax validation and rolls the edit back.
+///
+/// Returns the bare header path plus the inferred include kind, or the input
+/// unchanged with `None` when no delimiter is present (the caller then honors an
+/// explicit `import_kind`, defaulting to a system include).
+pub(crate) fn normalize_include_module(module: &str) -> (String, Option<&'static str>) {
+    let trimmed = module.trim();
+    if let Some(inner) = trimmed.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+        (inner.trim().to_string(), Some(C_INCLUDE_SYSTEM_KIND))
+    } else if let Some(inner) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        (inner.trim().to_string(), Some(C_INCLUDE_LOCAL_KIND))
+    } else {
+        (module.to_string(), None)
+    }
+}
+
 pub(crate) fn parse_c_imports(source: &str, tree: &Tree) -> ImportBlock {
     let root = tree.root_node();
     let mut imports = Vec::new();
@@ -383,5 +405,29 @@ mod tests {
                 assert_eq!(regenerated, src, "round-trip mismatch for {src:?}");
             }
         }
+    }
+
+    #[test]
+    fn normalize_include_module_strips_delimiters_and_infers_kind() {
+        // Angle/system delimiter.
+        assert_eq!(
+            normalize_include_module("<vector>"),
+            ("vector".to_string(), Some(C_INCLUDE_SYSTEM_KIND))
+        );
+        // Quote/local delimiter.
+        assert_eq!(
+            normalize_include_module("\"foo/bar.h\""),
+            ("foo/bar.h".to_string(), Some(C_INCLUDE_LOCAL_KIND))
+        );
+        // Surrounding whitespace tolerated.
+        assert_eq!(
+            normalize_include_module("  <stdio.h>  "),
+            ("stdio.h".to_string(), Some(C_INCLUDE_SYSTEM_KIND))
+        );
+        // Bare header: unchanged, no inferred kind (caller defaults to system).
+        assert_eq!(
+            normalize_include_module("string"),
+            ("string".to_string(), None)
+        );
     }
 }

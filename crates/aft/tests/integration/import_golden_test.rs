@@ -994,6 +994,35 @@ fn scenarios() -> Vec<Scenario> {
                 import_kind: Some("local"),
             }],
         },
+        // Agents naturally pass includes WITH the delimiter. The engine must
+        // strip it and infer the kind rather than double-wrapping (which would
+        // generate `#include <<string>>` and silently roll back).
+        Scenario {
+            name: "cpp_add_system_include_delimited",
+            ext: "cpp",
+            input: "#include <vector>\n\nint main() { return 0; }\n",
+            ops: &[Op::AddForm {
+                module: "<string>",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &[],
+                import_kind: None,
+            }],
+        },
+        Scenario {
+            name: "cpp_add_local_include_delimited",
+            ext: "cpp",
+            input: "#include <vector>\n\nint main() { return 0; }\n",
+            ops: &[Op::AddForm {
+                module: "\"widget.hpp\"",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &[],
+                import_kind: None,
+            }],
+        },
         Scenario {
             name: "c_remove_include",
             ext: "c",

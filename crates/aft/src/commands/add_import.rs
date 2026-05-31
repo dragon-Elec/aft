@@ -231,36 +231,40 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         )
     } else {
         // Fall through to the original "find insertion point and insert a new
-        // statement" behavior.
+        // statement" behavior, with two empty-block special cases that would
+        // otherwise place the import at offset 0:
         //
-        // Special case: a file with a language-level header (package/namespace/
-        // pragma) but NO existing imports. `find_insertion_point` returns offset
-        // 0 for an empty block, which would place the import BEFORE the header —
-        // invalid code (e.g. `import` before `package`, or before `<?php`). When
-        // we can locate the header prologue, insert just after it instead.
-        let (insert_offset, needs_blank_before, needs_blank_after) = match block
-            .imports
-            .is_empty()
-            .then(|| header_prologue_anchor(lang, &source, &tree))
-            .flatten()
-        {
-            Some(anchor) => {
-                let bytes = source.as_bytes();
-                let mut at = anchor;
-                if at < bytes.len() && bytes[at] == b'\r' {
-                    at += 1;
-                }
-                if at < bytes.len() && bytes[at] == b'\n' {
-                    at += 1;
-                }
-                // Blank line before separates the import from the header. Blank
-                // line after only when the next byte isn't already a newline, so
-                // a header already followed by a blank line doesn't double up.
-                let next_is_newline =
-                    at < bytes.len() && (bytes[at] == b'\n' || bytes[at] == b'\r');
-                (at, true, !next_is_newline && at < source.len())
+        //  - Vue: offset 0 lands before `<template>`, outside the `<script>`
+        //    block. Insert at the start of the script body instead.
+        //  - Header languages (Go/Java/.../PHP): offset 0 lands before the
+        //    `package`/`namespace`/`pragma`/`<?php` header — invalid code.
+        //    Insert just after the header prologue instead.
+        let bytes = source.as_bytes();
+        let skip_one_newline = |mut at: usize| {
+            if at < bytes.len() && bytes[at] == b'\r' {
+                at += 1;
             }
-            None => imports::find_insertion_point(&source, &block, group, module, type_only),
+            if at < bytes.len() && bytes[at] == b'\n' {
+                at += 1;
+            }
+            at
+        };
+        let (insert_offset, needs_blank_before, needs_blank_after) = if !block.imports.is_empty() {
+            imports::find_insertion_point(&source, &block, group, module, type_only)
+        } else if lang == LangId::Vue {
+            match imports::vue_script_content_range(&tree) {
+                Some((start, _end)) => (skip_one_newline(start), false, false),
+                None => imports::find_insertion_point(&source, &block, group, module, type_only),
+            }
+        } else if let Some(anchor) = header_prologue_anchor(lang, &source, &tree) {
+            let at = skip_one_newline(anchor);
+            // Blank line before separates the import from the header. Blank line
+            // after only when the next byte isn't already a newline, so a header
+            // already followed by a blank line doesn't double up.
+            let next_is_newline = at < bytes.len() && (bytes[at] == b'\n' || bytes[at] == b'\r');
+            (at, true, !next_is_newline && at < source.len())
+        } else {
+            imports::find_insertion_point(&source, &block, group, module, type_only)
         };
 
         // For Go, check if we're inserting into a grouped import block

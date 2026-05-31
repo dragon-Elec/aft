@@ -395,11 +395,101 @@ impl ImportSyntax for SoliditySyntax {
     }
 }
 
+/// Locate the byte range of the first `<script>` block's inner content in a Vue
+/// Single-File Component. tree-sitter-vue exposes the script body as a single
+/// `raw_text` node; this returns `(start, end)` of that node, or — for an empty
+/// `<script></script>` with no `raw_text` child — a zero-width range right after
+/// the start tag. Returns `None` when the file has no `<script>` element.
+pub(crate) fn vue_script_content_range(tree: &Tree) -> Option<(usize, usize)> {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if child.kind() != "script_element" {
+            continue;
+        }
+        let mut inner = child.walk();
+        for sub in child.named_children(&mut inner) {
+            if sub.kind() == "raw_text" {
+                return Some((sub.start_byte(), sub.end_byte()));
+            }
+        }
+        // Empty `<script></script>`: insert right after the start tag.
+        let mut inner2 = child.walk();
+        for sub in child.named_children(&mut inner2) {
+            if sub.kind() == "start_tag" {
+                return Some((sub.end_byte(), sub.end_byte()));
+            }
+        }
+    }
+    None
+}
+
+/// Parse imports from a Vue SFC `<script>` block. The script body is re-parsed
+/// with the TypeScript grammar (which covers both `lang="ts"` and plain JS
+/// import syntax), then every byte offset is remapped from script-relative to
+/// whole-file positions so insertion, removal, and organize operate correctly.
+fn parse_vue_imports(source: &str, tree: &Tree) -> ImportBlock {
+    let Some((start, end)) = vue_script_content_range(tree) else {
+        return ImportBlock {
+            imports: Vec::new(),
+            byte_range: None,
+        };
+    };
+    let inner = &source[start..end];
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&grammar_for(LangId::TypeScript))
+        .is_err()
+    {
+        return ImportBlock {
+            imports: Vec::new(),
+            byte_range: None,
+        };
+    }
+    let Some(inner_tree) = parser.parse(inner, None) else {
+        return ImportBlock {
+            imports: Vec::new(),
+            byte_range: None,
+        };
+    };
+    let mut block = parse_ts_imports(inner, &inner_tree);
+    for imp in &mut block.imports {
+        imp.byte_range = (imp.byte_range.start + start)..(imp.byte_range.end + start);
+    }
+    block.byte_range = block.byte_range.map(|r| (r.start + start)..(r.end + start));
+    block
+}
+
+/// Vue Single-File Component import engine. The `<script>` body is exposed by
+/// tree-sitter-vue as a single `raw_text` node, so we re-parse it with the
+/// TypeScript grammar and remap the resulting byte offsets back to whole-file
+/// positions. Generation and grouping reuse the ES (TS/JS) engine, since Vue
+/// script imports are TypeScript/JavaScript.
+struct VueSyntax;
+impl ImportSyntax for VueSyntax {
+    fn parse(&self, source: &str, tree: &Tree) -> ImportBlock {
+        parse_vue_imports(source, tree)
+    }
+    fn generate_line(&self, req: &ImportRequest) -> String {
+        generate_ts_import_line(
+            req.module_path,
+            req.names,
+            req.default_import,
+            req.namespace,
+            req.type_only,
+        )
+    }
+    fn classify_group(&self, module_path: &str) -> ImportGroup {
+        classify_group_ts(module_path)
+    }
+}
+
 static ES_SYNTAX: EsSyntax = EsSyntax;
 static PYTHON_SYNTAX: PythonSyntax = PythonSyntax;
 static RUST_SYNTAX: RustSyntax = RustSyntax;
 static GO_SYNTAX: GoSyntax = GoSyntax;
 static SOLIDITY_SYNTAX: SoliditySyntax = SoliditySyntax;
+static VUE_SYNTAX: VueSyntax = VueSyntax;
 
 /// Map a language to its import engine, or `None` when imports are unsupported.
 pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
@@ -409,6 +499,7 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         LangId::Rust => Some(&RUST_SYNTAX),
         LangId::Go => Some(&GO_SYNTAX),
         LangId::Solidity => Some(&SOLIDITY_SYNTAX),
+        LangId::Vue => Some(&VUE_SYNTAX),
         LangId::C => Some(&c::C_SYNTAX),
         LangId::Cpp => Some(&c::C_SYNTAX),
         LangId::Java => Some(&java::JAVA_SYNTAX),
@@ -420,12 +511,7 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         LangId::Ruby => Some(&ruby::RUBY_SYNTAX),
         LangId::Scala => Some(&scala::SCALA_SYNTAX),
         LangId::Swift => Some(&swift::SWIFT_SYNTAX),
-        LangId::Zig
-        | LangId::Bash
-        | LangId::Vue
-        | LangId::Json
-        | LangId::Html
-        | LangId::Markdown => None,
+        LangId::Zig | LangId::Bash | LangId::Json | LangId::Html | LangId::Markdown => None,
     }
 }
 
@@ -2167,6 +2253,67 @@ mod tests {
         let tree = parser.parse(source, None).unwrap();
         let block = parse_imports(source, &tree, LangId::JavaScript);
         (tree, block)
+    }
+
+    fn parse_vue(source: &str) -> (Tree, ImportBlock) {
+        let grammar = grammar_for(LangId::Vue);
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let block = parse_imports(source, &tree, LangId::Vue);
+        (tree, block)
+    }
+
+    /// Locks the tree-sitter-vue node kinds the Vue engine depends on: the
+    /// `<script>` body is exposed as a single `raw_text` node inside a
+    /// `script_element`. If a grammar bump changes this, the engine breaks
+    /// silently, so assert it here.
+    #[test]
+    fn vue_grammar_node_kinds_are_stable() {
+        let src = "<template>\n  <div />\n</template>\n\n<script setup lang=\"ts\">\nimport { ref } from 'vue'\n</script>\n";
+        let grammar = grammar_for(LangId::Vue);
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let script = root
+            .named_children(&mut cursor)
+            .find(|n| n.kind() == "script_element")
+            .expect("expected a script_element node");
+        let mut inner = script.walk();
+        assert!(
+            script
+                .named_children(&mut inner)
+                .any(|n| n.kind() == "raw_text"),
+            "expected script body exposed as raw_text"
+        );
+    }
+
+    #[test]
+    fn vue_parses_script_imports_with_whole_file_offsets() {
+        let src = "<template>\n  <div />\n</template>\n\n<script setup lang=\"ts\">\nimport { ref } from 'vue'\nimport Foo from './Foo.vue'\nconst x = ref(0)\n</script>\n";
+        let (_tree, block) = parse_vue(src);
+        assert_eq!(block.imports.len(), 2, "should find both script imports");
+        // Byte ranges must be whole-file (inside the <script> block), not
+        // script-relative — verify the raw slice round-trips.
+        for imp in &block.imports {
+            assert_eq!(&src[imp.byte_range.clone()], imp.raw_text);
+            assert!(
+                imp.byte_range.start > src.find("<script").unwrap(),
+                "import offset must fall inside the script block"
+            );
+        }
+        assert_eq!(block.imports[0].module_path, "vue");
+        assert_eq!(block.imports[1].module_path, "./Foo.vue");
+    }
+
+    #[test]
+    fn vue_without_script_block_has_no_imports() {
+        let src = "<template>\n  <div />\n</template>\n\n<style>.x{}</style>\n";
+        let (_tree, block) = parse_vue(src);
+        assert!(block.imports.is_empty());
+        assert!(block.byte_range.is_none());
     }
 
     // --- Basic parsing ---

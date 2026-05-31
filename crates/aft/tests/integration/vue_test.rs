@@ -190,7 +190,7 @@ fn vue_ast_search_documents_opaque_script_contents() {
 }
 
 #[test]
-fn vue_unsupported_formatter_and_import_organize_return_clean_errors() {
+fn vue_unsupported_formatter_but_import_organize_succeeds() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("src/App.vue");
 
@@ -214,6 +214,10 @@ fn vue_unsupported_formatter_and_import_organize_return_clean_errors() {
     assert_eq!(write["format_skipped_reason"], "unsupported_language");
     assert_eq!(write["syntax_valid"], true);
 
+    // Vue import management IS supported (the engine re-parses the <script>
+    // body as TypeScript). organize_imports should succeed; only the formatter
+    // remains unsupported for Vue (format_skipped_reason), which must not turn
+    // the organize into a failure.
     let organize = send(
         &mut aft,
         json!({
@@ -223,19 +227,12 @@ fn vue_unsupported_formatter_and_import_organize_return_clean_errors() {
         }),
     );
     assert_eq!(
-        organize["success"], false,
-        "organize_imports should reject Vue: {organize:?}"
+        organize["success"], true,
+        "organize_imports should support Vue script imports: {organize:?}"
     );
     assert_eq!(
-        organize["code"], "unsupported_language",
-        "Vue import management is unsupported — standardized code, not invalid_request"
-    );
-    assert!(
-        organize["message"]
-            .as_str()
-            .expect("error message")
-            .contains("Vue"),
-        "message should name Vue: {organize:?}"
+        organize["format_skipped_reason"], "unsupported_language",
+        "Vue has no formatter, so formatting is skipped (but organize still succeeds): {organize:?}"
     );
 
     let status = aft.shutdown();

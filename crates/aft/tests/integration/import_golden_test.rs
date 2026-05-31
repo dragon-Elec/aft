@@ -1051,6 +1051,45 @@ fn scenarios() -> Vec<Scenario> {
             input: "#include \"z_widget.hpp\"\n#include <vector>\n#include \"a_widget.hpp\"\n#include <string>\n\nvoid f();\n",
             ops: &[Op::Organize],
         },
+        // ---- Vue SFC (imports live inside the <script> block; the engine
+        // re-parses the script body as TS and remaps offsets to whole-file). ----
+        Scenario {
+            name: "vue_add_into_existing_script",
+            ext: "vue",
+            input: "<template>\n  <div />\n</template>\n\n<script setup lang=\"ts\">\nimport { ref } from 'vue'\nconst x = ref(0)\n</script>\n",
+            ops: &[Op::Add {
+                module: "./Foo.vue",
+                names: &[],
+                default_import: Some("Foo"),
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "vue_add_into_empty_script",
+            ext: "vue",
+            input: "<template>\n  <div />\n</template>\n\n<script setup lang=\"ts\">\n</script>\n",
+            ops: &[Op::Add {
+                module: "vue",
+                names: &["ref"],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "vue_remove_from_script",
+            ext: "vue",
+            input: "<template>\n  <div />\n</template>\n\n<script setup lang=\"ts\">\nimport { ref } from 'vue'\nimport Foo from './Foo.vue'\nconst x = ref(0)\n</script>\n",
+            ops: &[Op::Remove {
+                module: "./Foo.vue",
+                name: None,
+            }],
+        },
+        Scenario {
+            name: "vue_organize_script",
+            ext: "vue",
+            input: "<template>\n  <div />\n</template>\n\n<script setup lang=\"ts\">\nimport Foo from './Foo.vue'\nimport { ref } from 'vue'\nconst x = ref(0)\n</script>\n",
+            ops: &[Op::Organize],
+        },
     ]
 }
 

@@ -99,7 +99,7 @@ A brain isn't one organ. Neither is a capable coding agent.
 
 | Plugin | Region | What it does |
 |---|---|---|
-| **[Magic Context](https://github.com/cortexkit/magic-context)** | Hippocampus & medial temporal lobe | Long-term project memory. Compresses episodes into compartments, promotes stable facts, recalls prior context, tracks how knowledge changes over time. |
+| **[Magic Context](https://github.com/cortexkit/magic-context)** | Hippocampus & medial temporal lobe | Self-managing context and long-term memory. Compresses history with no compaction pauses, and forms, consolidates, and recalls project knowledge across sessions. |
 | **AFT** *(you are here)* | Sensorimotor cortex | Perceives code structure and acts on it precisely. |
 | **Alfonso** *(coming soon)* | Prefrontal cortex | Executive control. Plans, decomposes work, chooses agents and models, delegates, monitors progress, and decides when to ask, verify, and commit. |
 

@@ -513,6 +513,35 @@ fn is_supported_language(lang: LangId) -> bool {
             | LangId::Perl
     )
 }
+fn language_name(lang: LangId) -> &'static str {
+    match lang {
+        LangId::TypeScript => "typescript",
+        LangId::Tsx => "tsx",
+        LangId::JavaScript => "javascript",
+        LangId::Python => "python",
+        LangId::Rust => "rust",
+        LangId::Go => "go",
+        LangId::C => "c",
+        LangId::Cpp => "cpp",
+        LangId::Zig => "zig",
+        LangId::CSharp => "csharp",
+        LangId::Bash => "bash",
+        LangId::Html => "html",
+        LangId::Markdown => "markdown",
+        LangId::Yaml => "yaml",
+        LangId::Solidity => "solidity",
+        LangId::Vue => "vue",
+        LangId::Json => "json",
+        LangId::Scala => "scala",
+        LangId::Java => "java",
+        LangId::Ruby => "ruby",
+        LangId::Kotlin => "kotlin",
+        LangId::Swift => "swift",
+        LangId::Php => "php",
+        LangId::Lua => "lua",
+        LangId::Perl => "perl",
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -618,35 +647,5 @@ mod tests {
         assert_eq!(group_count(&aggregate), 1, "aggregate: {aggregate:#}");
         // The surfaced group is the child, not either unique block.
         assert_eq!(aggregate["items"][0]["cost"], 400);
-    }
-}
-
-fn language_name(lang: LangId) -> &'static str {
-    match lang {
-        LangId::TypeScript => "typescript",
-        LangId::Tsx => "tsx",
-        LangId::JavaScript => "javascript",
-        LangId::Python => "python",
-        LangId::Rust => "rust",
-        LangId::Go => "go",
-        LangId::C => "c",
-        LangId::Cpp => "cpp",
-        LangId::Zig => "zig",
-        LangId::CSharp => "csharp",
-        LangId::Bash => "bash",
-        LangId::Html => "html",
-        LangId::Markdown => "markdown",
-        LangId::Yaml => "yaml",
-        LangId::Solidity => "solidity",
-        LangId::Vue => "vue",
-        LangId::Json => "json",
-        LangId::Scala => "scala",
-        LangId::Java => "java",
-        LangId::Ruby => "ruby",
-        LangId::Kotlin => "kotlin",
-        LangId::Swift => "swift",
-        LangId::Php => "php",
-        LangId::Lua => "lua",
-        LangId::Perl => "perl",
     }
 }

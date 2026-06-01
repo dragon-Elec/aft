@@ -1577,11 +1577,29 @@ fn inspect_command_unused_exports_scope_filters_full_contributions_before_cap() 
 #[test]
 fn inspect_command_duplicates_scope_filters_full_contributions_before_cap() {
     let (_temp_dir, root) = fixture_project();
-    let source = many_duplicate_groups_source();
-    write_file(&root, "aaa_global/left.ts", &source);
-    write_file(&root, "aaa_global/right.ts", &source);
-    write_file(&root, "zzz_scoped/left.ts", &source);
-    write_file(&root, "zzz_scoped/right.ts", &source);
+    // Distinct per-file markers so the whole-file (program) node is not itself a
+    // cross-file duplicate (which would correctly subsume the 130 inner groups);
+    // the 130 functions remain byte-identical across files and so stay duplicated.
+    write_file(
+        &root,
+        "aaa_global/left.ts",
+        &many_duplicate_groups_source(2),
+    );
+    write_file(
+        &root,
+        "aaa_global/right.ts",
+        &many_duplicate_groups_source(3),
+    );
+    write_file(
+        &root,
+        "zzz_scoped/left.ts",
+        &many_duplicate_groups_source(4),
+    );
+    write_file(
+        &root,
+        "zzz_scoped/right.ts",
+        &many_duplicate_groups_source(5),
+    );
     let ctx = configured_context(&root);
 
     tier2_run(&ctx, &["duplicates"]);
@@ -1623,7 +1641,14 @@ fn inspect_command_duplicates_scope_filters_full_contributions_before_cap() {
     );
 }
 
-fn many_duplicate_groups_source() -> String {
+/// 130 literal-distinct functions shared across files (the real cross-file
+/// duplicate groups) plus a trailing marker function whose statement count is
+/// unique per `unique_stmts`. The unique marker makes each file's top-level
+/// (program) node structurally distinct, so the WHOLE FILE is not itself a
+/// cross-file duplicate that would (correctly) subsume the 130 inner groups
+/// under the nested-overlap collapse. Each caller passes a distinct
+/// `unique_stmts` so every file's program node appears exactly once.
+fn many_duplicate_groups_source(unique_stmts: usize) -> String {
     let mut source = String::new();
     for index in 0..130 {
         source.push_str(&format!(
@@ -1643,15 +1668,21 @@ fn many_duplicate_groups_source() -> String {
             index + 11
         ));
     }
+    source.push_str("function file_unique_marker() {\n");
+    for n in 0..unique_stmts {
+        source.push_str(&format!("  const marker_{n} = {n} * 2 + 1;\n"));
+    }
+    source.push_str("  return 0;\n}\n");
     source
 }
 
 #[test]
 fn inspect_command_duplicates_project_wide_cap_preserves_total_groups() {
     let (_temp_dir, root) = fixture_project();
-    let source = many_duplicate_groups_source();
-    write_file(&root, "src/left.ts", &source);
-    write_file(&root, "src/right.ts", &source);
+    // Distinct per-file markers (see scope test): keep the 130 functions
+    // duplicated across files without the whole file becoming one big duplicate.
+    write_file(&root, "src/left.ts", &many_duplicate_groups_source(2));
+    write_file(&root, "src/right.ts", &many_duplicate_groups_source(3));
     let ctx = configured_context(&root);
 
     tier2_run(&ctx, &["duplicates"]);

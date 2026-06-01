@@ -27,6 +27,7 @@ mod compress_filters_test;
 mod compress_output_shape_test;
 mod compression_events_test;
 mod configure_test;
+mod conflicts_discovery_test;
 mod db_read_fallback_test;
 mod edit_append_test;
 mod edit_match_test;

@@ -52,7 +52,7 @@ Always registered with `aft_` prefix regardless of hoisting setting.
 | Tool | Description | Key Params |
 |------|-------------|------------|
 | `aft_outline` | Structural outline of a file, directory, files, or URL; or indexed file tree | `target` (string or array), `files` |
-| `aft_zoom` | Inspect symbols with call-graph annotations (same-file or cross-file) | `filePath`, `symbols` (string or array), `targets`, `url` |
+| `aft_zoom` | Inspect symbols (same-file or cross-file); opt-in call-graph annotations | `filePath`, `symbols` (string or array), `targets`, `url`, `callgraph` |
 | `aft_import` | Language-aware import add/remove/organize | `op`, `filePath`, `module`, `names[]` |
 | `aft_conflicts` | Show all git merge conflicts with line-numbered regions | *(none)* |
 | `aft_search` | Hybrid semantic + lexical code search by meaning | `query`, `topK` |
@@ -494,9 +494,9 @@ are listed under `skipped_files` with a per-file `reason` (e.g. `parse_error`,
 
 ### aft_zoom
 
-Inspect code symbols with call-graph annotations. Returns the full source of named symbols with
-`calls_out` (what it calls) and `called_by` (what calls it) annotations. Use exactly one input
-mode.
+Inspect code symbols. Returns the full source of named symbols. Pass `callgraph: true` to also
+annotate each symbol with `calls_out` (what it calls) and `called_by` (what calls it); it
+defaults to `false` to keep output minimal. Use exactly one input mode.
 
 Use this when you need to understand a specific function, class, or type in detail — not for
 reading entire files (use `read` for that).
@@ -504,6 +504,9 @@ reading entire files (use `read` for that).
 ```json
 // Single symbol in a file
 { "filePath": "src/app.ts", "symbols": "handleRequest" }
+
+// Add call-graph annotations (calls_out / called_by) for the symbol
+{ "filePath": "src/app.ts", "symbols": "handleRequest", "callgraph": true }
 
 // Multiple symbols in the SAME file (polymorphic: string or array)
 { "filePath": "src/app.ts", "symbols": ["Config", "createApp"] }
@@ -932,7 +935,8 @@ Call graph and data-flow analysis across the workspace.
 
 ### aft_import
 
-Language-aware import management for TS, JS, TSX, Python, Rust, and Go.
+Language-aware import management for TS, JS, TSX, Python, Rust, Go, Solidity, Java, C#, PHP,
+Kotlin, Scala, Swift, Ruby, Lua, C, C++, Perl, and Vue.
 
 ```json
 // Add named imports with auto-grouping and deduplication
@@ -950,9 +954,17 @@ Language-aware import management for TS, JS, TSX, Python, Rust, and Go.
 { "op": "organize", "filePath": "src/api.ts" }
 ```
 
+Beyond `module`/`names`, `add` accepts language-appropriate fields: `defaultImport` and
+`namespace` (ES `import X, * as NS`), `alias` (whole-module alias, e.g. Solidity `import "./X.sol" as X`),
+`typeOnly` (TS), `modifiers` (statement modifiers such as Java/C# `static`, Swift `@testable`),
+and `importKind` (kind-specific imports such as PHP `function`/`const`, Swift `struct`/`func`).
+
 `op: "remove"` reports `removed: false` with a `reason` of `module_not_found` (the module
 was never imported) or `name_not_found` (the module is imported but the named symbol isn't
-in it) instead of pretending the removal succeeded.
+in it) instead of pretending the removal succeeded. For languages whose grammar can't be
+safely regenerated (wildcard/group/rename forms), `organize` sorts verbatim and refuses
+rather than corrupting syntax; a generated line that fails to parse rolls back and reports
+`generated_invalid_syntax` instead of a false success.
 
 ---
 

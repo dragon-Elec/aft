@@ -205,6 +205,12 @@ function buildSchema(): Record<string, unknown> {
                 description:
                   "Allow agents to launch bash with `{ background: true }` for long-running tasks. Foreground bash always auto-promotes to background after the foreground wait window (default 8s) regardless of this flag.",
               },
+              subagent_background: {
+                type: "boolean",
+                default: false,
+                description:
+                  "Allow subagents to run background bash. Default false — subagent `background: true` requests are otherwise converted to foreground so the subagent turn does not end early.",
+              },
               long_running_reminder_enabled: {
                 type: "boolean",
                 default: true,

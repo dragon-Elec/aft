@@ -57,7 +57,8 @@ packages aggressively), or when you want to reset the LSP server cache to force 
 download. Targets harness plugin cache, binary cache, downloaded LSP servers, and semantic
 index storage.
 
-**`doctor --issue`** — Collects a full diagnostic report, sanitizes your username and home
-path out of the logs, and files a GitHub issue. If you have `gh` installed, it submits
-directly; otherwise it writes the report to `./aft-issue-<timestamp>.md` and opens the
-new-issue page in your browser.
+**`doctor --issue`** — Collects a full diagnostic report and sanitizes secrets, your username,
+and home path out of the logs. It always writes the report to `./aft-issue-<timestamp>.md`
+first and prompts you to review it. Only after you confirm does it submit via `gh` (when
+installed); otherwise it opens the prefilled new-issue page in your browser. Nothing is sent
+without your explicit confirmation.

@@ -188,7 +188,11 @@ The schema is identical across harnesses. Only file location differs.
 
     // Allow subagents to run background bash. Default false — subagent
     // `background: true` requests are otherwise converted to foreground.
-    "subagent_background": false
+    "subagent_background": false,
+
+    // How long a foreground bash call blocks before auto-promoting the task
+    // to the background. Minimum 5000; lower values are clamped up. Default 8000.
+    "foreground_wait_window_ms": 8000
   },
 
   // aft_inspect codebase-health scanner (recommended/all tiers).

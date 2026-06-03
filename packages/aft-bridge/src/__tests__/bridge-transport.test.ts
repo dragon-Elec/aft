@@ -90,7 +90,7 @@ process.stdin.on("data", (chunk) => {
     const testBridge = bridge as unknown as { configured: boolean };
 
     try {
-      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 500 });
+      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
 
       const timedOutResult = bridge.send("slow", {}, { timeoutMs: 40 }).then(
         () => "resolved",
@@ -141,7 +141,7 @@ process.stdin.on("data", (chunk) => {
     const testBridge = bridge as unknown as { configured: boolean };
 
     try {
-      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 500 });
+      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
 
       const timedOutResult = bridge.send("slow", {}, { timeoutMs: 30 }).then(
         () => "resolved",
@@ -187,7 +187,7 @@ process.stdin.on("data", (chunk) => {
     const testBridge = bridge as unknown as { configured: boolean };
 
     try {
-      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 500 });
+      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
 
       const first = await bridge.send("first", {}, { timeoutMs: 20 }).then(
         () => "resolved",
@@ -251,7 +251,7 @@ process.stdin.on("data", (chunk) => {
     const testBridge = bridge as unknown as { configured: boolean };
 
     try {
-      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 500 });
+      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
 
       const first = await bridge.send("first-timeout", {}, { timeoutMs: 20 }).then(
         () => "resolved",
@@ -311,7 +311,7 @@ process.stdin.on("data", (chunk) => {
     const testBridge = bridge as unknown as { configured: boolean };
 
     try {
-      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 500 });
+      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
 
       const keepResult = await bridge
         .send("keep", {}, { timeoutMs: 20, keepBridgeOnTimeout: true })

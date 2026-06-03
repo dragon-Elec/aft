@@ -34,6 +34,52 @@ function getOpenCodeCacheDir(): string {
   return join(homedir(), ".cache", "opencode");
 }
 
+/** True when the `opencode` CLI is runnable on PATH. */
+function hasOpenCodeCli(): boolean {
+  try {
+    // timeout: a misbehaving/booting host must never hang the probe (and a hung
+    // probe under PATH self-resolution is what enabled a fork bomb).
+    execSync("opencode --version", { stdio: "ignore", timeout: 5000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True when an OpenCode Desktop app bundle exists in a known install location.
+ * Used only as a last-resort signal when the config dir hasn't been created yet
+ * (e.g. a freshly installed Desktop app that hasn't been launched).
+ */
+function openCodeDesktopAppExists(): boolean {
+  const candidates: string[] = [];
+  if (process.platform === "darwin") {
+    candidates.push(
+      "/Applications/OpenCode.app",
+      "/Applications/OpenCode Beta.app",
+      join(homedir(), "Applications", "OpenCode.app"),
+      join(homedir(), "Applications", "OpenCode Beta.app"),
+    );
+  } else if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local");
+    candidates.push(join(localAppData, "Programs", "opencode"), join(localAppData, "opencode"));
+  } else {
+    // Linux: common AppImage / package install hints.
+    candidates.push(
+      "/opt/OpenCode",
+      "/usr/lib/opencode",
+      join(homedir(), ".local", "share", "applications", "opencode.desktop"),
+    );
+  }
+  return candidates.some((p) => {
+    try {
+      return existsSync(p);
+    } catch {
+      return false;
+    }
+  });
+}
+
 /**
  * Convert a plugin entry string to a filesystem path if it represents one.
  *
@@ -103,14 +149,24 @@ export class OpenCodeAdapter implements HarnessAdapter {
   readonly pluginEntryWithVersion = PLUGIN_ENTRY;
 
   isInstalled(): boolean {
-    try {
-      // timeout: a misbehaving/booting host must never hang the probe (and a
-      // hung probe under PATH self-resolution is what enabled a fork bomb).
-      execSync("opencode --version", { stdio: "ignore", timeout: 5000 });
-      return true;
-    } catch {
-      return false;
-    }
+    // OpenCode ships two ways: the `opencode` CLI (on PATH) and OpenCode
+    // Desktop (an Electron app that does NOT put `opencode` on PATH). Both read
+    // the same `~/.config/opencode` config and load the same plugin entry, so
+    // "installed" must mean "OpenCode is present", not just "CLI is runnable" —
+    // otherwise `aft setup` bails for Desktop-only users (issue: setup finds no
+    // harness). getHostVersion() stays CLI-only and reports null for Desktop.
+    //
+    // Check cheap filesystem signals BEFORE shelling out: the config dir is
+    // created by Desktop and the CLI alike and is exactly where we write the
+    // plugin entry, so its presence both proves OpenCode is present and makes
+    // setup meaningful — without booting `opencode --version` (slow, and the
+    // probe that, under PATH self-resolution, enabled a fork bomb).
+    if (existsSync(getOpenCodeConfigDir())) return true;
+    // App bundle exists but config dir not yet created (freshly installed,
+    // never launched).
+    if (openCodeDesktopAppExists()) return true;
+    // Last resort: the CLI is on PATH but hasn't created a config dir yet.
+    return hasOpenCodeCli();
   }
 
   getHostVersion(): string | null {

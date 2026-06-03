@@ -87,7 +87,8 @@ describe("permission matrix (real Pi RPC)", () => {
     );
     expect(toolEnd.isError).toBe(false);
     expect(uiRequestSeen).toBe(false);
-    expect(JSON.stringify(toolEnd.result)).toContain("Edited inside.txt");
+    // Compact agent-facing summary — path is no longer echoed in the headline.
+    expect(JSON.stringify(toolEnd.result)).toContain("Edited (");
   }, 120_000);
 
   test("external edit under strict mode prompts then Rust still rejects (defense in depth)", async () => {

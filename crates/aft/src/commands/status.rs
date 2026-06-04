@@ -200,6 +200,24 @@ impl AppContext {
         let degraded_reasons = self.degraded_reasons();
         let degraded = !degraded_reasons.is_empty();
 
+        // Agent status-bar counts (the `[AFT E· W· | D· U· C· | T·]` glance).
+        // Surfaced for the TUI sidebar so users see the same code-health view
+        // agents get. `None` until the Tier-2 cache is populated at least once
+        // (so we never render fabricated zeros) — emitted as JSON null then,
+        // and the sidebar hides the section.
+        let status_bar = match self.status_bar_counts() {
+            Some(counts) => serde_json::json!({
+                "errors": counts.errors,
+                "warnings": counts.warnings,
+                "dead_code": counts.dead_code,
+                "unused_exports": counts.unused_exports,
+                "duplicates": counts.duplicates,
+                "todos": counts.todos,
+                "tier2_stale": counts.tier2_stale,
+            }),
+            None => serde_json::Value::Null,
+        };
+
         serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "project_root": config.project_root.as_ref().map(|p| p.display().to_string()),
@@ -216,6 +234,7 @@ impl AppContext {
             },
             "search_index": search_index_info,
             "semantic_index": semantic_index_info,
+            "status_bar": status_bar,
             "disk": disk_info,
             "lsp_servers": lsp_count,
             "symbol_cache": symbol_cache_stats,
@@ -329,5 +348,24 @@ mod tests {
         ctx.set_cache_role(true, None);
         let response = handle_status(&request(), &ctx);
         assert_eq!(response.data["cache_role"], "worktree");
+    }
+
+    #[test]
+    fn status_status_bar_is_null_until_tier2_populated() {
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let response = handle_status(&request(), &ctx);
+        // No Tier-2 scan has run yet, so the status-bar glance must be null
+        // (never fabricated zeros). The key is always present so the TS
+        // coercion can distinguish "field absent" from "not populated".
+        assert!(response.data.get("status_bar").is_some());
+        assert!(response.data["status_bar"].is_null());
+
+        // Once Tier-2 counts are populated, the snapshot carries the glance.
+        ctx.update_status_bar_tier2(Some(3), Some(2), Some(1), Some(5), false);
+        let response = handle_status(&request(), &ctx);
+        assert_eq!(response.data["status_bar"]["dead_code"], 3);
+        assert_eq!(response.data["status_bar"]["unused_exports"], 2);
+        assert_eq!(response.data["status_bar"]["duplicates"], 1);
+        assert_eq!(response.data["status_bar"]["tier2_stale"], false);
     }
 }

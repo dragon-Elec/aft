@@ -10,6 +10,24 @@ export interface StatusCompression {
   session: StatusCompressionAggregate;
 }
 
+/**
+ * The agent status-bar glance — `[AFT E· W· | D· U· C· | T·]`. `errors`/
+ * `warnings` are live LSP diagnostics for files touched this session; the
+ * Tier-2 trio (`dead_code`/`unused_exports`/`duplicates`) plus `todos` come
+ * from the last completed background scan. `tier2_stale` marks those Tier-2
+ * counts as predating the latest edit. Null in the snapshot until the Tier-2
+ * cache is populated at least once (no fabricated zeros).
+ */
+export interface StatusBar {
+  errors: number;
+  warnings: number;
+  dead_code: number;
+  unused_exports: number;
+  duplicates: number;
+  todos: number;
+  tier2_stale: boolean;
+}
+
 export interface AftStatusSnapshot {
   version: string;
   project_root: string | null;
@@ -62,6 +80,12 @@ export interface AftStatusSnapshot {
   /** Compression aggregate passthrough; rendering is added separately. */
   compression?: StatusCompression;
   /**
+   * Agent status-bar counts (E/W/D/U/C/T). Undefined until the Tier-2 cache
+   * is populated at least once — the overlay hides the Code Health section
+   * until then so it never shows fabricated zeros.
+   */
+  status_bar?: StatusBar;
+  /**
    * Set on synthetic "not_initialized" snapshots when no bridge has spawned
    * yet. Renderers display this in place of empty status rows.
    */
@@ -108,6 +132,23 @@ function readCompression(value: unknown): StatusCompression | undefined {
   return {
     project: readCompressionAggregate(compression.project),
     session: readCompressionAggregate(compression.session),
+  };
+}
+
+function readStatusBar(value: unknown): StatusBar | undefined {
+  // Null until Tier-2 is populated — the Rust snapshot emits JSON null, which
+  // is not an object, so this returns undefined and the overlay hides the
+  // Code Health section (no fabricated zeros).
+  if (typeof value !== "object" || value === null) return undefined;
+  const bar = asRecord(value);
+  return {
+    errors: readNumber(bar.errors),
+    warnings: readNumber(bar.warnings),
+    dead_code: readNumber(bar.dead_code),
+    unused_exports: readNumber(bar.unused_exports),
+    duplicates: readNumber(bar.duplicates),
+    todos: readNumber(bar.todos),
+    tier2_stale: readBoolean(bar.tier2_stale),
   };
 }
 
@@ -210,6 +251,7 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
       checkpoints: readNumber(session.checkpoints),
     },
     compression: readCompression(response.compression),
+    status_bar: readStatusBar(response.status_bar),
   };
 }
 
@@ -259,6 +301,20 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
     `- LSP servers: ${formatCount(status.lsp_servers)}`,
     `- symbol cache: ${formatCount(status.symbol_cache.local_entries)} local / ${formatCount(status.symbol_cache.warm_entries)} warm`,
   );
+
+  if (status.status_bar) {
+    const sb = status.status_bar;
+    lines.push(
+      "",
+      `Code Health${sb.tier2_stale ? " (~ stale)" : ""}`,
+      `- errors: ${formatCount(sb.errors)}`,
+      `- warnings: ${formatCount(sb.warnings)}`,
+      `- dead code: ${formatCount(sb.dead_code)}`,
+      `- unused exports: ${formatCount(sb.unused_exports)}`,
+      `- duplicates: ${formatCount(sb.duplicates)}`,
+      `- todos: ${formatCount(sb.todos)}`,
+    );
+  }
 
   if (status.storage_dir ?? status.disk.storage_dir) {
     lines.push(`- storage dir: ${status.storage_dir ?? status.disk.storage_dir}`);
@@ -348,6 +404,20 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
 
   if (status.storage_dir ?? status.disk.storage_dir) {
     lines.push(`- **Storage dir:** \`${status.storage_dir ?? status.disk.storage_dir}\``);
+  }
+
+  if (status.status_bar) {
+    const sb = status.status_bar;
+    lines.push(
+      "",
+      `### Code Health${sb.tier2_stale ? " (~ stale)" : ""}`,
+      `- **Errors:** ${formatCount(sb.errors)}`,
+      `- **Warnings:** ${formatCount(sb.warnings)}`,
+      `- **Dead code:** ${formatCount(sb.dead_code)}`,
+      `- **Unused exports:** ${formatCount(sb.unused_exports)}`,
+      `- **Duplicates:** ${formatCount(sb.duplicates)}`,
+      `- **TODOs:** ${formatCount(sb.todos)}`,
+    );
   }
 
   return lines.join("\n");

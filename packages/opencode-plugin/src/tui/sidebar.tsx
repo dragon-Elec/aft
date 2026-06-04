@@ -16,6 +16,7 @@ import {
   coerceAftStatus,
   formatSemanticIndexStatus,
   formatSemanticRefreshing,
+  type StatusBar,
   type StatusCompression,
 } from "../shared/status";
 import { resolveCortexKitStorageRoot } from "../shared/storage-paths";
@@ -177,6 +178,15 @@ export function collapsedCompressionValue(
   const { savings_tokens, original_tokens } = compression.project;
   const pct = original_tokens > 0 ? Math.round((savings_tokens / original_tokens) * 100) : 0;
   return `${formatCount(savings_tokens)} / ${pct}%`;
+}
+
+// Compact one-line code-health glance for the collapsed view — mirrors the
+// agent status bar shape `E· W· | D· U· C· | T·` with a leading `~` when the
+// Tier-2 counts predate the latest edit. Returns null until populated.
+export function collapsedStatusBarValue(statusBar: StatusBar | undefined): string | null {
+  if (!statusBar) return null;
+  const stale = statusBar.tier2_stale ? "~" : "";
+  return `E${statusBar.errors} W${statusBar.warnings} | ${stale}D${statusBar.dead_code} U${statusBar.unused_exports} C${statusBar.duplicates} | T${statusBar.todos}`;
 }
 
 // v0.27 moved AFT storage to the CortexKit root. TUI code must use a
@@ -426,6 +436,7 @@ const SidebarContent = (props: {
   const trigramBytes = () => s()?.disk?.trigram_disk_bytes ?? 0;
   const semanticBytes = () => s()?.disk?.semantic_disk_bytes ?? 0;
   const compressionRows = () => formatCompressionSidebarRows(s()?.compression);
+  const statusBar = () => s()?.status_bar;
 
   // Degraded-mode reason → human-readable hint. Distinct strings per reason
   // because the UX direction is different: "home_root" tells the user to
@@ -544,6 +555,13 @@ const SidebarContent = (props: {
               </text>
             </CollapsedRow>
           )}
+          {collapsedStatusBarValue(statusBar()) && (
+            <CollapsedRow theme={props.theme} label="Health">
+              <text fg={statusBar()!.errors > 0 ? props.theme.error : props.theme.textMuted}>
+                <b>{collapsedStatusBarValue(statusBar())}</b>
+              </text>
+            </CollapsedRow>
+          )}
         </box>
       )}
 
@@ -631,6 +649,57 @@ const SidebarContent = (props: {
                   <StatRow theme={props.theme} label={row.label} value={row.value} tone="muted" />
                 ),
               )}
+            </>
+          )}
+
+          {/* Code Health — the agent status-bar glance, surfaced for users.
+          Hidden until the Tier-2 cache is populated (status_bar undefined),
+          so it never shows fabricated zeros. Errors/warnings are live LSP
+          diagnostics; D/U/C/T come from the last background scan. A `~` on
+          the section header flags the Tier-2 counts as predating the latest
+          edit. */}
+          {statusBar() && (
+            <>
+              <SectionHeader
+                theme={props.theme}
+                title={statusBar()!.tier2_stale ? "Code Health ~" : "Code Health"}
+              />
+              <StatRow
+                theme={props.theme}
+                label="Errors"
+                value={formatCount(statusBar()!.errors)}
+                tone={statusBar()!.errors > 0 ? "err" : "muted"}
+              />
+              <StatRow
+                theme={props.theme}
+                label="Warnings"
+                value={formatCount(statusBar()!.warnings)}
+                tone={statusBar()!.warnings > 0 ? "warn" : "muted"}
+              />
+              <StatRow
+                theme={props.theme}
+                label="Dead Code"
+                value={formatCount(statusBar()!.dead_code)}
+                tone="muted"
+              />
+              <StatRow
+                theme={props.theme}
+                label="Unused Exports"
+                value={formatCount(statusBar()!.unused_exports)}
+                tone="muted"
+              />
+              <StatRow
+                theme={props.theme}
+                label="Duplicates"
+                value={formatCount(statusBar()!.duplicates)}
+                tone="muted"
+              />
+              <StatRow
+                theme={props.theme}
+                label="TODOs"
+                value={formatCount(statusBar()!.todos)}
+                tone="muted"
+              />
             </>
           )}
 

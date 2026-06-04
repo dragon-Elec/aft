@@ -30,6 +30,7 @@ mock.module("solid-js", () => ({
 
 const {
   collapsedCompressionValue,
+  collapsedStatusBarValue,
   formatCompressionSidebarRows,
   resolveTuiStorageDir,
   scopedSidebarSnapshot,
@@ -175,5 +176,41 @@ describe("collapsedCompressionValue (collapsed sidebar row)", () => {
       }),
     );
     expect(value).toBe("0 / 0%");
+  });
+});
+
+describe("collapsedStatusBarValue (collapsed Code Health row)", () => {
+  const bar = (overrides = {}) => ({
+    errors: 0,
+    warnings: 0,
+    dead_code: 0,
+    unused_exports: 0,
+    duplicates: 0,
+    todos: 0,
+    tier2_stale: false,
+    ...overrides,
+  });
+
+  test("returns null when status bar is undefined (Tier-2 not populated)", () => {
+    expect(collapsedStatusBarValue(undefined)).toBeNull();
+  });
+
+  test("renders the agent-bar glance shape", () => {
+    const value = collapsedStatusBarValue(
+      bar({
+        errors: 7,
+        warnings: 13,
+        dead_code: 334,
+        unused_exports: 222,
+        duplicates: 1167,
+        todos: 0,
+      }),
+    );
+    expect(value).toBe("E7 W13 | D334 U222 C1167 | T0");
+  });
+
+  test("prefixes Tier-2 trio with ~ when stale", () => {
+    const value = collapsedStatusBarValue(bar({ dead_code: 5, tier2_stale: true }));
+    expect(value).toBe("E0 W0 | ~D5 U0 C0 | T0");
   });
 });

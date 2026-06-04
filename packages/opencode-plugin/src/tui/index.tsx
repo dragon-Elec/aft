@@ -466,6 +466,55 @@ const StatusDialog = (props: StatusDialogProps) => {
         </box>
       ) : null}
 
+      {/* Code Health — the agent status-bar glance (E/W/D/U/C/T), surfaced so
+          users see the same view agents get. Hidden until the Tier-2 cache is
+          populated (status_bar undefined) so it never shows fabricated zeros.
+          A `~` on the header flags the Tier-2 counts as predating the latest
+          edit. */}
+      {status()?.status_bar ? (
+        <box flexDirection="column" width="100%" marginTop={1}>
+          <text fg={t().text}>
+            <b>{status()!.status_bar!.tier2_stale ? "Code Health ~" : "Code Health"}</b>
+          </text>
+          <R
+            theme={t()}
+            label="Errors"
+            value={formatCountShort(status()!.status_bar!.errors)}
+            tone={status()!.status_bar!.errors > 0 ? "err" : "muted"}
+          />
+          <R
+            theme={t()}
+            label="Warnings"
+            value={formatCountShort(status()!.status_bar!.warnings)}
+            tone={status()!.status_bar!.warnings > 0 ? "warn" : "muted"}
+          />
+          <R
+            theme={t()}
+            label="Dead Code"
+            value={formatCountShort(status()!.status_bar!.dead_code)}
+            tone="muted"
+          />
+          <R
+            theme={t()}
+            label="Unused Exports"
+            value={formatCountShort(status()!.status_bar!.unused_exports)}
+            tone="muted"
+          />
+          <R
+            theme={t()}
+            label="Duplicates"
+            value={formatCountShort(status()!.status_bar!.duplicates)}
+            tone="muted"
+          />
+          <R
+            theme={t()}
+            label="TODOs"
+            value={formatCountShort(status()!.status_bar!.todos)}
+            tone="muted"
+          />
+        </box>
+      ) : null}
+
       {/* Footer */}
       <box marginTop={1} justifyContent="flex-end" width="100%">
         <text fg={t().textMuted}>Enter or Esc to close</text>

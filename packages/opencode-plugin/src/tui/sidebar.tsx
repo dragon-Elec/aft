@@ -185,8 +185,11 @@ export type HealthLightTone = "ok" | "warn" | "err";
 export interface HealthLights {
   // Diagnostics: red if any errors, yellow if any warnings, else green.
   diagnostics: HealthLightTone;
-  // Code cruft: yellow if there is any dead code / unused export / duplicate,
-  // green when all three are zero. Never red — cruft is not a build failure.
+  // Code cruft: yellow if there is any duplicate, green when zero. Never red —
+  // cruft is not a build failure. NOTE: dead_code / unused_exports are
+  // temporarily excluded from this signal (and the expanded rows below) until
+  // the oxc-based resolver lands and makes those counts trustworthy on real
+  // TS/JS codebases. Restore them here when that engine ships.
   code: HealthLightTone;
   // TODOs: yellow if any, else green.
   todos: HealthLightTone;
@@ -199,9 +202,8 @@ export function collapsedHealthLights(statusBar: StatusBar | undefined): HealthL
   const diagnostics: HealthLightTone =
     statusBar.errors > 0 ? "err" : statusBar.warnings > 0 ? "warn" : "ok";
   const code: HealthLightTone =
-    statusBar.dead_code > 0 || statusBar.unused_exports > 0 || statusBar.duplicates > 0
-      ? "warn"
-      : "ok";
+    // statusBar.dead_code > 0 || statusBar.unused_exports > 0 ||  // restore with oxc engine
+    statusBar.duplicates > 0 ? "warn" : "ok";
   const todos: HealthLightTone = statusBar.todos > 0 ? "warn" : "ok";
   return { diagnostics, code, todos };
 }
@@ -565,13 +567,6 @@ const SidebarContent = (props: {
           <CollapsedRow theme={props.theme} label="Semantic Index">
             <text fg={toneColor(props.theme, semanticStatus().tone)}>●</text>
           </CollapsedRow>
-          {collapsedCompressionValue(s()?.compression) && (
-            <CollapsedRow theme={props.theme} label="Compression">
-              <text fg={props.theme.textMuted}>
-                <b>{collapsedCompressionValue(s()?.compression)}</b>
-              </text>
-            </CollapsedRow>
-          )}
           {collapsedHealthLights(statusBar()) && (
             <CollapsedRow theme={props.theme} label="Code Health">
               <box flexDirection="row" gap={1}>
@@ -583,6 +578,13 @@ const SidebarContent = (props: {
                   ●
                 </text>
               </box>
+            </CollapsedRow>
+          )}
+          {collapsedCompressionValue(s()?.compression) && (
+            <CollapsedRow theme={props.theme} label="Compression">
+              <text fg={props.theme.textMuted}>
+                <b>{collapsedCompressionValue(s()?.compression)}</b>
+              </text>
             </CollapsedRow>
           )}
         </box>
@@ -655,26 +657,6 @@ const SidebarContent = (props: {
             tone="muted"
           />
 
-          {/* Compression aggregates. Tabular layout matching Search/Semantic
-          Index above: each scope ("Session", "Project") renders as a
-          subheader followed by two StatRows (Tokens Saved, Compression
-          Ratio). Keeps numbers right-aligned in the value column instead
-          of jamming them after the label on the same line. */}
-          {compressionRows().length > 0 && (
-            <>
-              <SectionHeader theme={props.theme} title="Compression" />
-              {compressionRows().map((row) =>
-                row.kind === "scope" ? (
-                  <box width="100%">
-                    <text fg={props.theme.text}>{row.label}</text>
-                  </box>
-                ) : (
-                  <StatRow theme={props.theme} label={row.label} value={row.value} tone="muted" />
-                ),
-              )}
-            </>
-          )}
-
           {/* Code Health — the agent status-bar glance, surfaced for users.
           Hidden until the Tier-2 cache is populated (status_bar undefined),
           so it never shows fabricated zeros. Errors/warnings are live LSP
@@ -699,7 +681,11 @@ const SidebarContent = (props: {
                 value={formatCount(statusBar()!.warnings)}
                 tone={statusBar()!.warnings > 0 ? "warn" : "muted"}
               />
-              <StatRow
+              {/* Dead Code / Unused Exports temporarily hidden until the
+              oxc-based resolver lands and makes these trustworthy on real
+              TS/JS codebases (current tree-sitter scanner over-reports via
+              barrel re-export gaps). Restore both rows when that ships. */}
+              {/* <StatRow
                 theme={props.theme}
                 label="Dead Code"
                 value={formatCount(statusBar()!.dead_code)}
@@ -710,7 +696,7 @@ const SidebarContent = (props: {
                 label="Unused Exports"
                 value={formatCount(statusBar()!.unused_exports)}
                 tone="muted"
-              />
+              /> */}
               <StatRow
                 theme={props.theme}
                 label="Duplicates"
@@ -723,6 +709,26 @@ const SidebarContent = (props: {
                 value={formatCount(statusBar()!.todos)}
                 tone="muted"
               />
+            </>
+          )}
+
+          {/* Compression aggregates. Tabular layout matching Search/Semantic
+          Index above: each scope ("Session", "Project") renders as a
+          subheader followed by two StatRows (Tokens Saved, Compression
+          Ratio). Keeps numbers right-aligned in the value column instead
+          of jamming them after the label on the same line. */}
+          {compressionRows().length > 0 && (
+            <>
+              <SectionHeader theme={props.theme} title="Compression" />
+              {compressionRows().map((row) =>
+                row.kind === "scope" ? (
+                  <box width="100%">
+                    <text fg={props.theme.text}>{row.label}</text>
+                  </box>
+                ) : (
+                  <StatRow theme={props.theme} label={row.label} value={row.value} tone="muted" />
+                ),
+              )}
             </>
           )}
 

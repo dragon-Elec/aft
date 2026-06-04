@@ -337,8 +337,9 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
       `Code Health${sb.tier2_stale ? " (~ stale)" : ""}`,
       `- errors: ${formatCount(sb.errors)}`,
       `- warnings: ${formatCount(sb.warnings)}`,
-      `- dead code: ${formatCount(sb.dead_code)}`,
-      `- unused exports: ${formatCount(sb.unused_exports)}`,
+      // dead code / unused exports hidden until oxc resolver lands (restore both)
+      // `- dead code: ${formatCount(sb.dead_code)}`,
+      // `- unused exports: ${formatCount(sb.unused_exports)}`,
       `- duplicates: ${formatCount(sb.duplicates)}`,
       `- todos: ${formatCount(sb.todos)}`,
     );
@@ -446,8 +447,9 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
       `### Code Health${sb.tier2_stale ? " (~ stale)" : ""}`,
       `- **Errors:** ${formatCount(sb.errors)}`,
       `- **Warnings:** ${formatCount(sb.warnings)}`,
-      `- **Dead code:** ${formatCount(sb.dead_code)}`,
-      `- **Unused exports:** ${formatCount(sb.unused_exports)}`,
+      // dead code / unused exports hidden until oxc resolver lands (restore both)
+      // `- **Dead code:** ${formatCount(sb.dead_code)}`,
+      // `- **Unused exports:** ${formatCount(sb.unused_exports)}`,
       `- **Duplicates:** ${formatCount(sb.duplicates)}`,
       `- **TODOs:** ${formatCount(sb.todos)}`,
     );

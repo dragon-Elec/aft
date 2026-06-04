@@ -488,7 +488,9 @@ const StatusDialog = (props: StatusDialogProps) => {
             value={formatCountShort(status()!.status_bar!.warnings)}
             tone={status()!.status_bar!.warnings > 0 ? "warn" : "muted"}
           />
-          <R
+          {/* Dead Code / Unused Exports hidden until the oxc resolver lands
+          (current scanner over-reports on barrel re-exports). Restore both. */}
+          {/* <R
             theme={t()}
             label="Dead Code"
             value={formatCountShort(status()!.status_bar!.dead_code)}
@@ -499,7 +501,7 @@ const StatusDialog = (props: StatusDialogProps) => {
             label="Unused Exports"
             value={formatCountShort(status()!.status_bar!.unused_exports)}
             tone="muted"
-          />
+          /> */}
           <R
             theme={t()}
             label="Duplicates"

@@ -211,13 +211,17 @@ describe("collapsedHealthLights (collapsed Code Health traffic lights)", () => {
     expect(collapsedHealthLights(bar({ warnings: 3 }))?.diagnostics).toBe("warn");
   });
 
-  test("code light: yellow when any Tier-2 category is non-zero", () => {
-    expect(collapsedHealthLights(bar({ dead_code: 1 }))?.code).toBe("warn");
-    expect(collapsedHealthLights(bar({ unused_exports: 1 }))?.code).toBe("warn");
+  test("code light: yellow when duplicates are non-zero", () => {
     expect(collapsedHealthLights(bar({ duplicates: 1167 }))?.code).toBe("warn");
   });
 
-  test("code light: green only when all three Tier-2 categories are zero", () => {
+  test("code light: dead_code / unused_exports do NOT drive the light (hidden until oxc engine)", () => {
+    // Until the oxc resolver lands, dead_code/unused_exports are excluded from
+    // the user-facing health signal because the tree-sitter scanner over-reports.
+    expect(collapsedHealthLights(bar({ dead_code: 999, unused_exports: 999 }))?.code).toBe("ok");
+  });
+
+  test("code light: green when duplicates are zero", () => {
     expect(
       collapsedHealthLights(bar({ dead_code: 0, unused_exports: 0, duplicates: 0 }))?.code,
     ).toBe("ok");

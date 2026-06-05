@@ -14,9 +14,8 @@
 //!    rules for the long tail of CLI tools. Loaded from builtin / user /
 //!    project sources via [`toml_filter::build_registry`]. See
 //!    [`toml_filter`] and [`trust`] for the trust model.
-//! 5. **[`generic`] fallback** — ANSI strip + consecutive-dedup +
-//!    middle-truncate. Always applies when no Rust module or TOML filter
-//!    matches.
+//! 5. **[`generic`] fallback** — ANSI strip + consecutive-dedup. The
+//!    background bash registry owns the shared final output cap.
 
 pub mod biome;
 pub mod builtin_filters;

@@ -1,6 +1,7 @@
 //! Background bash task management. Phase 0 stub; Phase 1 Track D fills in.
 
 pub mod buffer;
+pub mod output;
 pub mod persistence;
 pub mod process;
 pub mod pty_process;

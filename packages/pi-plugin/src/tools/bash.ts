@@ -935,11 +935,13 @@ async function formatBashStatus(
     text += `
 ${formatWaitSummary(details.waited, details)}`;
   if (details.mode === "pty") {
+    // PTY output is rendered from the raw terminal spill file; never feed it
+    // through the piped-output compression/line renderer.
     text += await formatPtyStatus(extCtx, taskId, details, requestedOutputMode);
   } else {
     if (isTerminalStatus(details.status) && details.output_preview) {
       text += `
-${details.output_preview.slice(0, 2000)}`;
+${details.output_preview}`;
     }
     if (!isTerminalStatus(details.status)) {
       text += `
@@ -1048,19 +1050,14 @@ function renderBashResult(
   container.clear();
   container.addChild(new Spacer(1));
 
-  // Output preview — last 25 lines, matching Pi built-in bash behaviour
+  // Output preview is already capped by Rust's coordinated bash-output policy.
   const rawOutput = result.content
     .filter((c) => c.type === "text")
     .map((c) => (c as { text?: string }).text ?? "")
     .join("\n")
     .trim();
   if (rawOutput) {
-    const lines = rawOutput.split("\n");
-    const preview =
-      lines.length > 25
-        ? `... (${lines.length - 25} lines omitted)\n${lines.slice(-25).join("\n")}`
-        : rawOutput;
-    container.addChild(new Text(preview, 1, 0));
+    container.addChild(new Text(rawOutput, 1, 0));
     container.addChild(new Spacer(1));
   }
 

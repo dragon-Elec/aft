@@ -223,6 +223,54 @@ describe("Pi bash PTY layer", () => {
     expect(text(result)).toContain("wide");
   });
 
+  test("bash_status preserves full coordinated non-PTY preview", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const preview = `BEGIN-${"x".repeat(2500)}-END`;
+    const { ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "completed",
+      exit_code: 0,
+      mode: "pipes",
+      output_preview: preview,
+    }));
+    registerBashTool(api(tools), pluginCtx);
+
+    const result = await tools
+      .get("bash_status")!
+      .execute("call", { task_id: "bash-long-preview" }, undefined, undefined, {
+        cwd: process.cwd(),
+      });
+
+    expect(text(result)).toContain(preview);
+    expect(text(result)).toContain("-END");
+  });
+
+  test("bash_status PTY path ignores compressed output_preview", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const outputPath = await spill("raw pty bytes");
+    const { ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "completed",
+      mode: "pty",
+      output_path: outputPath,
+      output_preview: "COMPRESSED PIPE PREVIEW SHOULD NOT RENDER",
+    }));
+    registerBashTool(api(tools), pluginCtx);
+
+    const result = await tools
+      .get("bash_status")!
+      .execute(
+        "call",
+        { task_id: "bash-pty-raw-guard", output_mode: "raw" },
+        undefined,
+        undefined,
+        { cwd: process.cwd() },
+      );
+
+    expect(text(result)).toContain("raw pty bytes");
+    expect(text(result)).not.toContain("COMPRESSED PIPE PREVIEW");
+  });
+
   test("bash_status cache reuses terminal across calls", async () => {
     const outputPath = await spill("first");
     const tools = new Map<string, MockToolDef>();

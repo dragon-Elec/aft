@@ -147,7 +147,7 @@ function formatWatchResultText(
   }
   const preview = data.output_preview as string | undefined;
   if (preview && status !== "running") {
-    text += `\n${preview.slice(0, 2000)}`;
+    text += `\n${preview}`;
   }
   return text;
 }

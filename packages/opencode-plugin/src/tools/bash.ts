@@ -428,11 +428,13 @@ async function formatBashStatusText(
     typeof data.duration_ms === "number" ? ` ${Math.round(data.duration_ms / 1000)}s` : "";
   let text = `Task ${taskId}: ${status}${exit}${dur}`;
   if (data.mode === "pty") {
+    // PTY output is rendered from the raw terminal spill file; never feed it
+    // through the piped-output compression/line renderer.
     text += await formatPtyStatus(runtime, taskId, data, requestedOutputMode);
   } else {
     const preview = data.output_preview as string | undefined;
     if (preview && status !== "running") {
-      text += `\n${preview.slice(0, 2000)}`;
+      text += `\n${preview}`;
     }
     if (status === "running") {
       text += `\nA completion reminder will be delivered automatically; don't poll.`;

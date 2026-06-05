@@ -14,8 +14,6 @@ use crate::protocol::{RawRequest, Response, ERROR_PERMISSION_REQUIRED};
 // layer's polling wait-window, decoupled from the task budget. See council
 // decision in .alfonso/athena/council-aft-bash-timeout-design-5f25c3ee503ab303/
 // for the full rationale.
-#[cfg(test)]
-const INLINE_OUTPUT_LIMIT: usize = 30 * 1024;
 const DEFAULT_PTY_ROWS: u16 = 24;
 const DEFAULT_PTY_COLS: u16 = 80;
 const MAX_PTY_ROWS: u16 = 60;
@@ -296,90 +294,11 @@ where
     ))
 }
 
-/// Compute the byte index where the last `INLINE_OUTPUT_LIMIT` bytes of
-/// `output` start, snapped forward to a UTF-8 character boundary so we
-/// never split a multi-byte char.
-///
-/// The earlier implementation walked `char_indices().rev().find_map(...)`,
-/// which returned the LAST char's start index on the very first iteration
-/// (because `output.len() - idx == 1 <= INLINE_OUTPUT_LIMIT`). That bug
-/// made the inline preview a single character for any output above the
-/// limit. This helper computes the suffix start by byte arithmetic and
-/// keeps approximately `INLINE_OUTPUT_LIMIT` trailing bytes intact.
-#[cfg(test)]
-fn inline_output_suffix_start(output: &str) -> usize {
-    let mut start = output.len().saturating_sub(INLINE_OUTPUT_LIMIT);
-    while start < output.len() && !output.is_char_boundary(start) {
-        start += 1;
-    }
-    start
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(windows)]
     use crate::windows_shell::WindowsShell;
-
-    /// Regression: prior reverse `char_indices` logic returned only the LAST
-    /// character of `output` because the first reverse-iteration index already
-    /// satisfied `output.len() - idx == 1 <= INLINE_OUTPUT_LIMIT`. The new
-    /// implementation must keep approximately `INLINE_OUTPUT_LIMIT` trailing
-    /// bytes intact for ASCII input.
-    #[test]
-    fn inline_output_suffix_keeps_full_limit_for_ascii() {
-        let total = INLINE_OUTPUT_LIMIT * 2;
-        let output: String = "x".repeat(total);
-        let start = inline_output_suffix_start(&output);
-        let suffix_len = output.len() - start;
-        assert!(
-            suffix_len > INLINE_OUTPUT_LIMIT / 2,
-            "ascii suffix too short: got {suffix_len} bytes (limit={INLINE_OUTPUT_LIMIT})"
-        );
-        assert!(
-            suffix_len <= INLINE_OUTPUT_LIMIT,
-            "ascii suffix exceeded limit: got {suffix_len} bytes (limit={INLINE_OUTPUT_LIMIT})"
-        );
-        // Guard against a regression to the 1-char bug.
-        assert!(suffix_len > 1, "suffix collapsed to a single character");
-    }
-
-    /// The suffix-start index must always land on a UTF-8 char boundary so
-    /// `output[start..]` is a valid `&str`. Multi-byte chars (like 4-byte
-    /// emoji) require boundary snapping when the raw byte split lands inside
-    /// a code point.
-    #[test]
-    fn inline_output_suffix_respects_utf8_boundaries() {
-        // Each crab is 4 bytes. 20_000 of them = 80_000 bytes, well over the
-        // inline limit. The byte index `len - INLINE_OUTPUT_LIMIT` is unlikely
-        // to be a 4-byte boundary.
-        let output: String = "🦀".repeat(20_000);
-        let start = inline_output_suffix_start(&output);
-        assert!(
-            output.is_char_boundary(start),
-            "suffix split a multi-byte char"
-        );
-        // Slicing must succeed without panic.
-        let suffix = &output[start..];
-        let suffix_bytes = suffix.len();
-        assert!(
-            suffix_bytes <= INLINE_OUTPUT_LIMIT + 4,
-            "utf8 suffix far above limit: got {suffix_bytes} bytes (limit={INLINE_OUTPUT_LIMIT})"
-        );
-        assert!(
-            suffix_bytes > INLINE_OUTPUT_LIMIT / 2,
-            "utf8 suffix too short: got {suffix_bytes} bytes (limit={INLINE_OUTPUT_LIMIT})"
-        );
-    }
-
-    /// Output below the inline limit is returned by `maybe_truncate` directly,
-    /// but the helper must still return `0` so callers slicing `output[start..]`
-    /// get the full string.
-    #[test]
-    fn inline_output_suffix_returns_zero_for_short_input() {
-        let output = "small";
-        assert_eq!(inline_output_suffix_start(output), 0);
-    }
 
     /// Issue #27: `WindowsShell::args` must produce shell-appropriate flags.
     /// PowerShell variants need `-Command <string>`; cmd.exe needs `/D /C

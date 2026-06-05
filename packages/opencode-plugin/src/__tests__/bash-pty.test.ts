@@ -163,6 +163,44 @@ describe("OpenCode bash PTY layer", () => {
     expect(result).toContain("wide");
   });
 
+  test("bash_status preserves full coordinated non-PTY preview", async () => {
+    const preview = `BEGIN-${"x".repeat(2500)}-END`;
+    const { ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "completed",
+      exit_code: 0,
+      mode: "pipes",
+      output_preview: preview,
+    }));
+
+    const result = await createBashStatusTool(pluginCtx).execute(
+      { taskId: "bash-long-preview" },
+      runtime(),
+    );
+
+    expect(result).toContain(preview);
+    expect(result).toContain("-END");
+  });
+
+  test("bash_status PTY path ignores compressed output_preview", async () => {
+    const outputPath = await spill("raw pty bytes");
+    const { ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "completed",
+      mode: "pty",
+      output_path: outputPath,
+      output_preview: "COMPRESSED PIPE PREVIEW SHOULD NOT RENDER",
+    }));
+
+    const result = await createBashStatusTool(pluginCtx).execute(
+      { taskId: "bash-pty-raw-guard", outputMode: "raw" },
+      runtime(),
+    );
+
+    expect(result).toContain("raw pty bytes");
+    expect(result).not.toContain("COMPRESSED PIPE PREVIEW");
+  });
+
   test("Test 26: bash_status cache reuses terminal across calls", async () => {
     const outputPath = await spill("first");
     const { ctx: pluginCtx } = ctx(() => ({

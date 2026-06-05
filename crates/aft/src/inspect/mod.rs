@@ -10,6 +10,7 @@ pub mod tier2_scheduler;
 
 pub use cache::{ContributionRecord, InspectCache, InspectCacheError};
 pub use dispatch::{DispatchHandles, InspectWorker};
+pub(crate) use entry_points::resolve_entry_points;
 pub use freshness::{contribution_is_fresh, verify_contribution_file, ContributionFreshness};
 pub use job::{
     CallgraphExport, CallgraphOutboundCall, CallgraphSnapshot, FileContribution, InspectCategory,

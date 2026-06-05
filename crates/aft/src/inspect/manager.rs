@@ -2077,3 +2077,511 @@ mod guard_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod dead_code_projection_tests {
+    use super::*;
+    use crate::callgraph::walk_project_files;
+    use crate::callgraph_store::{project_dead_code_snapshot, CallGraphStore};
+    use crate::config::Config;
+    use crate::parser::SymbolCache;
+    use filetime::FileTime;
+    use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
+    use std::sync::RwLock;
+
+    static NEXT_MTIME: AtomicI64 = AtomicI64::new(1_900_000_000);
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ComparableSnapshot {
+        files: BTreeSet<PathBuf>,
+        exported_symbols: BTreeSet<(PathBuf, String, String, u32)>,
+        outbound_calls: BTreeSet<(PathBuf, String, String, u32)>,
+        entry_points: BTreeSet<PathBuf>,
+    }
+
+    #[test]
+    fn dead_code_projection_matches_builder_byte_parity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_projection_fixture(dir.path());
+        let root = canonical_root(dir.path());
+        let old = legacy_snapshot(&root);
+        let projected = store_projected_snapshot(&root, ".store-dead-code-parity");
+
+        assert_snapshot_parts_eq("fixture byte parity", &old, &projected);
+        assert_projection_fixture_coverage(&root, &projected);
+    }
+
+    #[test]
+    fn dead_code_projection_incremental_scenario_matrix_matches_cold_rebuild() {
+        run_projection_scenario("rename", setup_projection_rename, edit_projection_rename);
+        run_projection_scenario("delete", setup_projection_delete, edit_projection_delete);
+        run_projection_scenario(
+            "barrel delete",
+            setup_projection_barrel,
+            edit_projection_barrel_delete,
+        );
+        run_projection_scenario(
+            "dispatch edit",
+            setup_projection_dispatch,
+            edit_projection_dispatch,
+        );
+        run_projection_scenario(
+            "body-only edit",
+            setup_projection_body_only,
+            edit_projection_body_only,
+        );
+    }
+
+    #[test]
+    fn dead_code_projection_dead_code_scan_matches_builder_verdicts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_projection_fixture(dir.path());
+        let root = canonical_root(dir.path());
+        let files = project_files(&root);
+        let old = legacy_snapshot(&root);
+        let projected = store_projected_snapshot(&root, ".store-dead-code-e2e");
+        assert_snapshot_parts_eq("e2e fixture byte parity", &old, &projected);
+
+        let old_aggregate = dead_code_aggregate(&root, files.clone(), old);
+        let projected_aggregate = dead_code_aggregate(&root, files, projected);
+        assert_eq!(
+            serde_json::to_string(&projected_aggregate).expect("projected aggregate json"),
+            serde_json::to_string(&old_aggregate).expect("legacy aggregate json"),
+            "store-projected dead_code verdicts must match builder verdicts\nlegacy: {old_aggregate:#}\nprojected: {projected_aggregate:#}"
+        );
+        assert_dead_item(&projected_aggregate, "src/dead.ts", "knownDead");
+        assert_live_item(&projected_aggregate, "src/live.ts", "knownLive");
+        assert_live_item(&projected_aggregate, "src/render.ts", "render");
+        assert_live_item(&projected_aggregate, "src/other_render.ts", "render");
+    }
+
+    fn assert_projection_fixture_coverage(root: &Path, snapshot: &CallgraphSnapshot) {
+        let comparable = comparable_snapshot(snapshot);
+        assert!(
+            comparable
+                .files
+                .iter()
+                .any(|file| file.extension().and_then(|ext| ext.to_str()) == Some("ts")),
+            "fixture must include TypeScript files: {:#?}",
+            comparable.files
+        );
+        assert!(
+            comparable
+                .files
+                .iter()
+                .any(|file| file.extension().and_then(|ext| ext.to_str()) == Some("js")),
+            "fixture must include JavaScript files: {:#?}",
+            comparable.files
+        );
+        assert!(
+            comparable
+                .files
+                .iter()
+                .any(|file| file.extension().and_then(|ext| ext.to_str()) == Some("rs")),
+            "fixture must include Rust files: {:#?}",
+            comparable.files
+        );
+
+        let main_file = canonicalize_for_snapshot(&root.join("src/main.ts"));
+        let private_dispatch_target = format!("{}::dispatch", main_file.display());
+        assert!(
+            comparable
+                .outbound_calls
+                .iter()
+                .any(
+                    |(caller_file, caller_symbol, target, _)| caller_file == &main_file
+                        && caller_symbol == "main"
+                        && target == &private_dispatch_target
+                ),
+            "fixture must cover same-file private fallback target {private_dispatch_target}: {:#?}",
+            comparable.outbound_calls
+        );
+        assert!(
+            comparable
+                .outbound_calls
+                .iter()
+                .any(|(_, _, target, _)| target.contains(DISPATCHED_CALLEE_SEPARATOR)),
+            "fixture must cover method-dispatch suffixes: {:#?}",
+            comparable.outbound_calls
+        );
+        assert!(
+            comparable
+                .exported_symbols
+                .iter()
+                .any(|(_, symbol, kind, _)| symbol == "runDefault"
+                    && kind == DEFAULT_EXPORT_MARKER_KIND),
+            "fixture must cover default-export marker rows: {:#?}",
+            comparable.exported_symbols
+        );
+    }
+
+    fn run_projection_scenario(name: &str, setup: fn(&Path), edit: fn(&Path) -> Vec<PathBuf>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        setup(dir.path());
+        let root = canonical_root(dir.path());
+        let files_before = project_files(&root);
+        let incremental_store = CallGraphStore::open(
+            root.join(format!(".store-dead-code-projection-{name}-incremental")),
+            root.clone(),
+        )
+        .expect("open incremental store");
+        incremental_store
+            .cold_build(&files_before)
+            .expect("initial cold build");
+
+        let changed = edit(&root);
+        incremental_store
+            .refresh_files(&changed)
+            .expect("refresh changed files");
+        let incremental = project_dead_code_snapshot(incremental_store.sqlite_path())
+            .expect("project incremental snapshot");
+
+        let cold_store = CallGraphStore::open(
+            root.join(format!(".store-dead-code-projection-{name}-cold")),
+            root.clone(),
+        )
+        .expect("open cold store");
+        cold_store
+            .cold_build(&project_files(&root))
+            .expect("cold rebuild");
+        let cold =
+            project_dead_code_snapshot(cold_store.sqlite_path()).expect("project cold snapshot");
+
+        assert_snapshot_parts_eq(name, &cold, &incremental);
+    }
+
+    fn legacy_snapshot(root: &Path) -> CallgraphSnapshot {
+        build_tier2_callgraph_snapshot(root, usize::MAX)
+            .expect("legacy snapshot")
+            .as_ref()
+            .clone()
+    }
+
+    fn store_projected_snapshot(root: &Path, store_name: &str) -> CallgraphSnapshot {
+        let store =
+            CallGraphStore::open(root.join(store_name), root.to_path_buf()).expect("open store");
+        store
+            .cold_build(&project_files(root))
+            .expect("store cold build");
+        project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot")
+    }
+
+    fn dead_code_aggregate(
+        root: &Path,
+        scope_files: Vec<PathBuf>,
+        snapshot: CallgraphSnapshot,
+    ) -> Value {
+        let job = InspectJob {
+            job_id: 86,
+            key: JobKey::for_project_category(InspectCategory::DeadCode),
+            category: InspectCategory::DeadCode,
+            scope_files,
+            project_root: root.to_path_buf(),
+            inspect_dir: root.join(".aft-cache").join("inspect"),
+            config: Arc::new(Config {
+                project_root: Some(root.to_path_buf()),
+                ..Config::default()
+            }),
+            symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
+            callgraph_snapshot: Some(Arc::new(snapshot)),
+        };
+        crate::inspect::scanners::dead_code::run_dead_code_scan(&job)
+            .outcome
+            .expect("dead_code scan succeeds")
+            .aggregate
+    }
+
+    fn assert_snapshot_parts_eq(
+        label: &str,
+        expected: &CallgraphSnapshot,
+        actual: &CallgraphSnapshot,
+    ) {
+        let expected = comparable_snapshot(expected);
+        let actual = comparable_snapshot(actual);
+        assert_eq!(
+            actual, expected,
+            "{label} store-projected snapshot must match legacy builder snapshot"
+        );
+    }
+
+    fn comparable_snapshot(snapshot: &CallgraphSnapshot) -> ComparableSnapshot {
+        ComparableSnapshot {
+            files: snapshot.files.iter().cloned().collect(),
+            exported_symbols: snapshot
+                .exported_symbols
+                .iter()
+                .map(|export| {
+                    (
+                        export.file.clone(),
+                        export.symbol.clone(),
+                        export.kind.clone(),
+                        export.line,
+                    )
+                })
+                .collect(),
+            outbound_calls: snapshot
+                .outbound_calls
+                .iter()
+                .map(|call| {
+                    (
+                        call.caller_file.clone(),
+                        call.caller_symbol.clone(),
+                        call.target.clone(),
+                        call.line,
+                    )
+                })
+                .collect(),
+            entry_points: snapshot.entry_points.clone(),
+        }
+    }
+
+    fn assert_dead_item(aggregate: &Value, file: &str, symbol: &str) {
+        assert!(
+            aggregate_has_item(aggregate, file, symbol),
+            "expected {file}::{symbol} to be reported dead: {aggregate:#}"
+        );
+    }
+
+    fn assert_live_item(aggregate: &Value, file: &str, symbol: &str) {
+        assert!(
+            !aggregate_has_item(aggregate, file, symbol),
+            "expected {file}::{symbol} to be live/not reported dead: {aggregate:#}"
+        );
+    }
+
+    fn aggregate_has_item(aggregate: &Value, file: &str, symbol: &str) -> bool {
+        let Some(items) = aggregate.get("items").and_then(Value::as_array) else {
+            return false;
+        };
+        items.iter().any(|item| {
+            item.get("file").and_then(Value::as_str) == Some(file)
+                && item.get("symbol").and_then(Value::as_str) == Some(symbol)
+        })
+    }
+
+    fn project_files(root: &Path) -> Vec<PathBuf> {
+        walk_project_files(root).collect()
+    }
+
+    fn canonical_root(root: &Path) -> PathBuf {
+        std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+        std::fs::write(path, content).expect("write fixture");
+        bump_mtime(path);
+    }
+
+    fn bump_mtime(path: &Path) {
+        let secs = NEXT_MTIME.fetch_add(1, AtomicOrdering::SeqCst);
+        filetime::set_file_mtime(path, FileTime::from_unix_time(secs, 0)).expect("bump mtime");
+    }
+
+    fn remove_file(path: &Path) {
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    fn write_projection_fixture(root: &Path) {
+        write_file(
+            &root.join("package.json"),
+            r#"{"name":"dead-code-projection-fixture","type":"module","main":"src/main.ts"}"#,
+        );
+        write_file(
+            &root.join("Cargo.toml"),
+            r#"[package]
+name = "dead_code_projection_fixture"
+version = "0.1.0"
+edition = "2021"
+"#,
+        );
+        write_file(
+            &root.join("src/main.ts"),
+            r#"import runDefault from "./default";
+import { knownLive } from "./live";
+import { jsEntry } from "./app.js";
+
+export function main() {
+  dispatch();
+  runDefault();
+  jsEntry();
+}
+
+function dispatch() {
+  knownLive();
+  const service = { render() {} };
+  service.render();
+}
+"#,
+        );
+        write_file(
+            &root.join("src/default.ts"),
+            r#"export default function runDefault() {}
+"#,
+        );
+        write_file(
+            &root.join("src/live.ts"),
+            r#"export function knownLive() {}
+"#,
+        );
+        write_file(
+            &root.join("src/dead.ts"),
+            r#"export function knownDead() {}
+"#,
+        );
+        write_file(
+            &root.join("src/render.ts"),
+            r#"export function render() {}
+"#,
+        );
+        write_file(
+            &root.join("src/other_render.ts"),
+            r#"export function render() {}
+"#,
+        );
+        write_file(
+            &root.join("src/app.js"),
+            r#"import { jsHelper } from "./js_helper.js";
+
+export function jsEntry() {
+  jsHelper();
+}
+"#,
+        );
+        write_file(
+            &root.join("src/js_helper.js"),
+            r#"export function jsHelper() {}
+"#,
+        );
+        write_file(
+            &root.join("src/lib.rs"),
+            r#"mod util;
+use crate::util::rust_helper;
+
+pub fn rust_entry() {
+    rust_helper();
+}
+"#,
+        );
+        write_file(
+            &root.join("src/util.rs"),
+            r#"pub fn rust_helper() {}
+"#,
+        );
+    }
+
+    fn setup_projection_rename(root: &Path) {
+        write_file(
+            &root.join("a.ts"),
+            r#"export function outer() {
+  inner();
+}
+
+export function inner() {}
+"#,
+        );
+    }
+
+    fn edit_projection_rename(root: &Path) -> Vec<PathBuf> {
+        let path = root.join("a.ts");
+        write_file(
+            &path,
+            r#"export function outer() {
+  renamed();
+}
+
+export function renamed() {}
+"#,
+        );
+        vec![path]
+    }
+
+    fn setup_projection_delete(root: &Path) {
+        write_file(
+            &root.join("main.ts"),
+            r#"import { foo } from "./foo";
+export function main() { foo(); }
+"#,
+        );
+        write_file(&root.join("foo.ts"), "export function foo() {}\n");
+    }
+
+    fn edit_projection_delete(root: &Path) -> Vec<PathBuf> {
+        let path = root.join("foo.ts");
+        remove_file(&path);
+        vec![path]
+    }
+
+    fn setup_projection_barrel(root: &Path) {
+        write_file(
+            &root.join("main.ts"),
+            r#"import { foo } from "./barrel";
+export function main() { foo(); }
+"#,
+        );
+        write_file(&root.join("barrel.ts"), "export { foo } from \"./foo\";\n");
+        write_file(&root.join("foo.ts"), "export function foo() {}\n");
+    }
+
+    fn edit_projection_barrel_delete(root: &Path) -> Vec<PathBuf> {
+        let path = root.join("barrel.ts");
+        remove_file(&path);
+        vec![path]
+    }
+
+    fn setup_projection_dispatch(root: &Path) {
+        write_file(
+            &root.join("main.ts"),
+            r#"export function main() {
+  const service = { render() {}, paint() {} };
+  service.render();
+}
+"#,
+        );
+        write_file(&root.join("render.ts"), "export function render() {}\n");
+        write_file(&root.join("paint.ts"), "export function paint() {}\n");
+    }
+
+    fn edit_projection_dispatch(root: &Path) -> Vec<PathBuf> {
+        let path = root.join("main.ts");
+        write_file(
+            &path,
+            r#"export function main() {
+  const service = { render() {}, paint() {} };
+  service.paint();
+}
+"#,
+        );
+        vec![path]
+    }
+
+    fn setup_projection_body_only(root: &Path) {
+        write_file(
+            &root.join("main.ts"),
+            r#"import { foo } from "./foo";
+export function main() { foo(); }
+"#,
+        );
+        write_file(
+            &root.join("foo.ts"),
+            r#"export function foo() {
+  return 1;
+}
+"#,
+        );
+    }
+
+    fn edit_projection_body_only(root: &Path) -> Vec<PathBuf> {
+        let path = root.join("foo.ts");
+        write_file(
+            &path,
+            r#"export function foo() {
+  return 2;
+}
+"#,
+        );
+        vec![path]
+    }
+}

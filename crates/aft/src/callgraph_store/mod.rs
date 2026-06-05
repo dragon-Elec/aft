@@ -28,6 +28,9 @@ type ColdBuildSwapObserver = dyn Fn(&Path, &Path) + Send + Sync + 'static;
 static COLD_BUILD_SWAP_OBSERVER: OnceLock<Mutex<Option<Arc<ColdBuildSwapObserver>>>> =
     OnceLock::new();
 
+mod dead_code_projection;
+pub use dead_code_projection::project_dead_code_snapshot;
+
 #[doc(hidden)]
 pub fn set_cold_build_swap_observer(observer: Option<Arc<ColdBuildSwapObserver>>) {
     let slot = COLD_BUILD_SWAP_OBSERVER.get_or_init(|| Mutex::new(None));

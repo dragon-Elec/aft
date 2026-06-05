@@ -535,7 +535,7 @@ export function createBashWatchTool(ctx: PluginContext) {
     name: "bash_watch",
     label: "bash_watch",
     description:
-      "Block on a background bash task until a pattern matches, it exits, or timeout elapses; or register an async pattern notification with background:true.",
+      "Watch a background bash task. Two modes. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use this to be pinged when a specific line appears or the task exits, without freezing your turn. Sync (default) blocks until a pattern matches/the task exits/timeout, and is ONLY for short bounded waits (seconds, e.g. a dev server printing a readiness line). Do NOT sync-wait for a long task (build/test/install): blocking locks the user out until it ends — instead end your turn and let the automatic completion reminder arrive, or use async mode.",
     promptSnippet: "Wait for or watch a background bash task",
     parameters: BashWatchParams,
     async execute(

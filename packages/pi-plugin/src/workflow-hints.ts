@@ -88,7 +88,7 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
 
   if (hasBgBash) {
     sections.push(
-      `**Long-running commands** (builds, installs, full test suites): \`${bashName}({ background: true })\` returns immediately with a \`task_id\`. A completion reminder is delivered automatically — do not poll \`bash_status({ task_id })\`. Use \`bash_status\` only after the reminder arrives, or to inspect a task you already know is complete.`,
+      `**Long-running commands** (builds, installs, full test suites): \`${bashName}({ background: true })\` returns immediately with a \`task_id\`, then **end your turn** — a completion reminder arrives automatically when it finishes. Do not poll \`bash_status({ task_id })\`, and do not sync-wait with \`bash_watch\` for a long task: blocking freezes your turn and locks the user out until it ends. For an early non-blocking ping on a specific output line, register an async watch \`bash_watch({ task_id, pattern, background: true })\`. \`bash_watch\` synchronous mode is only for short bounded waits (seconds, e.g. a dev server printing a readiness line), never for multi-minute jobs.`,
     );
     sections.push(
       `**PTY / interactive commands**: PTY mode is for interactive REPLs and terminal apps (python, node, bash itself, vim). Start with \`${bashName}({ command: "python", pty: true, background: true })\`, read the screen with \`bash_status({ task_id, output_mode: "screen" })\`, and send input with \`bash_write({ task_id, input: "..." })\`.`,

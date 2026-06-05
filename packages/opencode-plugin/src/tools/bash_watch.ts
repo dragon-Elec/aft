@@ -37,7 +37,7 @@ type OutputCursor = { output: number; stderr: number; combined: number };
 export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
   return {
     description:
-      "Block on a background bash task until a pattern matches, it exits, or timeout elapses; or register an async pattern notification with background:true.",
+      "Watch a background bash task. Two modes. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use this to be pinged when a specific line appears or the task exits, without freezing your turn. Sync (default) blocks until a pattern matches/the task exits/timeout, and is ONLY for short bounded waits (seconds, e.g. a dev server printing a readiness line). Do NOT sync-wait for a long task (build/test/install): blocking locks the user out until it ends — instead end your turn and let the automatic completion reminder arrive, or use async mode.",
     args: {
       taskId: z.string().describe("Background task ID returned by bash({ background: true })."),
       pattern: z

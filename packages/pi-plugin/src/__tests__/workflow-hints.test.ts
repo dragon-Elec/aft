@@ -30,8 +30,12 @@ describe("Pi buildWorkflowHints", () => {
     expect(out).toContain("**Long-running commands**");
     // Anti-polling guidance must be present so agents stop calling
     // bash_status back-to-back. Mirrors OpenCode plugin parity.
-    expect(out).toContain("A completion reminder is delivered automatically");
-    expect(out).toContain("do not poll");
+    expect(out).toContain("a completion reminder arrives automatically");
+    expect(out).toContain("Do not poll");
+    // Anti-sync-block steer (parity with OpenCode): end the turn or use async,
+    // never sync-wait bash_watch on a long task.
+    expect(out).toContain("end your turn");
+    expect(out).toContain("do not sync-wait with `bash_watch` for a long task");
     expect(out).toContain("`task_id`");
     expect(out).toContain("`bash_status({ task_id })`");
     expect(out).not.toContain("taskId");

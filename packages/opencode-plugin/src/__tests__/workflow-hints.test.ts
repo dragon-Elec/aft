@@ -34,8 +34,13 @@ describe("buildWorkflowHints", () => {
     expect(out).toContain("`bash({ background: true })`");
     // Anti-polling guidance must be present so agents stop calling
     // bash_status back-to-back when waiting for a background task.
-    expect(out).toContain("A completion reminder is delivered automatically");
-    expect(out).toContain("do not poll");
+    expect(out).toContain("a completion reminder arrives automatically");
+    expect(out).toContain("Do not poll");
+    // Anti-sync-block steer: agents must not sync-wait bash_watch on a long task
+    // (it freezes the turn and locks the user out); end the turn or use async.
+    expect(out).toContain("end your turn");
+    expect(out).toContain("do not sync-wait with `bash_watch` for a long task");
+    expect(out).toContain("background: true");
   });
 
   test("omits long-running bash hint when background bash is off (foreground auto-promotes)", () => {

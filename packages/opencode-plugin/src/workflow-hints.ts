@@ -113,7 +113,7 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   // there's no "30s default" to warn about anymore.
   if (hasBash && hasBgBash) {
     sections.push(
-      `**Long-running commands** (builds, installs, full test suites): \`${bashName}({ background: true })\` returns immediately with a \`taskId\`. A completion reminder is delivered automatically — do not poll \`${bashStatusName}({ taskId })\`. Use \`${bashStatusName}\` only after the reminder arrives, or to inspect a task you already know is complete.`,
+      `**Long-running commands** (builds, installs, full test suites): \`${bashName}({ background: true })\` returns immediately with a \`taskId\`, then **end your turn** — a completion reminder arrives automatically when it finishes. Do not poll \`${bashStatusName}({ taskId })\`, and do not sync-wait with \`bash_watch\` for a long task: blocking freezes your turn and locks the user out until it ends. For an early non-blocking ping on a specific output line, register an async watch \`bash_watch({ taskId, pattern, background: true })\`. \`bash_watch\` synchronous mode is only for short bounded waits (seconds, e.g. a dev server printing a readiness line), never for multi-minute jobs.`,
     );
     sections.push(
       `**PTY / interactive commands**: PTY mode is for interactive REPLs and terminal apps (python, node, bash itself, vim). Start with \`${bashName}({ command: "python", pty: true, background: true })\`, read the screen with \`${bashStatusName}({ taskId, outputMode: "screen" })\`, and send input with \`${bashWriteName}({ taskId, input: "..." })\`.`,

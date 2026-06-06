@@ -1,11 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-use crate::callgraph::{
-    self, CallTreeNode, CallerEntry, CallerGroup, CallersResult, ImpactCaller, ImpactResult,
-    TraceHop, TracePath, TraceToResult, TraceToSymbolCandidate, TraceToSymbolHop,
-    TraceToSymbolResult,
-};
+use serde::Serialize;
+
+use crate::callgraph::{self, TraceToSymbolCandidate};
 use crate::callgraph_store::{
     CallGraphStore, CallGraphStoreError, StoreCallSite, StoreNode, StoreUnresolvedCall,
 };
@@ -13,6 +11,136 @@ use crate::error::AftError;
 use crate::protocol::Response;
 
 pub type StoreAdapterResult<T> = Result<T, CallGraphStoreError>;
+
+#[derive(Debug, Clone, Default)]
+struct EdgeMarker {
+    approximate: bool,
+    resolved_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreCallersResult {
+    pub symbol: String,
+    pub file: String,
+    pub callers: Vec<StoreCallerGroup>,
+    pub total_callers: usize,
+    pub scanned_files: usize,
+    pub depth_limited: bool,
+    pub truncated: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreCallerGroup {
+    pub file: String,
+    pub callers: Vec<StoreCallerEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreCallerEntry {
+    pub symbol: String,
+    pub line: u32,
+    #[serde(skip_serializing_if = "is_false")]
+    pub approximate: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreCallTreeNode {
+    pub name: String,
+    pub file: String,
+    pub line: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    pub resolved: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub approximate: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_by: Option<String>,
+    pub children: Vec<StoreCallTreeNode>,
+    pub depth_limited: bool,
+    pub truncated: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreImpactResult {
+    pub symbol: String,
+    pub file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    pub parameters: Vec<String>,
+    pub total_affected: usize,
+    pub affected_files: usize,
+    pub callers: Vec<StoreImpactCaller>,
+    pub depth_limited: bool,
+    pub truncated: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreImpactCaller {
+    pub caller_symbol: String,
+    pub caller_file: String,
+    pub line: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    pub is_entry_point: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_expression: Option<String>,
+    pub parameters: Vec<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub approximate: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreTraceHop {
+    pub symbol: String,
+    pub file: String,
+    pub line: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    pub is_entry_point: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub approximate: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreTracePath {
+    pub hops: Vec<StoreTraceHop>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreTraceToResult {
+    pub target_symbol: String,
+    pub target_file: String,
+    pub paths: Vec<StoreTracePath>,
+    pub total_paths: usize,
+    pub entry_points_found: usize,
+    pub max_depth_reached: bool,
+    pub truncated_paths: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreTraceToSymbolHop {
+    pub symbol: String,
+    pub file: String,
+    pub line: u32,
+    #[serde(skip_serializing_if = "is_false")]
+    pub approximate: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreTraceToSymbolResult {
+    pub path: Option<Vec<StoreTraceToSymbolHop>>,
+    pub complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
 
 enum ForwardCall {
     Resolved(StoreCallSite),
@@ -55,6 +183,30 @@ struct ResolvedStoreSymbol {
 #[derive(Clone)]
 struct TraceElem {
     node: StoreNode,
+    edge: EdgeMarker,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn edge_marker(site: &StoreCallSite) -> EdgeMarker {
+    if site.approximate() {
+        EdgeMarker {
+            approximate: true,
+            resolved_by: Some(site.resolved_by().to_string()),
+        }
+    } else {
+        EdgeMarker::default()
+    }
+}
+
+fn edge_approximate(site: &StoreCallSite) -> bool {
+    site.approximate()
+}
+
+fn edge_resolved_by(site: &StoreCallSite) -> Option<String> {
+    site.approximate().then(|| site.resolved_by().to_string())
 }
 
 pub fn callers_result(
@@ -62,7 +214,7 @@ pub fn callers_result(
     file: &Path,
     symbol: &str,
     depth: usize,
-) -> StoreAdapterResult<CallersResult> {
+) -> StoreAdapterResult<StoreCallersResult> {
     let target = resolve_symbol_query(store, file, symbol)?;
     let effective_depth = depth.max(1);
     let mut visited = HashSet::new();
@@ -84,23 +236,25 @@ pub fn callers_result(
 
     let sites = dedup_call_sites(sites);
     let total_callers = sites.len();
-    let mut groups: BTreeMap<String, Vec<CallerEntry>> = BTreeMap::new();
+    let mut groups: BTreeMap<String, Vec<StoreCallerEntry>> = BTreeMap::new();
     for site in sites {
         groups
             .entry(site.caller.file.clone())
             .or_default()
-            .push(CallerEntry {
-                symbol: site.caller.symbol,
+            .push(StoreCallerEntry {
+                symbol: site.caller.symbol.clone(),
                 line: site.line,
+                approximate: edge_approximate(&site),
+                resolved_by: edge_resolved_by(&site),
             });
     }
 
-    Ok(CallersResult {
+    Ok(StoreCallersResult {
         symbol: target.representative.symbol,
         file: target.representative.file,
         callers: groups
             .into_iter()
-            .map(|(file, callers)| CallerGroup { file, callers })
+            .map(|(file, callers)| StoreCallerGroup { file, callers })
             .collect(),
         total_callers,
         scanned_files: store.indexed_file_count()?,
@@ -114,7 +268,7 @@ pub fn call_tree_result(
     file: &Path,
     symbol: &str,
     depth: usize,
-) -> StoreAdapterResult<CallTreeNode> {
+) -> StoreAdapterResult<StoreCallTreeNode> {
     let target = resolve_symbol_query(store, file, symbol)?;
     let mut visited = HashSet::new();
     call_tree_inner(store, &target, depth, 0, &mut visited)
@@ -125,7 +279,7 @@ pub fn impact_result(
     file: &Path,
     symbol: &str,
     depth: usize,
-) -> StoreAdapterResult<ImpactResult> {
+) -> StoreAdapterResult<StoreImpactResult> {
     let target = resolve_symbol_query(store, file, symbol)?;
     let effective_depth = depth.max(1);
     let mut visited = HashSet::new();
@@ -156,7 +310,7 @@ pub fn impact_result(
     let mut callers = Vec::new();
     for site in sites {
         affected_files.insert(site.caller.file.clone());
-        callers.push(ImpactCaller {
+        callers.push(StoreImpactCaller {
             caller_symbol: site.caller.symbol.clone(),
             caller_file: site.caller.file.clone(),
             line: site.line,
@@ -172,6 +326,8 @@ pub fn impact_result(
                 .as_deref()
                 .map(|signature| callgraph::extract_parameters(signature, site.caller.lang))
                 .unwrap_or_default(),
+            approximate: edge_approximate(&site),
+            resolved_by: edge_resolved_by(&site),
         });
     }
     callers.sort_by(|left, right| {
@@ -180,7 +336,7 @@ pub fn impact_result(
             .then(left.line.cmp(&right.line))
     });
 
-    Ok(ImpactResult {
+    Ok(StoreImpactResult {
         symbol: target.representative.symbol,
         file: target.representative.file,
         signature: target_signature,
@@ -198,12 +354,13 @@ pub fn trace_to_result(
     file: &Path,
     symbol: &str,
     max_depth: usize,
-) -> StoreAdapterResult<TraceToResult> {
+) -> StoreAdapterResult<StoreTraceToResult> {
     let target = resolve_symbol_query(store, file, symbol)?;
     let effective_max = if max_depth == 0 { 10 } else { max_depth };
 
     let initial = vec![TraceElem {
         node: target.representative.clone(),
+        edge: EdgeMarker::default(),
     }];
     let mut complete_paths = Vec::new();
     if target.representative.is_entry_point {
@@ -241,8 +398,12 @@ pub fn trace_to_result(
             }
             has_new_path = true;
             let mut next_path = path.clone();
+            if let Some(current) = next_path.last_mut() {
+                current.edge = edge_marker(&site);
+            }
             next_path.push(TraceElem {
                 node: site.caller.clone(),
+                edge: EdgeMarker::default(),
             });
             if site.caller.is_entry_point {
                 complete_paths.push(next_path.clone());
@@ -254,22 +415,24 @@ pub fn trace_to_result(
         }
     }
 
-    let mut paths: Vec<TracePath> = complete_paths
+    let mut paths: Vec<StoreTracePath> = complete_paths
         .into_iter()
         .map(|mut elems| {
             elems.reverse();
             let hops = elems
                 .iter()
                 .enumerate()
-                .map(|(index, elem)| TraceHop {
+                .map(|(index, elem)| StoreTraceHop {
                     symbol: elem.node.symbol.clone(),
                     file: elem.node.file.clone(),
                     line: elem.node.line,
                     signature: elem.node.signature.clone(),
                     is_entry_point: index == 0 && elem.node.is_entry_point,
+                    approximate: elem.edge.approximate,
+                    resolved_by: elem.edge.resolved_by.clone(),
                 })
                 .collect();
-            TracePath { hops }
+            StoreTracePath { hops }
         })
         .collect();
     paths.sort_by(|left, right| {
@@ -295,7 +458,7 @@ pub fn trace_to_result(
         .collect::<HashSet<_>>()
         .len();
 
-    Ok(TraceToResult {
+    Ok(StoreTraceToResult {
         target_symbol: target.representative.symbol,
         target_file: target.representative.file,
         total_paths: paths.len(),
@@ -328,7 +491,7 @@ pub fn trace_to_symbol_result(
     to_symbol: &str,
     to_file: Option<&Path>,
     max_depth: usize,
-) -> StoreAdapterResult<TraceToSymbolResult> {
+) -> StoreAdapterResult<StoreTraceToSymbolResult> {
     let origin = resolve_symbol_query(store, file, symbol)?;
     let target_file = to_file.map(|path| relative_file(store, path));
     let effective_max = if max_depth == 0 {
@@ -344,7 +507,7 @@ pub fn trace_to_symbol_result(
         to_symbol,
         target_file.as_deref(),
     ) {
-        return Ok(TraceToSymbolResult {
+        return Ok(StoreTraceToSymbolResult {
             path: Some(vec![start_hop]),
             complete: true,
             reason: None,
@@ -371,26 +534,26 @@ pub fn trace_to_symbol_result(
         if depth >= effective_max {
             if callees
                 .iter()
-                .any(|node| !visited.contains(&(node.file.clone(), node.symbol.clone())))
+                .any(|(node, _)| !visited.contains(&(node.file.clone(), node.symbol.clone())))
             {
                 max_depth_exhausted = true;
             }
             continue;
         }
 
-        for callee in callees {
+        for (callee, edge) in callees {
             if !visited.insert((callee.file.clone(), callee.symbol.clone())) {
                 continue;
             }
             let mut next_path = path.clone();
-            next_path.push(trace_to_symbol_hop(&callee));
+            next_path.push(trace_to_symbol_hop_with_edge(&callee, edge));
             if trace_to_symbol_matches_target(
                 &callee.file,
                 &callee.symbol,
                 to_symbol,
                 target_file.as_deref(),
             ) {
-                return Ok(TraceToSymbolResult {
+                return Ok(StoreTraceToSymbolResult {
                     path: Some(next_path),
                     complete: true,
                     reason: None,
@@ -401,13 +564,13 @@ pub fn trace_to_symbol_result(
     }
 
     if max_depth_exhausted {
-        Ok(TraceToSymbolResult {
+        Ok(StoreTraceToSymbolResult {
             path: None,
             complete: false,
             reason: Some("max_depth_exhausted".to_string()),
         })
     } else {
-        Ok(TraceToSymbolResult {
+        Ok(StoreTraceToSymbolResult {
             path: None,
             complete: true,
             reason: Some("no_path_found".to_string()),
@@ -594,16 +757,18 @@ fn call_tree_inner(
     max_depth: usize,
     current_depth: usize,
     visited: &mut HashSet<(String, String)>,
-) -> StoreAdapterResult<CallTreeNode> {
+) -> StoreAdapterResult<StoreCallTreeNode> {
     let node = &current.representative;
     let visit_key = (node.file.clone(), node.symbol.clone());
     if visited.contains(&visit_key) {
-        return Ok(CallTreeNode {
+        return Ok(StoreCallTreeNode {
             name: node.symbol.clone(),
             file: node.file.clone(),
             line: node.line,
             signature: node.signature.clone(),
             resolved: true,
+            approximate: false,
+            resolved_by: None,
             children: Vec::new(),
             depth_limited: false,
             truncated: 0,
@@ -627,35 +792,41 @@ fn call_tree_inner(
                         site.target.clone(),
                     )?;
                     if let Some(child_symbol) = resolved {
-                        let child = call_tree_inner(
+                        let mut child = call_tree_inner(
                             store,
                             &child_symbol,
                             max_depth,
                             current_depth + 1,
                             visited,
                         )?;
+                        child.approximate = edge_approximate(&site);
+                        child.resolved_by = edge_resolved_by(&site);
                         depth_limited |= child.depth_limited;
                         truncated += child.truncated;
                         children.push(child);
                     } else {
-                        children.push(CallTreeNode {
-                            name: site.target_symbol,
-                            file: site.target_file,
+                        children.push(StoreCallTreeNode {
+                            name: site.target_symbol.clone(),
+                            file: site.target_file.clone(),
                             line: site.line,
                             signature: None,
                             resolved: false,
+                            approximate: edge_approximate(&site),
+                            resolved_by: edge_resolved_by(&site),
                             children: Vec::new(),
                             depth_limited: false,
                             truncated: 0,
                         });
                     }
                 }
-                ForwardCall::Unresolved(call) => children.push(CallTreeNode {
+                ForwardCall::Unresolved(call) => children.push(StoreCallTreeNode {
                     name: call.symbol,
                     file: call.caller.file,
                     line: call.line,
                     signature: None,
                     resolved: false,
+                    approximate: false,
+                    resolved_by: None,
                     children: Vec::new(),
                     depth_limited: false,
                     truncated: 0,
@@ -668,12 +839,14 @@ fn call_tree_inner(
     }
 
     visited.remove(&visit_key);
-    Ok(CallTreeNode {
+    Ok(StoreCallTreeNode {
         name: node.symbol.clone(),
         file: node.file.clone(),
         line: node.line,
         signature: node.signature.clone(),
         resolved: true,
+        approximate: false,
+        resolved_by: None,
         children,
         depth_limited,
         truncated,
@@ -713,7 +886,7 @@ fn forward_resolved_callees(
     store: &CallGraphStore,
     file: &str,
     symbol: &str,
-) -> StoreAdapterResult<Vec<StoreNode>> {
+) -> StoreAdapterResult<Vec<(StoreNode, EdgeMarker)>> {
     let Some(current) = resolve_exact_symbol(store, file, symbol, None)? else {
         return Ok(Vec::new());
     };
@@ -737,7 +910,7 @@ fn forward_resolved_callees(
             site.target.clone(),
         )?;
         if let Some(target) = resolved {
-            callees.push(target.representative);
+            callees.push((target.representative, edge_marker(&site)));
         }
     }
     Ok(callees)
@@ -771,11 +944,17 @@ fn call_site_key(site: &StoreCallSite) -> (String, u32, String, String) {
     )
 }
 
-fn trace_to_symbol_hop(node: &StoreNode) -> TraceToSymbolHop {
-    TraceToSymbolHop {
+fn trace_to_symbol_hop(node: &StoreNode) -> StoreTraceToSymbolHop {
+    trace_to_symbol_hop_with_edge(node, EdgeMarker::default())
+}
+
+fn trace_to_symbol_hop_with_edge(node: &StoreNode, edge: EdgeMarker) -> StoreTraceToSymbolHop {
+    StoreTraceToSymbolHop {
         symbol: node.symbol.clone(),
         file: node.file.clone(),
         line: node.line,
+        approximate: edge.approximate,
+        resolved_by: edge.resolved_by,
     }
 }
 

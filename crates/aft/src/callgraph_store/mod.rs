@@ -12,7 +12,7 @@ use crate::symbols::{Range, SymbolKind};
 use rayon::prelude::*;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -21,6 +21,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const SCHEMA_VERSION: i64 = 1;
 const BACKEND_TREESITTER: &str = "treesitter";
 const PROVENANCE_TREESITTER: &str = "treesitter+resolver";
+const PROVENANCE_NAME_MATCH: &str = "name_match";
+const NAME_MATCH_SCORE_THRESHOLD: f64 = 2.0;
 const TOP_LEVEL_SYMBOL: &str = "<top-level>";
 const JS_TS_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 
@@ -195,6 +197,17 @@ pub struct StoreCallSite {
     pub byte_start: usize,
     pub byte_end: usize,
     pub resolved: bool,
+    pub provenance: String,
+}
+
+impl StoreCallSite {
+    pub fn approximate(&self) -> bool {
+        self.provenance == PROVENANCE_NAME_MATCH
+    }
+
+    pub fn resolved_by(&self) -> &str {
+        &self.provenance
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,6 +363,26 @@ struct DispatchHint {
     line: u32,
     byte_start: usize,
     byte_end: usize,
+}
+
+#[derive(Debug, Clone)]
+struct NameMatchRef {
+    ref_id: String,
+    caller_node: String,
+    caller_file: String,
+    receiver: String,
+    method_name: String,
+    colon_dispatch: bool,
+    line: u32,
+    lang: String,
+}
+
+#[derive(Debug, Clone)]
+struct NameMatchCandidate {
+    node_id: String,
+    file_path: String,
+    scoped_name: String,
+    kind: String,
 }
 
 #[derive(Debug, Clone)]
@@ -655,6 +688,7 @@ impl CallGraphStore {
         for resolved in &resolved_refs {
             insert_resolved_ref(&tx, resolved)?;
         }
+        let name_match_edge_count = insert_name_match_edges(&tx, None)?;
         set_meta_ready(&tx, true)?;
         tx.commit()?;
         phase!("sqlite_insert", t);
@@ -663,7 +697,7 @@ impl CallGraphStore {
             files: extracts.len(),
             nodes: node_count,
             refs: ref_count,
-            edges: edge_count,
+            edges: edge_count + name_match_edge_count,
             failed_files: failures
                 .into_iter()
                 .map(|failure| failure.rel_path)
@@ -793,6 +827,8 @@ impl CallGraphStore {
                 }
             }
         }
+
+        insert_name_match_edges(&tx, Some(&own_refresh))?;
 
         tx.commit()?;
         Ok(IncrementalStats {
@@ -1403,7 +1439,7 @@ fn direct_callers_for_tuple(
 ) -> Result<Vec<StoreCallSite>> {
     let mut stmt = conn.prepare(
         "SELECT e.source_node, e.target_node, e.target_file, e.target_symbol, e.line,
-                r.byte_start, r.byte_end, r.status
+                r.byte_start, r.byte_end, r.status, e.provenance
          FROM edges e JOIN refs r ON r.ref_id = e.ref_id
          WHERE e.kind = 'call' AND e.target_file = ?1 AND e.target_symbol = ?2
          ORDER BY e.source_node, r.byte_start, r.line, r.ref_id",
@@ -1418,6 +1454,7 @@ fn direct_callers_for_tuple(
             row.get::<_, i64>(5)?,
             row.get::<_, i64>(6)?,
             row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
         ))
     })?;
 
@@ -1432,6 +1469,7 @@ fn direct_callers_for_tuple(
             byte_start,
             byte_end,
             status,
+            provenance,
         ) = row?;
         let Some(caller) = load_node_by_id(conn, &source_node)? else {
             continue;
@@ -1450,6 +1488,7 @@ fn direct_callers_for_tuple(
             byte_start: byte_start.max(0) as usize,
             byte_end: byte_end.max(0) as usize,
             resolved: status == "resolved",
+            provenance,
         });
     }
     Ok(sites)
@@ -1458,7 +1497,7 @@ fn direct_callers_for_tuple(
 fn outgoing_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
     let mut stmt = conn.prepare(
         "SELECT e.target_node, e.target_file, e.target_symbol, e.line,
-                r.byte_start, r.byte_end, r.status
+                r.byte_start, r.byte_end, r.status, e.provenance
          FROM edges e JOIN refs r ON r.ref_id = e.ref_id
          WHERE e.kind = 'call' AND e.source_node = ?1
          ORDER BY r.byte_start, r.line, r.ref_id",
@@ -1472,12 +1511,22 @@ fn outgoing_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<St
             row.get::<_, i64>(4)?,
             row.get::<_, i64>(5)?,
             row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
         ))
     })?;
 
     let mut calls = Vec::new();
     for row in rows {
-        let (target_node, target_file, target_symbol, line, byte_start, byte_end, status) = row?;
+        let (
+            target_node,
+            target_file,
+            target_symbol,
+            line,
+            byte_start,
+            byte_end,
+            status,
+            provenance,
+        ) = row?;
         let target = target_node
             .as_deref()
             .map(|node_id| load_node_by_id(conn, node_id))
@@ -1492,6 +1541,7 @@ fn outgoing_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<St
             byte_start: byte_start.max(0) as usize,
             byte_end: byte_end.max(0) as usize,
             resolved: status == "resolved",
+            provenance,
         });
     }
     Ok(calls)
@@ -1504,7 +1554,12 @@ fn unresolved_calls_for_node(
     let mut stmt = conn.prepare(
         "SELECT COALESCE(short_name, full_ref, ''), full_ref, line, byte_start, byte_end
          FROM refs
-         WHERE caller_node = ?1 AND kind = 'call' AND status = 'unresolved'
+         WHERE caller_node = ?1
+           AND kind = 'call'
+           AND status = 'unresolved'
+           AND NOT EXISTS (
+               SELECT 1 FROM edges e WHERE e.ref_id = refs.ref_id AND e.kind = 'call'
+           )
          ORDER BY byte_start, line, ref_id",
     )?;
     let rows = stmt.query_map(params![node.node_id], |row| {
@@ -3364,6 +3419,358 @@ fn insert_resolved_ref(tx: &Transaction<'_>, resolved: &ResolvedRef) -> Result<(
         )?;
     }
     Ok(())
+}
+
+fn insert_name_match_edges(
+    tx: &Transaction<'_>,
+    caller_files: Option<&BTreeSet<String>>,
+) -> Result<usize> {
+    let references = load_name_match_refs(tx, caller_files)?;
+    if references.is_empty() {
+        return Ok(0);
+    }
+
+    let mut candidates_by_name: HashMap<(String, String), Vec<NameMatchCandidate>> = HashMap::new();
+    let mut inserted = 0usize;
+    for reference in references {
+        let key = (reference.method_name.clone(), reference.lang.clone());
+        let candidates = match candidates_by_name.entry(key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let candidates =
+                    load_name_match_candidates(tx, &reference.method_name, &reference.lang)?;
+                entry.insert(candidates)
+            }
+        };
+        let Some(candidate) = select_name_match_candidate(&reference, candidates.as_slice()) else {
+            continue;
+        };
+        tx.execute(
+            "INSERT OR REPLACE INTO edges(
+                edge_id, ref_id, source_node, target_node, target_file, target_symbol,
+                kind, line, provenance
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'call', ?7, ?8)",
+            params![
+                ref_id(&[&reference.ref_id, "name_match_edge"]),
+                reference.ref_id,
+                reference.caller_node,
+                candidate.node_id,
+                candidate.file_path,
+                candidate.scoped_name,
+                reference.line as i64,
+                PROVENANCE_NAME_MATCH,
+            ],
+        )?;
+        inserted += 1;
+    }
+    Ok(inserted)
+}
+
+fn load_name_match_refs(
+    tx: &Transaction<'_>,
+    caller_files: Option<&BTreeSet<String>>,
+) -> Result<Vec<NameMatchRef>> {
+    let base_sql = "SELECT r.ref_id, r.caller_node, r.caller_file, r.short_name, r.full_ref,
+                           r.line, f.lang
+                    FROM refs r JOIN files f ON f.path = r.caller_file
+                    WHERE r.kind = 'call'
+                      AND r.status = 'unresolved'
+                      AND r.caller_node IS NOT NULL
+                      AND r.full_ref IS NOT NULL
+                      AND (r.full_ref LIKE '%.%' OR r.full_ref LIKE '%::%')";
+    let mut references = Vec::new();
+
+    if let Some(caller_files) = caller_files {
+        if caller_files.is_empty() {
+            return Ok(references);
+        }
+        let sql = format!(
+            "{base_sql} AND r.caller_file = ?1 ORDER BY r.caller_file, r.byte_start, r.ref_id"
+        );
+        let mut stmt = tx.prepare(&sql)?;
+        for caller_file in caller_files {
+            let rows = stmt.query_map(params![caller_file], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?;
+            for row in rows {
+                let (ref_id, caller_node, caller_file, short_name, full_ref, line, lang) = row?;
+                if let Some(reference) = name_match_ref_from_parts(
+                    ref_id,
+                    caller_node,
+                    caller_file,
+                    short_name,
+                    full_ref,
+                    line,
+                    lang,
+                ) {
+                    references.push(reference);
+                }
+            }
+        }
+        return Ok(references);
+    }
+
+    let sql = format!("{base_sql} ORDER BY r.caller_file, r.byte_start, r.ref_id");
+    let mut stmt = tx.prepare(&sql)?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+    for row in rows {
+        let (ref_id, caller_node, caller_file, short_name, full_ref, line, lang) = row?;
+        if let Some(reference) = name_match_ref_from_parts(
+            ref_id,
+            caller_node,
+            caller_file,
+            short_name,
+            full_ref,
+            line,
+            lang,
+        ) {
+            references.push(reference);
+        }
+    }
+    Ok(references)
+}
+
+fn name_match_ref_from_parts(
+    ref_id: String,
+    caller_node: Option<String>,
+    caller_file: String,
+    short_name: Option<String>,
+    full_ref: Option<String>,
+    line: i64,
+    lang: String,
+) -> Option<NameMatchRef> {
+    let caller_node = caller_node?;
+    let full_ref = full_ref?;
+    let (receiver, member, colon_dispatch) = parse_method_dispatch(&full_ref)?;
+    let method_name = if member.is_empty() {
+        short_name.as_deref()?.to_string()
+    } else {
+        member
+    };
+    Some(NameMatchRef {
+        ref_id,
+        caller_node,
+        caller_file,
+        receiver,
+        method_name,
+        colon_dispatch,
+        line: line.max(0) as u32,
+        lang,
+    })
+}
+
+fn parse_method_dispatch(full_ref: &str) -> Option<(String, String, bool)> {
+    let dot = full_ref.rfind('.').map(|index| (index, 1usize));
+    let colon = full_ref.rfind("::").map(|index| (index, 2usize));
+    let (delimiter, delimiter_len) = match (dot, colon) {
+        (Some(dot), Some(colon)) => {
+            if dot.0 > colon.0 {
+                dot
+            } else {
+                colon
+            }
+        }
+        (Some(dot), None) => dot,
+        (None, Some(colon)) => colon,
+        (None, None) => return None,
+    };
+    if delimiter == 0 {
+        return None;
+    }
+    let member_start = delimiter + delimiter_len;
+    if member_start >= full_ref.len() {
+        return None;
+    }
+    let receiver = last_name_segment(&full_ref[..delimiter]);
+    let member = &full_ref[member_start..];
+    if receiver.is_empty() || member.is_empty() {
+        return None;
+    }
+    Some((receiver.to_string(), member.to_string(), delimiter_len == 2))
+}
+
+fn last_name_segment(value: &str) -> &str {
+    value
+        .rsplit(['.', ':', '/', '\\'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(value)
+}
+
+fn load_name_match_candidates(
+    tx: &Transaction<'_>,
+    method_name: &str,
+    lang: &str,
+) -> Result<Vec<NameMatchCandidate>> {
+    let mut stmt = tx.prepare(
+        "SELECT n.id, n.file_path, n.scoped_name, n.kind
+         FROM nodes n JOIN files f ON f.path = n.file_path
+         WHERE n.name = ?1
+           AND f.lang = ?2
+           AND n.kind IN ('method', 'function')
+         ORDER BY n.file_path, n.scoped_name, n.start_line, n.start_col, n.id",
+    )?;
+    let rows = stmt.query_map(params![method_name, lang], |row| {
+        Ok(NameMatchCandidate {
+            node_id: row.get(0)?,
+            file_path: row.get(1)?,
+            scoped_name: row.get(2)?,
+            kind: row.get(3)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn select_name_match_candidate(
+    reference: &NameMatchRef,
+    candidates: &[NameMatchCandidate],
+) -> Option<NameMatchCandidate> {
+    let candidates = candidates
+        .iter()
+        .filter(|candidate| candidate.node_id != reference.caller_node)
+        .filter(|candidate| candidate_allowed_for_reference(reference, candidate))
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [] => None,
+        [candidate] => Some((**candidate).clone()),
+        _ => select_scored_name_match_candidate(reference, &candidates),
+    }
+}
+
+fn candidate_allowed_for_reference(
+    reference: &NameMatchRef,
+    candidate: &NameMatchCandidate,
+) -> bool {
+    if !reference.colon_dispatch {
+        return true;
+    }
+
+    candidate.kind == "method"
+        && candidate
+            .scoped_name
+            .split("::")
+            .any(|segment| segment == reference.receiver)
+}
+
+fn select_scored_name_match_candidate(
+    reference: &NameMatchRef,
+    candidates: &[&NameMatchCandidate],
+) -> Option<NameMatchCandidate> {
+    let receiver_words = split_camel_case(&reference.receiver);
+    if receiver_words.is_empty() {
+        return None;
+    }
+
+    let mut best: Option<(&NameMatchCandidate, f64)> = None;
+    let mut tied_best = false;
+    for candidate in candidates {
+        let candidate_words = split_camel_case(&candidate.scoped_name);
+        let overlap = receiver_words
+            .iter()
+            .filter(|receiver_word| {
+                candidate_words
+                    .iter()
+                    .any(|candidate_word| candidate_word == *receiver_word)
+            })
+            .count() as f64;
+        let score =
+            overlap + 1.0 + compute_path_proximity(&reference.caller_file, &candidate.file_path);
+        match best {
+            None => {
+                best = Some((*candidate, score));
+                tied_best = false;
+            }
+            Some((_, best_score)) if score > best_score => {
+                best = Some((*candidate, score));
+                tied_best = false;
+            }
+            Some((_, best_score)) if (score - best_score).abs() < f64::EPSILON => {
+                tied_best = true;
+            }
+            _ => {}
+        }
+    }
+
+    let (candidate, score) = best?;
+    if score >= NAME_MATCH_SCORE_THRESHOLD && !tied_best {
+        Some(candidate.clone())
+    } else {
+        None
+    }
+}
+
+fn split_camel_case(value: &str) -> Vec<String> {
+    let chars = value.chars().collect::<Vec<_>>();
+    let mut normalized = String::with_capacity(value.len() + 8);
+    for (index, ch) in chars.iter().enumerate() {
+        let previous = index.checked_sub(1).and_then(|prev| chars.get(prev));
+        let next = chars.get(index + 1);
+        let is_separator = ch.is_whitespace()
+            || matches!(
+                ch,
+                '_' | '.' | ':' | '/' | '\\' | '-' | '<' | '>' | '(' | ')' | '[' | ']'
+            );
+        if is_separator {
+            normalized.push(' ');
+            continue;
+        }
+        let camel_boundary = previous.is_some_and(|prev| {
+            (prev.is_lowercase() && ch.is_uppercase())
+                || (prev.is_ascii_digit() && ch.is_alphabetic())
+                || (prev.is_uppercase()
+                    && ch.is_uppercase()
+                    && next.is_some_and(|next| next.is_lowercase()))
+        });
+        if camel_boundary {
+            normalized.push(' ');
+        }
+        normalized.push(*ch);
+    }
+
+    normalized
+        .split_whitespace()
+        .filter(|word| word.len() > 1)
+        .map(|word| word.to_ascii_lowercase())
+        .collect()
+}
+
+fn compute_path_proximity(left: &str, right: &str) -> f64 {
+    let left_dirs = left
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .unwrap_or_default()
+        .split('/')
+        .filter(|part| !part.is_empty());
+    let right_dirs = right
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .unwrap_or_default()
+        .split('/')
+        .filter(|part| !part.is_empty());
+
+    let shared = left_dirs
+        .zip(right_dirs)
+        .take_while(|(left, right)| left == right)
+        .count();
+    ((shared as f64) * 0.05).min(0.5)
 }
 
 fn mark_backend_state(

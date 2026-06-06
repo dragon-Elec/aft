@@ -50,11 +50,9 @@ pub fn call_node_kinds(lang: LangId) -> Vec<&'static str> {
             "method_invocation",
         ],
         LangId::Lua => vec!["function_call"],
-        LangId::C
-        | LangId::Cpp
-        | LangId::Zig
-        | LangId::CSharp
-        | LangId::Bash
+        LangId::C | LangId::Cpp | LangId::Zig => vec!["call_expression"],
+        LangId::CSharp => vec!["invocation_expression"],
+        LangId::Bash
         | LangId::Scss
         | LangId::Vue
         | LangId::Html
@@ -152,7 +150,14 @@ pub fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Option<Str
         // Simple identifier: foo()
         "identifier" => Some(source[func_node.byte_range()].to_string()),
         // Member access: obj.method() / this.method()
-        "member_expression" | "field_expression" | "attribute" => {
+        "member_expression"
+        | "field_expression"
+        | "attribute"
+        | "member_access_expression"
+        | "qualified_identifier"
+        | "generic_name"
+        | "template_function"
+        | "template_method" => {
             // Last child that's a property_identifier, field_identifier, or identifier
             extract_last_segment(&func_node, source)
         }
@@ -218,6 +223,12 @@ fn extract_computed_member_name(node: &tree_sitter::Node, source: &str) -> Optio
 
 /// Extract the last segment of a member expression (the method/property name).
 pub fn extract_last_segment(node: &tree_sitter::Node, source: &str) -> Option<String> {
+    if let Some(name) = node.child_by_field_name("name") {
+        if let Some(segment) = extract_last_segment(&name, source) {
+            return Some(segment);
+        }
+    }
+
     let child_count = node.child_count();
     // Walk children from the end looking for an identifier-like node
     for i in (0..child_count).rev() {
@@ -225,6 +236,11 @@ pub fn extract_last_segment(node: &tree_sitter::Node, source: &str) -> Option<St
             match child.kind() {
                 "property_identifier" | "field_identifier" | "identifier" => {
                     return Some(source[child.byte_range()].to_string());
+                }
+                "generic_name" | "template_function" | "template_method" => {
+                    if let Some(segment) = extract_last_segment(&child, source) {
+                        return Some(segment);
+                    }
                 }
                 _ => {}
             }
@@ -561,13 +577,17 @@ mod tests {
     use super::*;
     use crate::parser::grammar_for;
 
-    fn parse_typescript(source: &str) -> tree_sitter::Tree {
-        let grammar = grammar_for(LangId::TypeScript);
+    fn parse_source(lang: LangId, source: &str) -> tree_sitter::Tree {
+        let grammar = grammar_for(lang);
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(&grammar)
-            .expect("typescript grammar should initialize");
-        parser.parse(source, None).expect("parse deep source")
+            .expect("grammar should initialize");
+        parser.parse(source, None).expect("parse source")
+    }
+
+    fn parse_typescript(source: &str) -> tree_sitter::Tree {
+        parse_source(LangId::TypeScript, source)
     }
 
     fn deeply_nested_calls(depth: usize) -> String {
@@ -596,6 +616,162 @@ mod tests {
         }
         source.push_str(";\n");
         source
+    }
+
+    fn extracted_call_pairs(lang: LangId, source: &str) -> Vec<(String, String)> {
+        let tree = parse_source(lang, source);
+        extract_calls_full(source, tree.root_node(), 0, source.len(), lang)
+            .into_iter()
+            .map(|(full, short, _, _, _)| (full, short))
+            .collect()
+    }
+
+    fn assert_extracted_call(lang: LangId, source: &str, full: &str, short: &str) {
+        let calls = extracted_call_pairs(lang, source);
+        assert!(
+            calls
+                .iter()
+                .any(|(actual_full, actual_short)| actual_full == full && actual_short == short),
+            "expected {full:?}/{short:?} in {calls:?}"
+        );
+    }
+
+    fn build_fixture_call_data(extension: &str, source: &str) -> crate::callgraph::FileCallData {
+        let dir = tempfile::tempdir().expect("create temp fixture dir");
+        let path = dir.path().join(format!("fixture.{extension}"));
+        std::fs::write(&path, source).expect("write fixture");
+        crate::callgraph::build_file_data(&path).expect("build fixture call data")
+    }
+
+    fn assert_symbol_has_call(
+        data: &crate::callgraph::FileCallData,
+        symbol: &str,
+        full: &str,
+        short: &str,
+    ) {
+        let calls = data
+            .calls_by_symbol
+            .iter()
+            .find(|(name, _)| name.rsplit("::").next().is_some_and(|tail| tail == symbol))
+            .map(|(_, calls)| calls)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected calls for symbol {symbol:?}; available symbols: {:?}",
+                    data.calls_by_symbol.keys().collect::<Vec<_>>()
+                )
+            });
+
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.full_callee == full && call.callee_name == short),
+            "expected {full:?}/{short:?} in calls for {symbol:?}: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn extracts_c_calls_and_attributes_them_to_function_symbols() {
+        let source = r#"
+int foo(void);
+struct Obj { int (*method)(void); };
+void caller(struct Obj *p, struct Obj obj) {
+    foo();
+    obj.method();
+    p->method();
+}
+"#;
+
+        assert_eq!(call_node_kinds(LangId::C), vec!["call_expression"]);
+        assert_extracted_call(LangId::C, source, "foo", "foo");
+        assert_extracted_call(LangId::C, source, "obj.method", "method");
+        assert_extracted_call(LangId::C, source, "p->method", "method");
+
+        let data = build_fixture_call_data("c", source);
+        assert_symbol_has_call(&data, "caller", "foo", "foo");
+        assert_symbol_has_call(&data, "caller", "obj.method", "method");
+        assert_symbol_has_call(&data, "caller", "p->method", "method");
+    }
+
+    #[test]
+    fn extracts_cpp_calls_and_attributes_them_to_function_symbols() {
+        let source = r#"
+namespace Foo { void bar(); }
+struct Painter { void draw(); };
+void foo();
+void caller(Painter *p, Painter obj) {
+    foo();
+    obj.draw();
+    p->draw();
+    Foo::bar();
+    Foo::templ<int>();
+}
+"#;
+
+        assert_eq!(call_node_kinds(LangId::Cpp), vec!["call_expression"]);
+        assert_extracted_call(LangId::Cpp, source, "foo", "foo");
+        assert_extracted_call(LangId::Cpp, source, "obj.draw", "draw");
+        assert_extracted_call(LangId::Cpp, source, "p->draw", "draw");
+        assert_extracted_call(LangId::Cpp, source, "Foo::bar", "bar");
+        assert_extracted_call(LangId::Cpp, source, "Foo::templ<int>", "templ");
+
+        let data = build_fixture_call_data("cpp", source);
+        assert_symbol_has_call(&data, "caller", "foo", "foo");
+        assert_symbol_has_call(&data, "caller", "p->draw", "draw");
+        assert_symbol_has_call(&data, "caller", "Foo::bar", "bar");
+    }
+
+    #[test]
+    fn extracts_csharp_calls_and_attributes_them_to_method_symbols() {
+        let source = r#"
+class Service { public void Find() {} }
+class Program {
+    void Foo() {}
+    void Caller(Service svc) {
+        Foo();
+        svc.Find();
+        Generic<int>();
+    }
+    T Generic<T>() => default;
+}
+"#;
+
+        assert_eq!(
+            call_node_kinds(LangId::CSharp),
+            vec!["invocation_expression"]
+        );
+        assert_extracted_call(LangId::CSharp, source, "Foo", "Foo");
+        assert_extracted_call(LangId::CSharp, source, "svc.Find", "Find");
+        assert_extracted_call(LangId::CSharp, source, "Generic<int>", "Generic");
+
+        let data = build_fixture_call_data("cs", source);
+        assert_symbol_has_call(&data, "Caller", "Foo", "Foo");
+        assert_symbol_has_call(&data, "Caller", "svc.Find", "Find");
+        assert_symbol_has_call(&data, "Caller", "Generic<int>", "Generic");
+    }
+
+    #[test]
+    fn extracts_zig_calls_and_attributes_them_to_function_symbols() {
+        let source = r#"
+fn foo() void {}
+const Obj = struct {
+    fn method(self: *Obj) void {}
+};
+fn caller(obj: *Obj) void {
+    foo();
+    obj.method();
+    std.debug.print("x", .{});
+}
+"#;
+
+        assert_eq!(call_node_kinds(LangId::Zig), vec!["call_expression"]);
+        assert_extracted_call(LangId::Zig, source, "foo", "foo");
+        assert_extracted_call(LangId::Zig, source, "obj.method", "method");
+        assert_extracted_call(LangId::Zig, source, "std.debug.print", "print");
+
+        let data = build_fixture_call_data("zig", source);
+        assert_symbol_has_call(&data, "caller", "foo", "foo");
+        assert_symbol_has_call(&data, "caller", "obj.method", "method");
+        assert_symbol_has_call(&data, "caller", "std.debug.print", "print");
     }
 
     #[test]

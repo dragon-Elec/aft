@@ -199,12 +199,12 @@ const PLUGIN_VERSION: string = (() => {
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.35.3";
+const ANNOUNCEMENT_VERSION = "0.36.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Code Health in the TUI sidebar and `/aft-status`: live LSP errors and warnings plus duplicate and TODO counts, shown as at-a-glance traffic lights when the sidebar is collapsed.",
-  "The semantic index now recovers on its own from a transient embedding-backend blip (a restarted local server, or a model still loading) instead of getting stuck on `failed`.",
-  "Fixed a background codebase-scan crash on very deep or minified files.",
-  "More reliable LSP auto-install when a parent directory has its own `package.json`.",
+  "Persisted call graph: dead-code analysis runs on large repositories again (the file-count cap is gone), `aft_callgraph` queries resolve from disk, and method-call edges are more accurate across more languages.",
+  "Bash output stops hiding failures: piping a test/build through `grep`/`head` with compression on now keeps the failures and summary instead of stripping them.",
+  "Code search steering: guidance and hints now point to `aft_search` and parallel `aft_*` tools instead of `grep`/`find` in bash.",
+  "Fixes: a small `timeout` no longer kills a foreground `bash` command (#102), and `aft_delete`/`aft_safety checkpoint` no longer crash on a mistyped `files` argument.",
 ];
 
 /**

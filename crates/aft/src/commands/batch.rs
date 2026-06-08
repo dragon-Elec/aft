@@ -215,6 +215,26 @@ fn resolve_edit(
             .unwrap_or("");
         let fuzzy_matches = crate::fuzzy_match::find_all_fuzzy(source, match_str);
 
+        // Fuzzy passes (>= 2) are line-based and set the byte range to include
+        // the trailing newline after the last matched line, even when the user's
+        // match had none. Applying `newString` verbatim over that range merges
+        // the last replaced line with the next one (#83). Re-append a newline
+        // when the matched range ended in one and the replacement does not —
+        // mirrors edit_match.rs and batch's own line-range mode. The exact pass
+        // (1) matches byte-for-byte, so its trailing newline is left untouched.
+        let effective_replacement = |m: &crate::fuzzy_match::FuzzyMatch| -> String {
+            let byte_end = m.byte_start + m.byte_len;
+            let range_has_trailing_nl = m.pass >= 2
+                && byte_end > 0
+                && byte_end <= source.len()
+                && source.as_bytes()[byte_end - 1] == b'\n';
+            if range_has_trailing_nl && !replacement.is_empty() && !replacement.ends_with('\n') {
+                format!("{replacement}\n")
+            } else {
+                replacement.to_string()
+            }
+        };
+
         if fuzzy_matches.is_empty() {
             return Err(Response::error(
                 req_id,
@@ -255,7 +275,7 @@ fn resolve_edit(
                 return Ok(ResolvedEdit {
                     byte_start: m.byte_start,
                     byte_end: m.byte_start + m.byte_len,
-                    replacement: replacement.to_string(),
+                    replacement: effective_replacement(m),
                 });
             }
             return Err(Response::error(
@@ -274,7 +294,7 @@ fn resolve_edit(
         Ok(ResolvedEdit {
             byte_start: m.byte_start,
             byte_end: m.byte_start + m.byte_len,
-            replacement: replacement.to_string(),
+            replacement: effective_replacement(m),
         })
     } else if edit_val.get("line_start").is_some() {
         // Line-range replacement

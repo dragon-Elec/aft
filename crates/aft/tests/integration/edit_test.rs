@@ -989,6 +989,50 @@ fn batch_fuzzy_match() {
     assert!(status.success());
 }
 
+// Regression: a batch fuzzy (oldString/newString) match whose range includes
+// the trailing newline (line-based fuzzy passes do) must not merge the last
+// replaced line with the next line when the replacement has no trailing newline
+// (#83 class — edit_match had the fix, batch's string path did not).
+#[test]
+fn batch_fuzzy_preserves_trailing_newline() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_nl.ts");
+    // Trailing spaces force the rstrip fuzzy pass (pass 2).
+    fs::write(
+        &target,
+        "function f() {\n  const a = 1;   \n  const b = 2;   \n  return a + b;\n}\n",
+    )
+    .unwrap();
+
+    let req = serde_json::json!({
+        "id": "b-nl",
+        "command": "batch",
+        "file": target.display().to_string(),
+        "edits": [
+            // Match has no trailing spaces (forces fuzzy) and the replacement has
+            // no trailing newline (the bug condition).
+            { "oldString": "  const a = 1;\n  const b = 2;", "newString": "  const c = 3;" },
+        ]
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+    assert_eq!(resp["success"], true, "batch should succeed: {resp:?}");
+
+    let result = fs::read_to_string(&target).unwrap();
+    assert!(
+        result.contains("  const c = 3;\n  return a + b;"),
+        "the line after the match must not be merged: {result:?}"
+    );
+    assert!(
+        !result.contains("const c = 3;  return a + b;"),
+        "last replaced line merged with the next line: {result:?}"
+    );
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
 #[test]
 fn batch_line_range_edit() {
     let mut aft = AftProcess::spawn();

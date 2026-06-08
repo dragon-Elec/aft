@@ -22,6 +22,27 @@ describe("sanitizeContent", () => {
     expect(out).toContain("/Users/<USER>");
   });
 
+  test("redacts Windows user paths across drives and slash styles", () => {
+    // Other users / non-C: drives / forward-slash forms aren't covered by the
+    // active-home/username passes, so they must be matched structurally — they
+    // would otherwise leak into a public doctor --issue body.
+    const cases: Array<[string, string]> = [
+      ["C:\\Users\\Alice\\project\\x.ts", "C:\\Users\\<USER>"],
+      ["D:\\Users\\Bob\\repo", "D:\\Users\\<USER>"],
+      ["C:/Users/Carol/code/y.ts", "C:/Users/<USER>"],
+      ["E:/Users/Dave/app", "E:/Users/<USER>"],
+    ];
+    for (const [input, expectedPrefix] of cases) {
+      const out = sanitizeContent(input);
+      expect(out).toContain("<USER>");
+      expect(out.startsWith(expectedPrefix)).toBe(true);
+      expect(out).not.toContain("Alice");
+      expect(out).not.toContain("Bob");
+      expect(out).not.toContain("Carol");
+      expect(out).not.toContain("Dave");
+    }
+  });
+
   test("replaces Linux /home/<name>/ with <USER>", () => {
     const input = "Reading /home/bob/.config/opencode/aft.jsonc";
     const out = sanitizeContent(input);

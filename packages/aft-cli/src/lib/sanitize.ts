@@ -113,8 +113,14 @@ export function sanitizeContent(content: string): string {
   }
   sanitized = sanitized.replace(/\/Users\/[^/\s"']+/g, "/Users/<USER>");
   sanitized = sanitized.replace(/\/home\/[^/\s"']+/g, "/home/<USER>");
-  sanitized = sanitized.replace(/C:\\\\Users\\\\[^\\\\"'\s]+/g, "C:\\\\Users\\\\<USER>");
-  sanitized = sanitized.replace(/C:\\Users\\[^\\"'\s]+/g, "C:\\Users\\<USER>");
+  // Windows user dirs, any drive letter, both slash styles, and escaped-backslash
+  // (JSON-encoded) forms. The home/username passes only catch the ACTIVE user;
+  // a log can carry other users' paths or a non-C: drive (e.g. a CI runner or a
+  // pasted path), which would otherwise leak into the public issue body. The
+  // drive letter is preserved (not PII); only the username segment is redacted.
+  sanitized = sanitized.replace(/([A-Za-z]:\\\\Users\\\\)[^\\\\"'\s]+/g, "$1<USER>");
+  sanitized = sanitized.replace(/([A-Za-z]:\\Users\\)[^\\"'\s]+/g, "$1<USER>");
+  sanitized = sanitized.replace(/([A-Za-z]:\/Users\/)[^/\s"']+/g, "$1<USER>");
   if (username) {
     sanitized = sanitized.replace(new RegExp(escapeRegex(username), "g"), "<USER>");
   }

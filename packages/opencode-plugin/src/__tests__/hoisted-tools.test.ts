@@ -331,7 +331,7 @@ describe("Hoisted tool execute handlers", () => {
     }
   });
 
-  failingTest("edit throws the Rust error response for failed replacements", async () => {
+  test("edit throws the Rust error response for failed replacements", async () => {
     tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
@@ -348,14 +348,14 @@ describe("Hoisted tool execute handlers", () => {
     ).rejects.toThrow("Match not found in file");
   });
 
-  // Still `failingTest`: hoisted apply_patch's add-hunk branch checks
-  // `try/catch` around the bridge call, but the bridge returns `success:
-  // false` responses without throwing — so the catch never runs, the hunk
-  // is treated as Created, and the original error message is silently lost.
-  // Separately tracked from the total-failure-throws fix; needs the add path
-  // to assert response.success === true (or throw) before treating the hunk
-  // as a success.
-  failingTest("apply_patch throws the Rust error response when a patch write fails", async () => {
+  // Regression: hoisted apply_patch wraps each hunk's bridge call in try/catch,
+  // but callBridge returns `success: false` responses WITHOUT throwing — so the
+  // catch never ran, the hunk was falsely recorded as Created, and the error
+  // was silently lost. The add/delete/update(+move) branches now convert a
+  // `success: false` response into a throw so it reaches the failure path. For
+  // a move hunk this is critical: a failed destination write must NOT proceed
+  // to delete the source.
+  test("apply_patch throws the Rust error response when a patch write fails", async () => {
     tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
@@ -375,6 +375,47 @@ describe("Hoisted tool execute handlers", () => {
     await expect(tools.apply_patch.execute({ patchText }, sdkCtx)).rejects.toThrow(
       "Disk full while writing patch",
     );
+  });
+
+  // BLOCKER regression: a move hunk whose destination write fails must NOT
+  // delete the source. Before the fix, the destination `write` returning
+  // `{ success: false }` (data, not a throw) was treated as success and the
+  // code proceeded to delete the source — losing the file entirely.
+  test("apply_patch move hunk does not delete source when destination write fails", async () => {
+    tmpDir = await makeTempDir();
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const sourceFile = resolve(tmpDir, "from.ts");
+    await writeFile(sourceFile, "export const moved = 1;\n");
+
+    const patchText = [
+      "*** Begin Patch",
+      "*** Update File: from.ts",
+      "*** Move to: to.ts",
+      "@@",
+      "-export const moved = 1;",
+      "+export const moved = 2;",
+      "*** End Patch",
+    ].join("\n");
+
+    let deleteFileCalled = false;
+    const { tools } = createMockHoistedHarness(async (command) => {
+      if (command === "checkpoint") return { success: true };
+      if (command === "write") return { success: false, message: "Disk full writing destination" };
+      if (command === "delete_file") {
+        deleteFileCalled = true;
+        return { success: true };
+      }
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    await expect(tools.apply_patch.execute({ patchText }, sdkCtx)).rejects.toThrow(
+      "Disk full writing destination",
+    );
+    // Source must be untouched: never deleted, content intact.
+    expect(deleteFileCalled).toBe(false);
+    expect(existsSync(sourceFile)).toBe(true);
+    expect(await readFile(sourceFile, "utf-8")).toBe("export const moved = 1;\n");
   });
 
   test("delete throws when every file in the batch fails", async () => {

@@ -858,6 +858,15 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
 
       const data = await callBridge(ctx, context, command, params);
 
+      // callBridge returns `{ success: false }` responses as DATA (it does not
+      // throw), so a failed edit (match-not-found, ambiguous, syntax rollback,
+      // glob with zero matches) must be surfaced as an error here. Otherwise
+      // formatEditSummary would report a false `Edited (+0/-0).` for an edit
+      // that never applied. Mirrors the write/apply_patch contract.
+      if (data.success === false) {
+        throw new Error((data.message as string) || "edit failed");
+      }
+
       // UI metadata returned directly on the result (see write tool for the
       // rationale; replaces the old metadata-store + after-hook merge that
       // intermittently lost the diff under duplicate plugin loads — GitHub #96).
@@ -1155,6 +1164,12 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
                 include_diff_content: true,
                 multi_file_write_paths: multiFileWritePaths,
               });
+              // callBridge returns `{ success: false }` as data, not a throw,
+              // so without this check a failed write would be falsely recorded
+              // as `Created` and the hunk would never reach `failures`.
+              if (writeResult.success === false) {
+                throw new Error((writeResult.message as string | undefined) ?? "write failed");
+              }
               const wrDiff = writeResult.diff as
                 | { before?: string; after?: string; additions?: number; deletions?: number }
                 | undefined;
@@ -1192,7 +1207,12 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
           case "delete": {
             try {
               const before = await fs.promises.readFile(filePath, "utf-8").catch(() => "");
-              await callBridge(ctx, context, "delete_file", { file: filePath });
+              const deleteResult = await callBridge(ctx, context, "delete_file", {
+                file: filePath,
+              });
+              if (deleteResult.success === false) {
+                throw new Error((deleteResult.message as string | undefined) ?? "delete failed");
+              }
               // delete_file doesn't return a diff. The counts are unambiguous:
               // every prior line is a deletion; nothing is added.
               perFileDiffs.push({
@@ -1228,6 +1248,15 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
                 include_diff_content: true,
                 multi_file_write_paths: multiFileWritePaths,
               });
+              // CRITICAL for move hunks: the destination write returns
+              // `{ success: false }` as data, not a throw. Without this check a
+              // failed destination write would be treated as success and the
+              // code below would proceed to DELETE THE SOURCE — losing the file
+              // entirely. Throwing here routes to the catch → `failures` and
+              // leaves the source intact.
+              if (writeResult.success === false) {
+                throw new Error((writeResult.message as string | undefined) ?? "write failed");
+              }
 
               // Collect diagnostics from this file
               const diags = writeResult.lsp_diagnostics as
@@ -1398,7 +1427,15 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         // numbers (e.g. +399/-400 for a single-line removal). See
         // perFileDiffs population above for how counts are derived per
         // hunk type.
-        const files = hunks.map((h) => {
+        // Only successfully-applied hunks belong in the UI metadata. A failed
+        // hunk has no diff entry (its catch pushed to `failures`, not
+        // perFileDiffs), so including it would emit an empty-patch row the UI
+        // drops anyway AND list it under the "Success" title below. Scope to
+        // the hunks that actually landed. (Total failure throws earlier, so
+        // here we're at full or partial success.)
+        const failedPaths = new Set(failures);
+        const appliedHunks = hunks.filter((h) => !failedPaths.has(h.path));
+        const files = appliedHunks.map((h) => {
           const filePath = resolvePathFromProjectRoot(projectRoot, h.path);
           // `move_path` only exists on UpdateHunk variants — narrow first.
           const rawMovePath = h.type === "update" ? h.move_path : undefined;
@@ -1434,13 +1471,18 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         });
 
         // Build title matching built-in: "Success. Updated the following files:\nM path/to/file.ts"
+        // On PARTIAL failure (some hunks failed but others landed), don't claim
+        // "Success" — say so and list only what actually applied.
         const fileList = files
           .map((f) => {
             const prefix = f.type === "add" ? "A" : f.type === "delete" ? "D" : "M";
             return `${prefix} ${f.relativePath}`;
           })
           .join("\n");
-        const title = `Success. Updated the following files:\n${fileList}`;
+        const title =
+          failures.length > 0
+            ? `Partially applied (${files.length} of ${hunks.length}). Updated:\n${fileList}`
+            : `Success. Updated the following files:\n${fileList}`;
 
         // Aggregate unified diff for the top-level metadata.diff field
         // (OpenCode's renderer also uses this for some views).

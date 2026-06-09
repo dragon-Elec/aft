@@ -2118,15 +2118,22 @@ impl SemanticIndex {
             })
             .collect();
 
-        // Sort descending by score
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let keep = top_k.min(scored.len());
+        if keep == 0 {
+            return Vec::new();
+        }
+
+        if keep < scored.len() {
+            scored.select_nth_unstable_by(keep, semantic_score_order);
+            scored.truncate(keep);
+        }
+        scored.sort_by(semantic_score_order);
 
         scored
             .into_iter()
-            .take(top_k)
-            // Keep the sort → take → map ordering explicit: removing the old
-            // `> 0.0` floor cannot evict positive hits because top_k has already
-            // been selected, but it can surface zero-score noise in the tail.
+            // Keep the selected best-first slice mapped without reintroducing the
+            // old `> 0.0` floor: top_k has already been selected, and zero-score
+            // tail entries remain observable when requested.
             .map(|(score, idx)| {
                 let entry = &self.entries[idx];
                 SemanticResult {
@@ -3085,6 +3092,12 @@ fn symbols_to_chunks(
     chunks
 }
 
+fn semantic_score_order(a: &(f32, usize), b: &(f32, usize)) -> std::cmp::Ordering {
+    b.0.partial_cmp(&a.0)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| a.1.cmp(&b.1))
+}
+
 /// Cosine similarity between two vectors
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
@@ -3859,6 +3872,73 @@ Connection: close
         let loaded = SemanticIndex::from_bytes(&bytes, &project).expect("load serialized index");
         assert_eq!(loaded.entries.len(), 0);
         assert!(loaded.file_mtimes.is_empty());
+    }
+
+    #[test]
+    fn semantic_search_bounded_top_k_matches_reference_full_sort() {
+        let project_root = test_project_root();
+        let file = project_root.join("src/lib.rs");
+        let mut index = SemanticIndex::new(project_root, 2);
+        let entries = [
+            ("alpha", vec![1.0, 0.0], false),
+            ("beta", vec![0.0, 1.0], false),
+            ("gamma", vec![1.0, 0.0], false),
+            ("delta", vec![0.5, 0.5], true),
+            ("epsilon", vec![-1.0, 0.0], false),
+        ];
+        for (line, (name, vector, exported)) in entries.into_iter().enumerate() {
+            index.entries.push(EmbeddingEntry {
+                chunk: SemanticChunk {
+                    file: file.clone(),
+                    name: name.to_string(),
+                    kind: SymbolKind::Function,
+                    start_line: line as u32 + 1,
+                    end_line: line as u32 + 1,
+                    exported,
+                    embed_text: name.to_string(),
+                    snippet: format!("fn {name}() {{}}"),
+                },
+                vector,
+            });
+        }
+
+        let query = vec![1.0, 0.0];
+        let top_k = 4;
+        let mut reference: Vec<(f32, usize)> = index
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| {
+                let mut score = cosine_similarity(&query, &entry.vector);
+                if entry.chunk.exported {
+                    score *= 1.1;
+                }
+                (score, idx)
+            })
+            .collect();
+        reference.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let expected: Vec<(String, f32)> = reference
+            .into_iter()
+            .take(top_k)
+            .map(|(score, idx)| (index.entries[idx].chunk.name.clone(), score))
+            .collect();
+
+        let actual: Vec<(String, f32)> = index
+            .search(&query, top_k)
+            .into_iter()
+            .map(|result| (result.name, result.score))
+            .collect();
+
+        assert_eq!(
+            actual.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            expected.iter().map(|(name, _)| name).collect::<Vec<_>>()
+        );
+        for ((_, actual_score), (_, expected_score)) in actual.iter().zip(expected.iter()) {
+            assert!((actual_score - expected_score).abs() < 1e-6);
+        }
+        assert_eq!(actual[0].0, "alpha");
+        assert_eq!(actual[1].0, "gamma", "equal scores keep insertion order");
+        assert!(index.search(&query, 0).is_empty());
     }
 
     #[test]

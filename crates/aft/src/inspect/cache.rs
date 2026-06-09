@@ -317,6 +317,7 @@ pub struct InspectCache {
 impl InspectCache {
     pub fn open(inspect_dir: PathBuf, project_root: PathBuf) -> Result<Self, InspectCacheError> {
         std::fs::create_dir_all(&inspect_dir)?;
+        let project_root = canonical_project_root(&project_root);
         let project_key = crate::search_index::project_cache_key(&project_root);
         let sqlite_path = inspect_dir.join(format!("{project_key}.sqlite"));
         let conn = Connection::open(&sqlite_path)?;
@@ -334,6 +335,7 @@ impl InspectCache {
         inspect_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Option<Self>, InspectCacheError> {
+        let project_root = canonical_project_root(&project_root);
         let project_key = crate::search_index::project_cache_key(&project_root);
         let sqlite_path = inspect_dir.join(format!("{project_key}.sqlite"));
         if !sqlite_path.is_file() {
@@ -1104,6 +1106,26 @@ fn update_contribution_fingerprint_hash(
     hasher.update(&file_size.to_le_bytes());
     hasher.update(&[0]);
     hasher.update(file_hash.as_bytes());
+}
+
+pub(crate) fn canonical_project_root(project_root: &Path) -> PathBuf {
+    fs::canonicalize(project_root).unwrap_or_else(|_| normalize_path(project_root))
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !result.pop() {
+                    result.push(component);
+                }
+            }
+            other => result.push(other.as_os_str()),
+        }
+    }
+    result
 }
 
 fn relative_string(project_root: &Path, path: &Path) -> String {

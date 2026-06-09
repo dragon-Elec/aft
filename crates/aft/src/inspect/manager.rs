@@ -8,7 +8,7 @@ use crossbeam_channel::{after, bounded, select, Receiver, Sender};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::cache::{InspectCache, Tier2ContributionUpdates};
+use super::cache::{canonical_project_root, InspectCache, Tier2ContributionUpdates};
 use super::dispatch::{default_worker, start_dispatch_loop, InspectWorker};
 use super::freshness::ContributionFreshness;
 use super::job::{
@@ -33,6 +33,12 @@ struct Waiter {
 struct CachedContributionFreshness {
     file_path: PathBuf,
     freshness: FileFreshness,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct InspectCacheIdentity {
+    sqlite_path: PathBuf,
+    project_root: PathBuf,
 }
 
 #[derive(PartialEq, Eq)]
@@ -67,7 +73,7 @@ pub struct InspectManager {
     #[allow(dead_code)]
     pool: Arc<rayon::ThreadPool>,
     in_flight: Mutex<HashMap<JobKey, Vec<Waiter>>>,
-    caches: Mutex<HashMap<PathBuf, Arc<InspectCache>>>,
+    caches: Mutex<HashMap<InspectCacheIdentity, Arc<InspectCache>>>,
     soft_deadline: Duration,
     next_job_id: AtomicU64,
     /// Monotonic count of Tier-2 completions delivered via the reuse path
@@ -343,20 +349,25 @@ impl InspectManager {
         inspect_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Arc<InspectCache>, String> {
+        let project_root = canonical_project_root(&project_root);
         let project_key = crate::search_index::project_cache_key(&project_root);
         let sqlite_path = inspect_dir.join(format!("{project_key}.sqlite"));
+        let identity = InspectCacheIdentity {
+            sqlite_path,
+            project_root: project_root.clone(),
+        };
         let mut caches = self
             .caches
             .lock()
             .map_err(|_| "inspect manager cache map lock poisoned".to_string())?;
-        if let Some(cache) = caches.get(&sqlite_path) {
+        if let Some(cache) = caches.get(&identity) {
             return Ok(Arc::clone(cache));
         }
         let cache = Arc::new(
             InspectCache::open(inspect_dir, project_root)
                 .map_err(|error| format!("failed to open inspect cache: {error}"))?,
         );
-        caches.insert(sqlite_path, Arc::clone(&cache));
+        caches.insert(identity, Arc::clone(&cache));
         Ok(cache)
     }
 
@@ -2061,6 +2072,103 @@ mod guard_tests {
             .expect("write fixture");
         }
         dir
+    }
+
+    #[test]
+    fn cache_for_paths_rebinds_same_project_key_to_current_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).expect("create source repo");
+        std::fs::write(
+            source.join("package.json"),
+            r#"{"name":"inspect-cache-fixture","version":"1.0.0"}"#,
+        )
+        .expect("write source manifest");
+        std::fs::write(source.join("index.ts"), "export const source = 1;\n")
+            .expect("write source file");
+        assert!(std::process::Command::new("git")
+            .current_dir(&source)
+            .arg("init")
+            .status()
+            .expect("git init source repo")
+            .success());
+        assert!(std::process::Command::new("git")
+            .current_dir(&source)
+            .args(["add", "."])
+            .status()
+            .expect("git add source repo")
+            .success());
+        assert!(std::process::Command::new("git")
+            .current_dir(&source)
+            .args([
+                "-c",
+                "user.name=AFT Tests",
+                "-c",
+                "user.email=aft-tests@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .status()
+            .expect("git commit source repo")
+            .success());
+
+        let clone = dir.path().join("clone");
+        assert!(std::process::Command::new("git")
+            .args(["clone", "--quiet"])
+            .arg(&source)
+            .arg(&clone)
+            .status()
+            .expect("git clone source repo")
+            .success());
+        std::fs::write(
+            clone.join("package.json"),
+            r#"{"name":"inspect-cache-fixture","version":"2.0.0"}"#,
+        )
+        .expect("write clone manifest edit");
+        assert_eq!(
+            crate::search_index::project_cache_key(&source),
+            crate::search_index::project_cache_key(&clone),
+            "clones with the same root commit should share the sqlite project key"
+        );
+
+        let source = std::fs::canonicalize(source).expect("canonical source root");
+        let clone = std::fs::canonicalize(clone).expect("canonical clone root");
+        let manager = InspectManager::new();
+        let inspect_dir = dir.path().join("inspect");
+        let key = JobKey::for_project_category(InspectCategory::DeadCode);
+        let source_cache = manager
+            .cache_for_paths(inspect_dir.clone(), source.clone())
+            .expect("open source cache");
+        let source_hash = source_cache
+            .contribution_set_hash(InspectCategory::DeadCode)
+            .expect("source contribution hash");
+        source_cache
+            .store_tier2_aggregate(
+                key.clone(),
+                &source_hash,
+                serde_json::json!({ "count": 7, "items": [] }),
+            )
+            .expect("store source aggregate");
+        assert_eq!(
+            source_cache
+                .get_aggregated(&key)
+                .expect("read source aggregate")
+                .and_then(|payload| payload.get("count").and_then(Value::as_u64)),
+            Some(7)
+        );
+
+        let clone_cache = manager
+            .cache_for_paths(inspect_dir, clone.clone())
+            .expect("open clone cache");
+        assert_eq!(clone_cache.project_root(), clone.as_path());
+        assert!(
+            clone_cache
+                .get_aggregated(&key)
+                .expect("read clone aggregate")
+                .is_none(),
+            "same-key clone with a different manifest must not reuse the source root's cached count"
+        );
     }
 
     #[test]

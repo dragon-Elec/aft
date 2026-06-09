@@ -12,6 +12,7 @@ const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
 const BRIDGE_HANG_TIMEOUT_THRESHOLD = 2;
 const SEMANTIC_TIMEOUT_SAFETY_MARGIN_MS = 5_000;
 const MAX_STDOUT_BUFFER = 64 * 1024 * 1024; // 64MB
+const STDOUT_BUFFER_COMPACT_THRESHOLD = 64 * 1024;
 
 // ## Note on TypeScript `as` type assertions
 //
@@ -293,6 +294,7 @@ export class BinaryBridge {
   private pending = new Map<string, PendingRequest>();
   private nextId = 1;
   private stdoutBuffer = "";
+  private stdoutReadOffset = 0;
   private stderrBuffer = "";
   /** Ring buffer of the last N stderr lines, cleared on every spawn. */
   private stderrTail: string[] = [];
@@ -1066,6 +1068,7 @@ export class BinaryBridge {
 
     this.process = child;
     this.stdoutBuffer = "";
+    this.stdoutReadOffset = 0;
     this.stderrBuffer = "";
     this.lastChildActivityAt = 0;
     this.consecutiveRequestTimeouts = 0;
@@ -1115,29 +1118,51 @@ export class BinaryBridge {
   }
 
   private onStdoutData(data: string): void {
+    if (this.stdoutReadOffset > STDOUT_BUFFER_COMPACT_THRESHOLD) {
+      this.compactStdoutBuffer();
+    }
     this.stdoutBuffer += data;
-    if (this.stdoutBuffer.length > MAX_STDOUT_BUFFER) {
+    if (this.stdoutBuffer.length - this.stdoutReadOffset > MAX_STDOUT_BUFFER) {
       this.handleCrash(
         new Error(`aft bridge stdout buffer exceeded ${MAX_STDOUT_BUFFER} bytes — killing bridge`),
       );
       return;
     }
 
-    // Process complete lines
+    // Process complete lines without repeatedly slicing the remaining buffer.
     let newlineIdx: number;
-    while ((newlineIdx = this.stdoutBuffer.indexOf("\n")) !== -1) {
-      const line = this.stdoutBuffer.slice(0, newlineIdx).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(newlineIdx + 1);
+    while ((newlineIdx = this.stdoutBuffer.indexOf("\n", this.stdoutReadOffset)) !== -1) {
+      const line = this.stdoutBuffer.slice(this.stdoutReadOffset, newlineIdx).trim();
+      this.stdoutReadOffset = newlineIdx + 1;
 
-      if (!line) continue;
+      if (line) {
+        this.processStdoutLine(line);
+      }
 
-      this.processStdoutLine(line);
+      if (
+        this.stdoutReadOffset > STDOUT_BUFFER_COMPACT_THRESHOLD &&
+        this.stdoutReadOffset > this.stdoutBuffer.length / 2
+      ) {
+        this.compactStdoutBuffer();
+      }
+    }
+
+    if (this.stdoutReadOffset === this.stdoutBuffer.length) {
+      this.stdoutBuffer = "";
+      this.stdoutReadOffset = 0;
     }
   }
 
+  private compactStdoutBuffer(): void {
+    if (this.stdoutReadOffset === 0) return;
+    this.stdoutBuffer = this.stdoutBuffer.slice(this.stdoutReadOffset);
+    this.stdoutReadOffset = 0;
+  }
+
   private flushStdoutBuffer(): void {
-    const line = this.stdoutBuffer.trim();
+    const line = this.stdoutBuffer.slice(this.stdoutReadOffset).trim();
     this.stdoutBuffer = "";
+    this.stdoutReadOffset = 0;
     if (!line) return;
     this.processStdoutLine(line);
   }

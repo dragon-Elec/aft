@@ -3,7 +3,7 @@ use aft::bash_background::BgTaskRegistry;
 use aft::config::Config;
 use aft::context::{
     AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent,
-    SemanticRefreshRequest,
+    SemanticRefreshRequest, StatusBarCounts,
 };
 use aft::log_ctx;
 use aft::lsp::client::LspEvent;
@@ -148,7 +148,6 @@ fn main() {
                 drain_semantic_refresh_events(&ctx);
                 drain_inspect_events(&ctx);
                 drain_watcher_events(&ctx);
-                drain_semantic_refresh_events(&ctx);
                 drain_lsp_events(&ctx);
                 if shutdown_requested.load(Ordering::SeqCst) {
                     break;
@@ -184,7 +183,6 @@ fn main() {
                 drain_semantic_refresh_events(&ctx);
                 drain_inspect_events(&ctx);
                 drain_watcher_events(&ctx);
-                drain_semantic_refresh_events(&ctx);
                 drain_lsp_events(&ctx);
                 let request_id = req.id.clone();
                 let session_id = req.session().to_string();
@@ -449,6 +447,12 @@ fn attach_bg_completions(
     ) {
         return;
     }
+    if !ctx
+        .bash_background()
+        .has_completions_for_session(Some(session_id))
+    {
+        return;
+    }
     let completions = ctx
         .bash_background()
         .drain_completions_for_session(Some(session_id));
@@ -472,6 +476,18 @@ fn attach_bg_completions(
 /// responses never reach the agent, and bash-lifecycle commands fire rapidly).
 /// `errors`/`warnings` are read live from the LSP store here; Tier-2/todos are
 /// last-known. Omitted entirely until the Tier-2 cache is populated once.
+fn status_bar_last_emitted() -> &'static Mutex<Option<StatusBarCounts>> {
+    static LAST_EMITTED_STATUS_BAR: OnceLock<Mutex<Option<StatusBarCounts>>> = OnceLock::new();
+    LAST_EMITTED_STATUS_BAR.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn reset_status_bar_emission_for_test() {
+    if let Ok(mut last) = status_bar_last_emitted().lock() {
+        *last = None;
+    }
+}
+
 fn attach_status_bar(response: &mut Response, ctx: &AppContext, command: &str) {
     if matches!(
         command,
@@ -492,6 +508,18 @@ fn attach_status_bar(response: &mut Response, ctx: &AppContext, command: &str) {
     let Some(counts) = ctx.status_bar_counts() else {
         return;
     };
+    match status_bar_last_emitted().lock() {
+        Ok(mut last) => {
+            if last.as_ref() == Some(&counts) {
+                return;
+            }
+            *last = Some(counts.clone());
+        }
+        Err(_) => {
+            // If the fingerprint lock is poisoned, prefer the previous behavior
+            // (emit) over accidentally suppressing a changed status bar.
+        }
+    }
     let value = serde_json::json!({
         "errors": counts.errors,
         "warnings": counts.warnings,
@@ -2255,9 +2283,10 @@ fn drain_lsp_events(ctx: &AppContext) {
 #[cfg(test)]
 mod watcher_filter_tests {
     use super::{
-        dispatch_panic_response, drain_configure_warning_events, drain_semantic_index_events,
-        drain_semantic_refresh_events, drain_watcher_events, filter_watcher_raw_paths,
-        project_root_was_deleted, reset_semantic_refresh_retry_state_for_test,
+        attach_status_bar, dispatch_panic_response, drain_configure_warning_events,
+        drain_semantic_index_events, drain_semantic_refresh_events, drain_watcher_events,
+        filter_watcher_raw_paths, project_root_was_deleted,
+        reset_semantic_refresh_retry_state_for_test, reset_status_bar_emission_for_test,
         schedule_semantic_refresh_retry, semantic_refresh_circuit_is_open,
         semantic_refresh_probe_is_scheduled_for_test,
         semantic_refresh_transient_failure_count_for_test, watcher_event_invalidates,
@@ -2274,7 +2303,7 @@ mod watcher_filter_tests {
     use aft::lsp::registry::ServerKind;
     use aft::lsp::roots::ServerKey;
     use aft::parser::TreeSitterProvider;
-    use aft::protocol::{ConfigureWarningsFrame, PushFrame};
+    use aft::protocol::{ConfigureWarningsFrame, PushFrame, Response};
     use aft::semantic_index::SemanticIndex;
     use notify::event::{
         AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind,
@@ -2708,6 +2737,30 @@ mod watcher_filter_tests {
         write_push_frame_or_request_shutdown(&mut BrokenWriter, &frame, &shutdown);
 
         assert!(shutdown.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn status_bar_attach_skips_unchanged_fingerprint() {
+        reset_status_bar_emission_for_test();
+        let tmp = TempDir::new().unwrap();
+        let ctx = make_ctx_with_root(tmp.path());
+        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+
+        let mut first = Response::success("one", serde_json::json!({}));
+        attach_status_bar(&mut first, &ctx, "read");
+        assert_eq!(first.data["status_bar"]["dead_code"], 1);
+        assert_eq!(first.data["status_bar"]["unused_exports"], 2);
+        assert_eq!(first.data["status_bar"]["duplicates"], 3);
+        assert_eq!(first.data["status_bar"]["todos"], 4);
+
+        let mut unchanged = Response::success("two", serde_json::json!({}));
+        attach_status_bar(&mut unchanged, &ctx, "read");
+        assert!(unchanged.data.get("status_bar").is_none());
+
+        ctx.update_status_bar_tier2(Some(5), Some(2), Some(3), Some(4), false);
+        let mut changed = Response::success("three", serde_json::json!({}));
+        attach_status_bar(&mut changed, &ctx, "read");
+        assert_eq!(changed.data["status_bar"]["dead_code"], 5);
     }
 
     #[test]

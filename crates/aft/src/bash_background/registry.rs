@@ -221,6 +221,12 @@ pub(crate) struct BgTaskState {
     pub(crate) pending_terminal_override: Option<BgTaskStatus>,
 }
 
+fn completion_matches_session(completion: &BgCompletion, session_id: Option<&str>) -> bool {
+    session_id
+        .map(|session_id| completion.session_id == session_id)
+        .unwrap_or(true)
+}
+
 impl BgTaskRegistry {
     pub fn new(progress_sender: SharedProgressSender) -> Self {
         let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
@@ -1674,13 +1680,21 @@ impl BgTaskRegistry {
 
         completions
             .iter()
-            .filter(|completion| {
-                session_id
-                    .map(|session_id| completion.session_id == session_id)
-                    .unwrap_or(true)
-            })
+            .filter(|completion| completion_matches_session(completion, session_id))
             .cloned()
             .collect()
+    }
+
+    pub fn has_completions_for_session(&self, session_id: Option<&str>) -> bool {
+        match self.inner.completions.lock() {
+            Ok(completions) => completions
+                .iter()
+                .any(|completion| completion_matches_session(completion, session_id)),
+            // Bias to safety: if the queue state cannot be inspected cheaply,
+            // let callers take the existing drain path rather than risk
+            // suppressing a pending completion.
+            Err(_) => true,
+        }
     }
 
     pub fn ack_completions_for_session(
@@ -4058,6 +4072,26 @@ mod tests {
             preview.contains("...<truncated "),
             "preview was {preview:?}"
         );
+    }
+
+    #[test]
+    fn has_completions_for_session_matches_pending_delivery() {
+        let registry = BgTaskRegistry::default();
+        assert!(!registry.has_completions_for_session(Some("session")));
+        assert!(!registry.has_completions_for_session(None));
+
+        let dir = tempfile::tempdir().unwrap();
+        let (_task_id, task) =
+            insert_terminal_piped_task(&registry, &dir, QUICK_SUCCESS_COMMAND, "done\n", "", false);
+        registry.post_terminal_transition(&task, true).unwrap();
+
+        assert!(registry.has_completions_for_session(Some("session")));
+        assert!(registry.has_completions_for_session(None));
+        assert!(!registry.has_completions_for_session(Some("other-session")));
+
+        let completions = registry.drain_completions_for_session(Some("session"));
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].task_id, task.task_id);
     }
 
     #[test]

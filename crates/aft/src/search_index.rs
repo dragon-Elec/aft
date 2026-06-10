@@ -405,12 +405,7 @@ impl SearchIndex {
             file.content_hash = cache_freshness::hash_bytes(content);
         }
 
-        let mut trigram_map: BTreeMap<u32, PostingFilter> = BTreeMap::new();
-        for (trigram, next_char, position) in extract_trigrams(content) {
-            let entry = trigram_map.entry(trigram).or_default();
-            entry.next_mask |= mask_for_next_char(next_char);
-            entry.loc_mask |= mask_for_position(position);
-        }
+        let trigram_map = trigram_filter_map(content, true);
 
         let mut file_trigrams = Vec::with_capacity(trigram_map.len());
         for (trigram, filter) in trigram_map {
@@ -1532,12 +1527,11 @@ pub fn normalize_char(c: u8) -> u8 {
     c.to_ascii_lowercase()
 }
 
-pub fn extract_trigrams(content: &[u8]) -> Vec<(u32, u8, usize)> {
+fn scan_trigrams(content: &[u8], mut visit: impl FnMut(u32, u8, usize)) {
     if content.len() < 3 {
-        return Vec::new();
+        return;
     }
 
-    let mut trigrams = Vec::with_capacity(content.len().saturating_sub(2));
     for start in 0..=content.len() - 3 {
         let trigram = pack_trigram(
             normalize_char(content[start]),
@@ -1545,20 +1539,39 @@ pub fn extract_trigrams(content: &[u8]) -> Vec<(u32, u8, usize)> {
             normalize_char(content[start + 2]),
         );
         let next_char = content.get(start + 3).copied().unwrap_or(EOF_SENTINEL);
-        trigrams.push((trigram, next_char, start));
+        visit(trigram, next_char, start);
     }
+}
+
+pub fn extract_trigrams(content: &[u8]) -> Vec<(u32, u8, usize)> {
+    let mut trigrams = Vec::with_capacity(content.len().saturating_sub(2));
+    scan_trigrams(content, |trigram, next_char, position| {
+        trigrams.push((trigram, next_char, position));
+    });
     trigrams
+}
+
+fn trigram_filter_map(content: &[u8], include_eof_next_char: bool) -> BTreeMap<u32, PostingFilter> {
+    let mut filters: BTreeMap<u32, PostingFilter> = BTreeMap::new();
+    scan_trigrams(content, |trigram, next_char, position| {
+        let entry = filters.entry(trigram).or_default();
+        if include_eof_next_char || next_char != EOF_SENTINEL {
+            entry.next_mask |= mask_for_next_char(next_char);
+        }
+        entry.loc_mask |= mask_for_position(position);
+    });
+    filters
 }
 
 pub fn query_trigrams_from_tokens(tokens: &[&str]) -> Vec<u32> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for token in tokens {
-        for (trigram, _, _) in extract_trigrams(token.as_bytes()) {
+        scan_trigrams(token.as_bytes(), |trigram, _, _| {
             if seen.insert(trigram) {
                 out.push(trigram);
             }
-        }
+        });
     }
     out
 }
@@ -2408,15 +2421,7 @@ fn add_run_to_and_query(query: &mut RegexQuery, run: &[u8]) {
 }
 
 fn trigram_filters(run: &[u8]) -> Vec<(u32, PostingFilter)> {
-    let mut filters: BTreeMap<u32, PostingFilter> = BTreeMap::new();
-    for (trigram, next_char, position) in extract_trigrams(run) {
-        let entry: &mut PostingFilter = filters.entry(trigram).or_default();
-        if next_char != EOF_SENTINEL {
-            entry.next_mask |= mask_for_next_char(next_char);
-        }
-        entry.loc_mask |= mask_for_position(position);
-    }
-    filters.into_iter().collect()
+    trigram_filter_map(run, false).into_iter().collect()
 }
 
 fn merge_filter(target: &mut PostingFilter, filter: PostingFilter) {
@@ -2659,6 +2664,36 @@ mod tests {
             trigrams[1],
             (pack_trigram(b'u', b's', b't'), EOF_SENTINEL, 1)
         );
+    }
+
+    #[test]
+    fn index_file_trigram_filters_match_legacy_extraction() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("sample.txt");
+        let content = b"Rust rust RUST\nxy";
+        fs::write(&path, content).expect("write sample");
+
+        let mut expected = BTreeMap::new();
+        for (trigram, next_char, position) in extract_trigrams(content) {
+            let entry: &mut PostingFilter = expected.entry(trigram).or_default();
+            entry.next_mask |= mask_for_next_char(next_char);
+            entry.loc_mask |= mask_for_position(position);
+        }
+
+        let mut index = SearchIndex::new();
+        index.project_root = dir.path().to_path_buf();
+        index.index_file(&path, content);
+
+        let file_id = *index.path_to_id.get(&path).expect("file indexed");
+        let file_trigrams = index.file_trigrams.get(&file_id).expect("file trigrams");
+        assert_eq!(file_trigrams, &expected.keys().copied().collect::<Vec<_>>());
+        for (trigram, filter) in expected {
+            let postings = index.postings.get(&trigram).expect("posting list");
+            assert_eq!(postings.len(), 1);
+            assert_eq!(postings[0].file_id, file_id);
+            assert_eq!(postings[0].next_mask, filter.next_mask);
+            assert_eq!(postings[0].loc_mask, filter.loc_mask);
+        }
     }
 
     #[test]

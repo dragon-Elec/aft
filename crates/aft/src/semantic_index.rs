@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fmt::Display;
 use std::fs;
+use std::io::{self, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -2255,19 +2256,22 @@ impl SemanticIndex {
                 .unwrap_or(Duration::ZERO)
                 .as_nanos()
         ));
-        let bytes = self.to_bytes();
-        let write_result = (|| -> std::io::Result<()> {
-            use std::io::Write;
-            let mut file = fs::File::create(&tmp_path)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            Ok(())
+        let write_result = (|| -> io::Result<usize> {
+            let file = fs::File::create(&tmp_path)?;
+            let mut writer = BufWriter::new(file);
+            let bytes_written = self.write_to_writer(&mut writer)?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            Ok(bytes_written)
         })();
-        if let Err(e) = write_result {
-            slog_warn!("failed to write semantic index: {}", e);
-            let _ = fs::remove_file(&tmp_path);
-            return;
-        }
+        let bytes_written = match write_result {
+            Ok(bytes_written) => bytes_written,
+            Err(e) => {
+                slog_warn!("failed to write semantic index: {}", e);
+                let _ = fs::remove_file(&tmp_path);
+                return;
+            }
+        };
         if let Err(e) = fs::rename(&tmp_path, &data_path) {
             slog_warn!("failed to rename semantic index: {}", e);
             let _ = fs::remove_file(&tmp_path);
@@ -2276,7 +2280,7 @@ impl SemanticIndex {
         slog_info!(
             "semantic index persisted: {} entries, {:.1} KB",
             self.entries.len(),
-            bytes.len() as f64 / 1024.0
+            bytes_written as f64 / 1024.0
         );
     }
 
@@ -2293,7 +2297,8 @@ impl SemanticIndex {
             .join("semantic")
             .join(project_key)
             .join("semantic.bin");
-        let file_len = usize::try_from(fs::metadata(&data_path).ok()?.len()).ok()?;
+        let file = fs::File::open(&data_path).ok()?;
+        let file_len = usize::try_from(file.metadata().ok()?.len()).ok()?;
         if file_len < HEADER_BYTES_V1 {
             slog_warn!(
                 "corrupt semantic index (too small: {} bytes), removing",
@@ -2305,8 +2310,10 @@ impl SemanticIndex {
             return None;
         }
 
-        let bytes = fs::read(&data_path).ok()?;
-        let version = bytes[0];
+        let mut reader = BufReader::new(file);
+        let mut version_buf = [0u8; 1];
+        reader.read_exact(&mut version_buf).ok()?;
+        let version = version_buf[0];
         if version != SEMANTIC_INDEX_VERSION_V6 {
             slog_info!(
                 "cached semantic index version {} is older than {}, rebuilding",
@@ -2318,7 +2325,13 @@ impl SemanticIndex {
             }
             return None;
         }
-        match Self::from_bytes(&bytes, current_canonical_root) {
+        match Self::from_reader_after_version(
+            reader,
+            version,
+            current_canonical_root,
+            Some(file_len),
+            1,
+        ) {
             Ok(index) => {
                 if index.entries.is_empty() {
                     slog_info!("cached semantic index is empty, will rebuild");
@@ -2359,30 +2372,32 @@ impl SemanticIndex {
     /// Serialize the index to bytes for disk persistence
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        let fingerprint_bytes = self.fingerprint.as_ref().and_then(|fingerprint| {
+        self.write_to_writer(&mut buf)
+            .expect("writing semantic index to Vec cannot fail");
+        buf
+    }
+
+    fn write_to_writer<W: Write>(&self, writer: &mut W) -> io::Result<usize> {
+        let mut bytes_written = 0usize;
+        let fingerprint = self.fingerprint.as_ref().and_then(|fingerprint| {
             let encoded = fingerprint.as_string();
             if encoded.is_empty() {
                 None
             } else {
-                Some(encoded.into_bytes())
+                Some(encoded)
             }
         });
-        let file_mtimes: Vec<_> = self
+        let fp_bytes_ref = fingerprint.as_deref().map(str::as_bytes).unwrap_or(&[]);
+        let file_mtime_count = self
             .file_mtimes
             .iter()
-            .filter_map(|(path, mtime)| {
-                cache_relative_path(&self.project_root, path)
-                    .map(|relative| (relative, path, mtime))
-            })
-            .collect();
-        let entries: Vec<_> = self
+            .filter(|(path, _)| cache_relative_path(&self.project_root, path).is_some())
+            .count();
+        let entry_count = self
             .entries
             .iter()
-            .filter_map(|entry| {
-                cache_relative_path(&self.project_root, &entry.chunk.file)
-                    .map(|relative| (relative, entry))
-            })
-            .collect();
+            .filter(|entry| cache_relative_path(&self.project_root, &entry.chunk.file).is_some())
+            .count();
 
         // Header: version(1) + dimension(4) + entry_count(4) + fingerprint_len(4) + fingerprint
         //
@@ -2397,87 +2412,161 @@ impl SemanticIndex {
         // V3/V4 load as compatible formats but are rejected on disk so snippets
         // and file sizes are rebuilt once.
         let version = SEMANTIC_INDEX_VERSION_V6;
-        buf.push(version);
-        buf.extend_from_slice(&(self.dimension as u32).to_le_bytes());
-        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-        let fp_bytes_ref: &[u8] = fingerprint_bytes.as_deref().unwrap_or(&[]);
-        buf.extend_from_slice(&(fp_bytes_ref.len() as u32).to_le_bytes());
-        buf.extend_from_slice(fp_bytes_ref);
+        write_counted(writer, &[version], &mut bytes_written)?;
+        write_counted(
+            writer,
+            &(self.dimension as u32).to_le_bytes(),
+            &mut bytes_written,
+        )?;
+        write_counted(
+            writer,
+            &(entry_count as u32).to_le_bytes(),
+            &mut bytes_written,
+        )?;
+        write_counted(
+            writer,
+            &(fp_bytes_ref.len() as u32).to_le_bytes(),
+            &mut bytes_written,
+        )?;
+        write_counted(writer, fp_bytes_ref, &mut bytes_written)?;
 
         // File mtime table: count(4) + entries
         // V3 layout per entry: path_len(4) + path + secs(8) + subsec_nanos(4)
-        buf.extend_from_slice(&(file_mtimes.len() as u32).to_le_bytes());
-        for (relative, path, mtime) in &file_mtimes {
-            let path_bytes = relative.to_string_lossy().as_bytes().to_vec();
-            buf.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&path_bytes);
+        write_counted(
+            writer,
+            &(file_mtime_count as u32).to_le_bytes(),
+            &mut bytes_written,
+        )?;
+        for (path, mtime) in &self.file_mtimes {
+            let Some(relative) = cache_relative_path(&self.project_root, path) else {
+                continue;
+            };
+            let relative = relative.to_string_lossy();
+            let path_bytes = relative.as_bytes();
+            write_counted(
+                writer,
+                &(path_bytes.len() as u32).to_le_bytes(),
+                &mut bytes_written,
+            )?;
+            write_counted(writer, path_bytes, &mut bytes_written)?;
             let duration = mtime
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default();
-            buf.extend_from_slice(&duration.as_secs().to_le_bytes());
-            buf.extend_from_slice(&duration.subsec_nanos().to_le_bytes());
-            let size = self.file_sizes.get(*path).copied().unwrap_or_default();
-            buf.extend_from_slice(&size.to_le_bytes());
+            write_counted(
+                writer,
+                &duration.as_secs().to_le_bytes(),
+                &mut bytes_written,
+            )?;
+            write_counted(
+                writer,
+                &duration.subsec_nanos().to_le_bytes(),
+                &mut bytes_written,
+            )?;
+            let size = self.file_sizes.get(path).copied().unwrap_or_default();
+            write_counted(writer, &size.to_le_bytes(), &mut bytes_written)?;
             let hash = self
                 .file_hashes
-                .get(*path)
+                .get(path)
                 .copied()
                 .unwrap_or_else(cache_freshness::zero_hash);
-            buf.extend_from_slice(hash.as_bytes());
+            write_counted(writer, hash.as_bytes(), &mut bytes_written)?;
         }
 
         // Entries: each is metadata + vector
-        for (relative, entry) in &entries {
+        for entry in &self.entries {
+            let Some(relative) = cache_relative_path(&self.project_root, &entry.chunk.file) else {
+                continue;
+            };
             let c = &entry.chunk;
 
             // File path
-            let file_bytes = relative.to_string_lossy().as_bytes().to_vec();
-            buf.extend_from_slice(&(file_bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&file_bytes);
+            let relative = relative.to_string_lossy();
+            let file_bytes = relative.as_bytes();
+            write_counted(
+                writer,
+                &(file_bytes.len() as u32).to_le_bytes(),
+                &mut bytes_written,
+            )?;
+            write_counted(writer, file_bytes, &mut bytes_written)?;
 
             // Name
             let name_bytes = c.name.as_bytes();
-            buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(name_bytes);
+            write_counted(
+                writer,
+                &(name_bytes.len() as u32).to_le_bytes(),
+                &mut bytes_written,
+            )?;
+            write_counted(writer, name_bytes, &mut bytes_written)?;
 
             // Kind (1 byte)
-            buf.push(symbol_kind_to_u8(&c.kind));
+            write_counted(writer, &[symbol_kind_to_u8(&c.kind)], &mut bytes_written)?;
 
             // Lines + exported
-            buf.extend_from_slice(&(c.start_line as u32).to_le_bytes());
-            buf.extend_from_slice(&(c.end_line as u32).to_le_bytes());
-            buf.push(c.exported as u8);
+            write_counted(
+                writer,
+                &(c.start_line as u32).to_le_bytes(),
+                &mut bytes_written,
+            )?;
+            write_counted(
+                writer,
+                &(c.end_line as u32).to_le_bytes(),
+                &mut bytes_written,
+            )?;
+            write_counted(writer, &[c.exported as u8], &mut bytes_written)?;
 
             // Snippet
             let snippet_bytes = c.snippet.as_bytes();
-            buf.extend_from_slice(&(snippet_bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(snippet_bytes);
+            write_counted(
+                writer,
+                &(snippet_bytes.len() as u32).to_le_bytes(),
+                &mut bytes_written,
+            )?;
+            write_counted(writer, snippet_bytes, &mut bytes_written)?;
 
             // Embed text
             let embed_bytes = c.embed_text.as_bytes();
-            buf.extend_from_slice(&(embed_bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(embed_bytes);
+            write_counted(
+                writer,
+                &(embed_bytes.len() as u32).to_le_bytes(),
+                &mut bytes_written,
+            )?;
+            write_counted(writer, embed_bytes, &mut bytes_written)?;
 
             // Vector (f32 array)
             for &val in &entry.vector {
-                buf.extend_from_slice(&val.to_le_bytes());
+                write_counted(writer, &val.to_le_bytes(), &mut bytes_written)?;
             }
         }
 
-        buf
+        Ok(bytes_written)
     }
 
     /// Deserialize the index from bytes
     pub fn from_bytes(data: &[u8], current_canonical_root: &Path) -> Result<Self, String> {
         debug_assert!(current_canonical_root.is_absolute());
-        let mut pos = 0;
-
         if data.len() < HEADER_BYTES_V1 {
             return Err("data too short".to_string());
         }
 
-        let version = data[pos];
-        pos += 1;
+        Self::from_reader_after_version(
+            Cursor::new(&data[1..]),
+            data[0],
+            current_canonical_root,
+            Some(data.len()),
+            1,
+        )
+    }
+
+    fn from_reader_after_version<R: Read>(
+        reader: R,
+        version: u8,
+        current_canonical_root: &Path,
+        total_len: Option<usize>,
+        bytes_read: usize,
+    ) -> Result<Self, String> {
+        debug_assert!(current_canonical_root.is_absolute());
+        let mut reader = CountingReader::with_bytes_read(reader, bytes_read);
+
         if version != SEMANTIC_INDEX_VERSION_V1
             && version != SEMANTIC_INDEX_VERSION_V2
             && version != SEMANTIC_INDEX_VERSION_V3
@@ -2495,13 +2584,13 @@ impl SemanticIndex {
             || version == SEMANTIC_INDEX_VERSION_V4
             || version == SEMANTIC_INDEX_VERSION_V5
             || version == SEMANTIC_INDEX_VERSION_V6)
-            && data.len() < HEADER_BYTES_V2
+            && total_len.is_some_and(|len| len < HEADER_BYTES_V2)
         {
             return Err("data too short for semantic index v2/v3/v4/v5/v6 header".to_string());
         }
 
-        let dimension = read_u32(data, &mut pos)? as usize;
-        let entry_count = read_u32(data, &mut pos)? as usize;
+        let dimension = read_u32_stream(&mut reader)? as usize;
+        let entry_count = read_u32_stream(&mut reader)? as usize;
         validate_embedding_dimension(dimension)?;
         if entry_count > MAX_ENTRIES {
             return Err(format!("too many semantic index entries: {}", entry_count));
@@ -2518,15 +2607,22 @@ impl SemanticIndex {
             || version == SEMANTIC_INDEX_VERSION_V5
             || version == SEMANTIC_INDEX_VERSION_V6;
         let fingerprint = if has_fingerprint_field {
-            let fingerprint_len = read_u32(data, &mut pos)? as usize;
-            if pos + fingerprint_len > data.len() {
+            let fingerprint_len = read_u32_stream(&mut reader)? as usize;
+            if total_len
+                .is_some_and(|len| reader.bytes_read().saturating_add(fingerprint_len) > len)
+            {
                 return Err("unexpected end of data reading fingerprint".to_string());
             }
             if fingerprint_len == 0 {
                 None
             } else {
-                let raw = String::from_utf8_lossy(&data[pos..pos + fingerprint_len]).to_string();
-                pos += fingerprint_len;
+                let mut raw = vec![0u8; fingerprint_len];
+                read_exact_stream(
+                    &mut reader,
+                    &mut raw,
+                    "unexpected end of data reading fingerprint",
+                )?;
+                let raw = String::from_utf8_lossy(&raw).to_string();
                 Some(
                     serde_json::from_str::<SemanticIndexFingerprint>(&raw)
                         .map_err(|error| format!("invalid semantic fingerprint: {error}"))?,
@@ -2537,7 +2633,7 @@ impl SemanticIndex {
         };
 
         // File mtimes
-        let mtime_count = read_u32(data, &mut pos)? as usize;
+        let mtime_count = read_u32_stream(&mut reader)? as usize;
         if mtime_count > MAX_ENTRIES {
             return Err(format!("too many semantic file mtimes: {}", mtime_count));
         }
@@ -2546,7 +2642,7 @@ impl SemanticIndex {
             .checked_mul(dimension)
             .and_then(|count| count.checked_mul(F32_BYTES))
             .ok_or_else(|| "semantic vector allocation overflow".to_string())?;
-        if vector_bytes > data.len().saturating_sub(pos) {
+        if total_len.is_some_and(|len| vector_bytes > len.saturating_sub(reader.bytes_read())) {
             return Err("semantic index vectors exceed available data".to_string());
         }
 
@@ -2554,8 +2650,8 @@ impl SemanticIndex {
         let mut file_sizes = HashMap::with_capacity(mtime_count);
         let mut file_hashes = HashMap::with_capacity(mtime_count);
         for _ in 0..mtime_count {
-            let path = read_string(data, &mut pos)?;
-            let secs = read_u64(data, &mut pos)?;
+            let path = read_string_stream(&mut reader, total_len)?;
+            let secs = read_u64_stream(&mut reader)?;
             // V3+ persists subsec_nanos alongside secs so staleness checks
             // survive restart round-trips. V1/V2 load with 0 nanos, which
             // causes one rebuild on upgrade (they never matched live APFS
@@ -2566,23 +2662,23 @@ impl SemanticIndex {
                 || version == SEMANTIC_INDEX_VERSION_V5
                 || version == SEMANTIC_INDEX_VERSION_V6
             {
-                read_u32(data, &mut pos)?
+                read_u32_stream(&mut reader)?
             } else {
                 0
             };
             let size =
                 if version == SEMANTIC_INDEX_VERSION_V5 || version == SEMANTIC_INDEX_VERSION_V6 {
-                    read_u64(data, &mut pos)?
+                    read_u64_stream(&mut reader)?
                 } else {
                     0
                 };
             let content_hash = if version == SEMANTIC_INDEX_VERSION_V6 {
-                if pos + 32 > data.len() {
-                    return Err("unexpected end of data reading content hash".to_string());
-                }
                 let mut hash_bytes = [0u8; 32];
-                hash_bytes.copy_from_slice(&data[pos..pos + 32]);
-                pos += 32;
+                read_exact_stream(
+                    &mut reader,
+                    &mut hash_bytes,
+                    "unexpected end of data reading content hash",
+                )?;
                 blake3::Hash::from_bytes(hash_bytes)
             } else {
                 cache_freshness::zero_hash()
@@ -2622,45 +2718,41 @@ impl SemanticIndex {
         // Entries
         let mut entries = Vec::with_capacity(entry_count);
         for _ in 0..entry_count {
-            let raw_file = PathBuf::from(read_string(data, &mut pos)?);
+            let raw_file = PathBuf::from(read_string_stream(&mut reader, total_len)?);
             let file = if version == SEMANTIC_INDEX_VERSION_V6 {
                 cached_path_under_root(current_canonical_root, &raw_file)
                     .ok_or_else(|| "cached semantic entry path escapes project root".to_string())?
             } else {
                 raw_file
             };
-            let name = read_string(data, &mut pos)?;
+            let name = read_string_stream(&mut reader, total_len)?;
 
-            if pos >= data.len() {
-                return Err("unexpected end of data".to_string());
-            }
-            let kind = u8_to_symbol_kind(data[pos]);
-            pos += 1;
+            let kind = u8_to_symbol_kind(read_u8_stream(&mut reader, "unexpected end of data")?);
 
-            let start_line = read_u32(data, &mut pos)?;
-            let end_line = read_u32(data, &mut pos)?;
+            let start_line = read_u32_stream(&mut reader)?;
+            let end_line = read_u32_stream(&mut reader)?;
 
-            if pos >= data.len() {
-                return Err("unexpected end of data".to_string());
-            }
-            let exported = data[pos] != 0;
-            pos += 1;
+            let exported = read_u8_stream(&mut reader, "unexpected end of data")? != 0;
 
-            let snippet = read_string(data, &mut pos)?;
-            let embed_text = read_string(data, &mut pos)?;
+            let snippet = read_string_stream(&mut reader, total_len)?;
+            let embed_text = read_string_stream(&mut reader, total_len)?;
 
             // Vector
             let vec_bytes = dimension
                 .checked_mul(F32_BYTES)
                 .ok_or_else(|| "semantic vector allocation overflow".to_string())?;
-            if pos + vec_bytes > data.len() {
+            if total_len.is_some_and(|len| reader.bytes_read().saturating_add(vec_bytes) > len) {
                 return Err("unexpected end of data reading vector".to_string());
             }
             let mut vector = Vec::with_capacity(dimension);
             for _ in 0..dimension {
-                let bytes = [data[pos], data[pos + 1], data[pos + 2], data[pos + 3]];
+                let mut bytes = [0u8; F32_BYTES];
+                read_exact_stream(
+                    &mut reader,
+                    &mut bytes,
+                    "unexpected end of data reading vector",
+                )?;
                 vector.push(f32::from_le_bytes(bytes));
-                pos += 4;
             }
 
             entries.push(EmbeddingEntry {
@@ -2705,6 +2797,87 @@ impl SemanticIndex {
             deferred_files: HashSet::new(),
         })
     }
+}
+
+fn write_counted<W: Write>(
+    writer: &mut W,
+    bytes: &[u8],
+    bytes_written: &mut usize,
+) -> io::Result<()> {
+    writer.write_all(bytes)?;
+    *bytes_written = bytes_written.saturating_add(bytes.len());
+    Ok(())
+}
+
+struct CountingReader<R> {
+    inner: R,
+    bytes_read: usize,
+}
+
+impl<R> CountingReader<R> {
+    fn with_bytes_read(inner: R, bytes_read: usize) -> Self {
+        Self { inner, bytes_read }
+    }
+
+    fn bytes_read(&self) -> usize {
+        self.bytes_read
+    }
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.bytes_read = self.bytes_read.saturating_add(read);
+        Ok(read)
+    }
+}
+
+fn read_exact_stream<R: Read>(
+    reader: &mut CountingReader<R>,
+    buf: &mut [u8],
+    eof_message: &'static str,
+) -> Result<(), String> {
+    reader.read_exact(buf).map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            eof_message.to_string()
+        } else {
+            format!("{eof_message}: {error}")
+        }
+    })
+}
+
+fn read_u8_stream<R: Read>(
+    reader: &mut CountingReader<R>,
+    eof_message: &'static str,
+) -> Result<u8, String> {
+    let mut bytes = [0u8; 1];
+    read_exact_stream(reader, &mut bytes, eof_message)?;
+    Ok(bytes[0])
+}
+
+fn read_u32_stream<R: Read>(reader: &mut CountingReader<R>) -> Result<u32, String> {
+    let mut bytes = [0u8; 4];
+    read_exact_stream(reader, &mut bytes, "unexpected end of data reading u32")?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64_stream<R: Read>(reader: &mut CountingReader<R>) -> Result<u64, String> {
+    let mut bytes = [0u8; 8];
+    read_exact_stream(reader, &mut bytes, "unexpected end of data reading u64")?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_string_stream<R: Read>(
+    reader: &mut CountingReader<R>,
+    total_len: Option<usize>,
+) -> Result<String, String> {
+    let len = read_u32_stream(reader)? as usize;
+    if total_len.is_some_and(|total_len| reader.bytes_read().saturating_add(len) > total_len) {
+        return Err("unexpected end of data reading string".to_string());
+    }
+    let mut bytes = vec![0u8; len];
+    read_exact_stream(reader, &mut bytes, "unexpected end of data reading string")?;
+    Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
 /// Build enriched embedding text from a symbol with cAST-style context
@@ -3154,34 +3327,6 @@ fn u8_to_symbol_kind(v: u8) -> SymbolKind {
     }
 }
 
-fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32, String> {
-    if *pos + 4 > data.len() {
-        return Err("unexpected end of data reading u32".to_string());
-    }
-    let val = u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
-    *pos += 4;
-    Ok(val)
-}
-
-fn read_u64(data: &[u8], pos: &mut usize) -> Result<u64, String> {
-    if *pos + 8 > data.len() {
-        return Err("unexpected end of data reading u64".to_string());
-    }
-    let bytes: [u8; 8] = data[*pos..*pos + 8].try_into().unwrap();
-    *pos += 8;
-    Ok(u64::from_le_bytes(bytes))
-}
-
-fn read_string(data: &[u8], pos: &mut usize) -> Result<String, String> {
-    let len = read_u32(data, pos)? as usize;
-    if *pos + len > data.len() {
-        return Err("unexpected end of data reading string".to_string());
-    }
-    let s = String::from_utf8_lossy(&data[*pos..*pos + len]).to_string();
-    *pos += len;
-    Ok(s)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3432,6 +3577,91 @@ Connection: close
         index
             .file_hashes
             .insert(file.to_path_buf(), cache_freshness::zero_hash());
+    }
+
+    fn legacy_semantic_index_bytes(index: &SemanticIndex) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let fingerprint_bytes = index.fingerprint.as_ref().and_then(|fingerprint| {
+            let encoded = fingerprint.as_string();
+            if encoded.is_empty() {
+                None
+            } else {
+                Some(encoded.into_bytes())
+            }
+        });
+        let file_mtimes: Vec<_> = index
+            .file_mtimes
+            .iter()
+            .filter_map(|(path, mtime)| {
+                cache_relative_path(&index.project_root, path)
+                    .map(|relative| (relative, path, mtime))
+            })
+            .collect();
+        let entries: Vec<_> = index
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                cache_relative_path(&index.project_root, &entry.chunk.file)
+                    .map(|relative| (relative, entry))
+            })
+            .collect();
+
+        buf.push(SEMANTIC_INDEX_VERSION_V6);
+        buf.extend_from_slice(&(index.dimension as u32).to_le_bytes());
+        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        let fp_bytes_ref: &[u8] = fingerprint_bytes.as_deref().unwrap_or(&[]);
+        buf.extend_from_slice(&(fp_bytes_ref.len() as u32).to_le_bytes());
+        buf.extend_from_slice(fp_bytes_ref);
+
+        buf.extend_from_slice(&(file_mtimes.len() as u32).to_le_bytes());
+        for (relative, path, mtime) in &file_mtimes {
+            let path_bytes = relative.to_string_lossy().as_bytes().to_vec();
+            buf.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&path_bytes);
+            let duration = mtime
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default();
+            buf.extend_from_slice(&duration.as_secs().to_le_bytes());
+            buf.extend_from_slice(&duration.subsec_nanos().to_le_bytes());
+            let size = index.file_sizes.get(*path).copied().unwrap_or_default();
+            buf.extend_from_slice(&size.to_le_bytes());
+            let hash = index
+                .file_hashes
+                .get(*path)
+                .copied()
+                .unwrap_or_else(cache_freshness::zero_hash);
+            buf.extend_from_slice(hash.as_bytes());
+        }
+
+        for (relative, entry) in &entries {
+            let c = &entry.chunk;
+            let file_bytes = relative.to_string_lossy().as_bytes().to_vec();
+            buf.extend_from_slice(&(file_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&file_bytes);
+
+            let name_bytes = c.name.as_bytes();
+            buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+
+            buf.push(symbol_kind_to_u8(&c.kind));
+            buf.extend_from_slice(&(c.start_line as u32).to_le_bytes());
+            buf.extend_from_slice(&(c.end_line as u32).to_le_bytes());
+            buf.push(c.exported as u8);
+
+            let snippet_bytes = c.snippet.as_bytes();
+            buf.extend_from_slice(&(snippet_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(snippet_bytes);
+
+            let embed_bytes = c.embed_text.as_bytes();
+            buf.extend_from_slice(&(embed_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(embed_bytes);
+
+            for &val in &entry.vector {
+                buf.extend_from_slice(&val.to_le_bytes());
+            }
+        }
+
+        buf
     }
 
     #[derive(Default)]
@@ -4002,6 +4232,102 @@ Connection: close
         assert_eq!(restored.dimension, 4);
         assert_eq!(restored.backend_label(), Some("fastembed"));
         assert_eq!(restored.model_label(), Some("all-MiniLM-L6-v2"));
+    }
+
+    #[test]
+    fn semantic_cache_streaming_persistence_matches_legacy_bytes_and_round_trips() {
+        let storage = tempfile::tempdir().expect("create storage dir");
+        let project = storage.path().join("project");
+        fs::create_dir_all(project.join("src")).expect("create project src");
+        let file = project.join("src/lib.rs");
+        fs::write(&file, "pub fn alpha() {}\npub fn beta() {}\n").expect("write source");
+        let project_root = fs::canonicalize(&project).expect("canonical project");
+        let file = fs::canonicalize(&file).expect("canonical file");
+
+        let mut index = SemanticIndex::new(project_root.clone(), 3);
+        let mtime = SystemTime::UNIX_EPOCH + Duration::new(123, 456);
+        index.file_mtimes.insert(file.clone(), mtime);
+        index.file_sizes.insert(file.clone(), 42);
+        index
+            .file_hashes
+            .insert(file.clone(), cache_freshness::zero_hash());
+        index.entries.push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: file.clone(),
+                name: "alpha".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 0,
+                exported: true,
+                embed_text: "file:src/lib.rs kind:function name:alpha".to_string(),
+                snippet: "pub fn alpha() {}".to_string(),
+            },
+            vector: vec![0.1, 0.2, 0.3],
+        });
+        index.entries.push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: file.clone(),
+                name: "beta".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 1,
+                end_line: 1,
+                exported: true,
+                embed_text: "file:src/lib.rs kind:function name:beta".to_string(),
+                snippet: "pub fn beta() {}".to_string(),
+            },
+            vector: vec![0.4, 0.5, 0.6],
+        });
+        let fingerprint = SemanticIndexFingerprint {
+            backend: "fastembed".to_string(),
+            model: "all-MiniLM-L6-v2".to_string(),
+            base_url: FALLBACK_BACKEND.to_string(),
+            dimension: 3,
+            chunking_version: default_chunking_version(),
+        };
+        index.set_fingerprint(fingerprint.clone());
+
+        let legacy_bytes = legacy_semantic_index_bytes(&index);
+        assert_eq!(index.to_bytes(), legacy_bytes);
+
+        index.write_to_disk(storage.path(), "proj");
+        let data_path = storage.path().join("semantic/proj/semantic.bin");
+        assert_eq!(
+            fs::read(&data_path).expect("read semantic.bin"),
+            legacy_bytes
+        );
+
+        let loaded = SemanticIndex::read_from_disk(
+            storage.path(),
+            "proj",
+            &project_root,
+            false,
+            Some(&fingerprint.as_string()),
+        )
+        .expect("load semantic index");
+        assert_eq!(loaded.entries.len(), index.entries.len());
+        assert_eq!(loaded.dimension, index.dimension);
+        assert_eq!(
+            loaded.fingerprint().unwrap().as_string(),
+            fingerprint.as_string()
+        );
+        assert_eq!(loaded.file_mtimes.get(&file), Some(&mtime));
+        assert_eq!(loaded.file_sizes.get(&file), Some(&42));
+        assert_eq!(
+            loaded.file_hashes.get(&file),
+            Some(&cache_freshness::zero_hash())
+        );
+        for (actual, expected) in loaded.entries.iter().zip(index.entries.iter()) {
+            assert_eq!(actual.chunk.file, expected.chunk.file);
+            assert_eq!(actual.chunk.name, expected.chunk.name);
+            assert_eq!(actual.chunk.kind, expected.chunk.kind);
+            assert_eq!(actual.chunk.start_line, expected.chunk.start_line);
+            assert_eq!(actual.chunk.end_line, expected.chunk.end_line);
+            assert_eq!(actual.chunk.exported, expected.chunk.exported);
+            assert_eq!(actual.chunk.embed_text, expected.chunk.embed_text);
+            assert_eq!(actual.chunk.snippet, expected.chunk.snippet);
+            assert_eq!(actual.vector, expected.vector);
+        }
+        assert_eq!(loaded.to_bytes(), legacy_bytes);
     }
 
     #[test]

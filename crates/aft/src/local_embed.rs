@@ -143,9 +143,10 @@ impl LocalEmbedder {
             return Ok(Vec::new());
         }
 
+        let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let encodings = self
             .tokenizer
-            .encode_batch(texts.to_vec(), true)
+            .encode_batch(text_refs, true)
             .map_err(|e| format!("tokenize batch: {e}"))?;
 
         // Greedily partition (order-preserving) into sub-batches bounded by the

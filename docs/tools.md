@@ -109,9 +109,9 @@ doesn't exist. Backs up any existing content before overwriting.
 
 Auto-formats using the project's configured formatter (biome, oxfmt, prettier, etc.).
 
-LSP diagnostics are **off by default** (since v0.33) — the write returns as soon as the file is
-written. Pass `diagnostics: true` to wait up to 3s for fresh LSP diagnostics and include them
-inline, or call `aft_inspect` / `lsp_diagnostics` at a verification checkpoint instead.
+The write returns as soon as the file is written. Diagnostics surface through the AFT status
+bar and `aft_inspect`; set `lsp.diagnostics_on_edit: true` in `aft.jsonc` to additionally wait
+for and inline fresh LSP diagnostics on every edit.
 
 For partial edits (find/replace), use `edit` instead.
 
@@ -174,10 +174,10 @@ To edit multiple files, make parallel `edit` calls in one response.
 Creates the file (and parent directories) if missing. Faster than read+write for adding to logs,
 notepad files, or large appendable structures.
 
-LSP diagnostics are **off by default** (since v0.33). Pass `diagnostics: true` on any edit mode to
-wait up to 3s for fresh diagnostics and include them inline; otherwise the edit returns as soon as
-the write completes. Use `aft_inspect` or `lsp_diagnostics` to check diagnostics across a batch of
-edits or before tests/commits. Use `aft_safety checkpoint` / `undo` for recovery before risky edits.
+The edit returns as soon as the write completes. Diagnostics surface through the AFT status bar
+and `aft_inspect`; set `lsp.diagnostics_on_edit: true` in `aft.jsonc` to additionally wait for
+and inline fresh LSP diagnostics on every edit. Use `aft_safety checkpoint` / `undo` for
+recovery before risky edits.
 
 ---
 
@@ -202,7 +202,7 @@ abort). A move hunk never deletes the source unless the destination write succee
 ```
 
 Context anchors (`@@`) use fuzzy matching to handle whitespace and Unicode differences.
-LSP diagnostics are off by default; pass `diagnostics: true` to include them inline for updated files.
+Diagnostics surface through the AFT status bar and `aft_inspect` (or inline on every edit with `lsp.diagnostics_on_edit: true`).
 
 ---
 

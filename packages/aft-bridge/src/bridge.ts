@@ -13,6 +13,27 @@ const BRIDGE_HANG_TIMEOUT_THRESHOLD = 2;
 const SEMANTIC_TIMEOUT_SAFETY_MARGIN_MS = 5_000;
 const MAX_STDOUT_BUFFER = 64 * 1024 * 1024; // 64MB
 const STDOUT_BUFFER_COMPACT_THRESHOLD = 64 * 1024;
+const TERMINAL_BASH_STATUSES = new Set([
+  "completed",
+  "failed",
+  "killed",
+  "timed_out",
+  // Historical/defensive aliases seen in plugin-side compatibility code.
+  "cancelled",
+  "timeout",
+]);
+
+function isTerminalBashStatus(status: unknown): boolean {
+  return typeof status === "string" && TERMINAL_BASH_STATUSES.has(status);
+}
+
+function bashTaskIdFrom(response: Record<string, unknown>): string | undefined {
+  const snakeCase = response.task_id;
+  if (typeof snakeCase === "string" && snakeCase.length > 0) return snakeCase;
+  const camelCase = response.taskId;
+  if (typeof camelCase === "string" && camelCase.length > 0) return camelCase;
+  return undefined;
+}
 
 // ## Note on TypeScript `as` type assertions
 //
@@ -125,6 +146,7 @@ interface PendingRequest {
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
   onProgress?: (chunk: { kind: "stdout" | "stderr"; text: string }) => void;
+  command: string;
 }
 
 /** Single configure-time warning produced by the Rust side. */
@@ -292,6 +314,7 @@ export class BinaryBridge {
   private cwd: string;
   private process: ChildProcess | null = null;
   private pending = new Map<string, PendingRequest>();
+  private outstandingBackgroundTaskIds = new Set<string>();
   private nextId = 1;
   private stdoutBuffer = "";
   private stdoutReadOffset = 0;
@@ -447,6 +470,10 @@ export class BinaryBridge {
 
   hasPendingRequests(): boolean {
     return this.pending.size > 0;
+  }
+
+  hasOutstandingBackgroundTasks(): boolean {
+    return this.outstandingBackgroundTaskIds.size > 0;
   }
 
   /** Project root this bridge was spawned/configured for. */
@@ -674,7 +701,7 @@ export class BinaryBridge {
           this.handleTimeout(requestSessionId);
         }, effectiveTimeoutMs);
 
-        this.pending.set(id, { resolve, reject, timer, onProgress: options?.onProgress });
+        this.pending.set(id, { resolve, reject, timer, onProgress: options?.onProgress, command });
 
         if (!this.process?.stdin?.writable) {
           this.pending.delete(id);
@@ -1195,6 +1222,8 @@ export class BinaryBridge {
         return;
       }
       if (response.type === "bash_completed") {
+        const taskId = bashTaskIdFrom(response);
+        if (taskId) this.outstandingBackgroundTaskIds.delete(taskId);
         this.onBashCompletion?.(response as unknown as BashCompletedPayload, this);
         return;
       }
@@ -1226,6 +1255,7 @@ export class BinaryBridge {
         clearTimeout(entry.timer);
         this.consecutiveRequestTimeouts = 0;
         this.scheduleRestartCountReset();
+        this.accountForBashTaskResponse(entry.command, response);
         this.captureStatusBar(response);
         entry.resolve(response);
       } else if (typeof response.type === "string") {
@@ -1233,6 +1263,24 @@ export class BinaryBridge {
       }
     } catch (_err) {
       this.warnVia(`Failed to parse stdout line: ${line}`);
+    }
+  }
+
+  private accountForBashTaskResponse(command: string, response: Record<string, unknown>): void {
+    const taskId = bashTaskIdFrom(response);
+    if (!taskId) return;
+
+    if (isTerminalBashStatus(response.status)) {
+      this.outstandingBackgroundTaskIds.delete(taskId);
+      return;
+    }
+
+    // A successful bash spawn returns { task_id, status: "running", ... }.
+    // Bias toward wake safety: if a bash response has a task id but an unknown
+    // non-terminal/missing status, keep the bridge alive until a terminal
+    // bash_completed frame or terminal bash_status/bash_kill response removes it.
+    if (command === "bash" && response.success !== false) {
+      this.outstandingBackgroundTaskIds.add(taskId);
     }
   }
 

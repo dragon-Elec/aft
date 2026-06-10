@@ -183,12 +183,12 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.36.0";
+const ANNOUNCEMENT_VERSION = "0.37.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Persisted call graph: dead-code analysis runs on large repositories again (the file-count cap is gone), `aft_callgraph` queries resolve from disk, and method-call edges are more accurate across more languages.",
-  "Bash output stops hiding failures: piping a test/build through `grep`/`head` with compression on now keeps the failures and summary instead of stripping them.",
-  "Code search steering: guidance and hints now point to `aft_search` and parallel `aft_*` tools instead of `grep`/`find` in bash.",
-  "Fixes: a small `timeout` no longer kills a foreground `bash` command (#102), and `aft_delete`/`aft_safety checkpoint` no longer crash on a mistyped `files` argument.",
+  "Much lower background CPU: idle bridges shut down after 30 minutes, deleted project roots stop the watcher instead of spinning it, and background scans reuse warm caches on a bounded thread pool.",
+  "`aft_transform` removed: usage data showed agents never called it — `edit` covers everything it did, and every request now carries a smaller tool surface.",
+  "Leaner tools: `bash`, `write`, `edit`, `apply_patch`, `aft_search`, and `aft_refactor` descriptions trimmed and config-aware; system-prompt guidance rewritten around what to do instead of what to avoid.",
+  "Background bash reminders are right-sized: failures keep head + tail context, successes show a short tail, and compressors never print a success summary for a non-zero exit.",
 ];
 
 /**

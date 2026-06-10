@@ -682,28 +682,47 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     // synthetic "not_initialized" status so the sidebar shows something
     // sensible without triggering project indexing.
     //
-    // Prefer THIS server's own project (the plugin-init cwd) first — that
-    // bridge is always safe to serve from this server instance.
+    // Status is scoped to the POLLED SESSION's project, not this server's
+    // launch cwd. With `opencode -s <sessid>` run from another project's
+    // directory, OpenCode hands the plugin and the TUI the launch cwd — tool
+    // calls already re-resolve the session's real directory via the SDK, and
+    // the sidebar must match them, or it renders the launch-cwd project's
+    // data for a session that lives elsewhere.
     //
-    // The cross-project fallback (the `opencode -s` resume case, where the
-    // plugin-init cwd has no bridge and the session's real project lives
-    // elsewhere) must NOT trust the process-wide session-dir warm cache: in a
-    // multi-project host (Desktop / `opencode serve`) all plugin instances
-    // share that cache, and a fallback-seeded or stale entry made project A's
-    // server happily serve project B's warm bridge — the sidebar then rendered
-    // another project's data the moment the window opened (RPC contamination).
-    // Instead, only serve a cross-project bridge when a FRESH SDK lookup
-    // confirms the polled session really lives in that directory, and never
-    // attempt the fallback for placeholder/empty session ids.
-    let bridge = pool.getActiveBridgeForRoot(input.directory);
+    // Resolution order:
+    //  1. SDK-verified session directory (fresh `session.get`, 15s memo) —
+    //     NEVER the process-wide session-dir warm cache: in a multi-project
+    //     host (Desktop / `opencode serve`) that cache is shared by all plugin
+    //     instances and a fallback-seeded entry once made project A's server
+    //     serve project B's bridge (RPC contamination).
+    //  2. If the verified directory differs from ours and has NO warm bridge
+    //     in this pool, return the placeholder — never another project's data
+    //     for a foreign session; the client keeps scanning ports for the
+    //     process that actually hosts that session's bridge.
+    //  3. Own directory only when verification yields nothing (placeholder /
+    //     empty session id, SDK miss) — the common single-project case.
+    let bridge: ReturnType<typeof pool.getActiveBridgeForRoot> = null;
     let servedDirectory = input.directory;
     const realSessionID = (params.sessionID as string) || "";
-    if (!bridge && realSessionID) {
-      const verifiedDir = await verifySessionDirectory(input.client, realSessionID);
-      if (verifiedDir && verifiedDir !== input.directory) {
-        bridge = pool.getActiveBridgeForRoot(verifiedDir);
+    const verifiedDir = realSessionID
+      ? await verifySessionDirectory(input.client, realSessionID)
+      : null;
+    if (verifiedDir) {
+      bridge = pool.getActiveBridgeForRoot(verifiedDir);
+      if (bridge) {
         servedDirectory = verifiedDir;
+      } else if (verifiedDir !== input.directory) {
+        return {
+          success: true,
+          status: "not_initialized",
+          message:
+            "AFT bridge is now spawned lazily, information here will be populated after first tool call.",
+        };
       }
+    }
+    if (!bridge) {
+      bridge = pool.getActiveBridgeForRoot(input.directory);
+      servedDirectory = input.directory;
     }
     if (!bridge) {
       return {

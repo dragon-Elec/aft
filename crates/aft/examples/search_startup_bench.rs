@@ -1,7 +1,7 @@
 //! Reproducible timings for search startup / grep-cap / ignore-fingerprint fixes.
 //!
-//!   cargo run --release -p agent-file-tools --bin search_startup_bench -- --generate /tmp/aft-bench-fixture
-//!   cargo run --release -p agent-file-tools --bin search_startup_bench -- --measure /tmp/aft-bench-fixture
+//!   cargo run --release -p agent-file-tools --example search_startup_bench -- --generate /tmp/aft-bench-fixture
+//!   cargo run --release -p agent-file-tools --example search_startup_bench -- --measure /tmp/aft-bench-fixture
 
 use std::fs;
 use std::path::Path;

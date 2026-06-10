@@ -91,7 +91,6 @@ import { registerReadingTools } from "./tools/reading.js";
 import { registerRefactorTool } from "./tools/refactor.js";
 import { registerSafetyTool } from "./tools/safety.js";
 import { registerSemanticTool } from "./tools/semantic.js";
-import { registerStructureTool } from "./tools/structure.js";
 import type { PluginContext } from "./types.js";
 import { registerWorkflowHints } from "./workflow-hints.js";
 
@@ -201,13 +200,7 @@ const ANNOUNCEMENT_FEATURES: string[] = [
  */
 const ANNOUNCEMENT_FOOTER = "Join us on Discord: https://discord.gg/DSa65w8wuf";
 
-const ALL_ONLY_TOOLS = new Set([
-  "aft_callgraph",
-  "aft_delete",
-  "aft_move",
-  "aft_transform",
-  "aft_refactor",
-]);
+const ALL_ONLY_TOOLS = new Set(["aft_callgraph", "aft_delete", "aft_move", "aft_refactor"]);
 
 const pendingEagerWarnings = new Map<string, ConfigureWarning[]>();
 
@@ -322,7 +315,6 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
   move: boolean;
   astSearch: boolean;
   astReplace: boolean;
-  structure: boolean;
   refactor: boolean;
 } {
   const surface = config.tool_surface ?? "recommended";
@@ -355,7 +347,6 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
       move: false,
       astSearch: false,
       astReplace: false,
-      structure: false,
       refactor: false,
     };
   }
@@ -380,7 +371,6 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
     move: false,
     astSearch: ok("ast_grep_search"),
     astReplace: ok("ast_grep_replace"),
-    structure: false,
     refactor: false,
   };
 
@@ -390,7 +380,6 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
       navigate: allOnly("aft_callgraph"),
       delete: allOnly("aft_delete"),
       move: allOnly("aft_move"),
-      structure: allOnly("aft_transform"),
       refactor: allOnly("aft_refactor"),
     };
   }
@@ -784,9 +773,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   }
   if (surface.delete || surface.move) {
     registerFsTools(pi, ctx, surface);
-  }
-  if (surface.structure) {
-    registerStructureTool(pi, ctx);
   }
   if (surface.refactor) {
     registerRefactorTool(pi, ctx);

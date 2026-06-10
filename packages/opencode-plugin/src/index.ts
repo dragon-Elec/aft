@@ -75,7 +75,6 @@ import { refactoringTools } from "./tools/refactoring.js";
 import { safetyTools } from "./tools/safety.js";
 import { searchTools } from "./tools/search.js";
 import { semanticTools } from "./tools/semantic.js";
-import { structureTools } from "./tools/structure.js";
 import type { PluginContext } from "./types.js";
 import { buildHintsFromConfig } from "./workflow-hints.js";
 
@@ -232,7 +231,6 @@ const ANNOUNCEMENT_FOOTER = "Join us on Discord: https://discord.gg/DSa65w8wuf";
  * - Reading: aft_outline
  * - Safety: aft_safety
  * - Imports: aft_import
- * - Structure: aft_transform
  * - Navigation: aft_callgraph
  * - Refactoring: aft_refactor
  */
@@ -870,17 +868,11 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // Tool surface tiers:
   //   minimal:     aft_outline, aft_zoom, aft_safety
   //   recommended: minimal + hoisted + ast_grep_* + aft_import (default)
-  //   all:         recommended + aft_callgraph, aft_delete, aft_move, aft_transform, aft_refactor
+  //   all:         recommended + aft_callgraph, aft_delete, aft_move, aft_refactor
   const surface = aftConfig.tool_surface ?? "recommended";
 
   // Tools only available in "all" tier
-  const ALL_ONLY_TOOLS = new Set([
-    "aft_callgraph",
-    "aft_delete",
-    "aft_move",
-    "aft_transform",
-    "aft_refactor",
-  ]);
+  const ALL_ONLY_TOOLS = new Set(["aft_callgraph", "aft_delete", "aft_move", "aft_refactor"]);
 
   // Build full tool map
   const allTools = normalizeToolMap({
@@ -892,7 +884,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     ...safetyTools(ctx),
     // aft_import: recommended+
     ...(surface !== "minimal" && importTools(ctx)),
-    ...structureTools(ctx),
     ...navigationTools(ctx),
     // AST tools: recommended+
     ...(surface !== "minimal" && astTools(ctx)),

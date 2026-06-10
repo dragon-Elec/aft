@@ -245,7 +245,7 @@ export const AftConfigSchema = z
      * - "minimal":     aft_outline, aft_zoom, aft_safety (no hoisting)
      * - "recommended": minimal + hoisted read/write/edit/apply_patch
      *                  + ast_grep_search/replace + aft_import (default)
-     * - "all":         recommended + aft_callgraph, aft_delete, aft_move, aft_transform, aft_refactor
+     * - "all":         recommended + aft_callgraph, aft_delete, aft_move, aft_refactor
      */
     tool_surface: z.enum(["minimal", "recommended", "all"]).optional(),
     /**

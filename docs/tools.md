@@ -66,7 +66,6 @@ Always registered with `aft_` prefix regardless of hoisting setting.
 | `aft_delete` | Delete one or more files (or directories) with backup | `files`, `recursive` |
 | `aft_move` | Move or rename a file with backup | `filePath`, `destination` |
 | `aft_callgraph` | Call graph and data-flow navigation | `op`, `filePath`, `symbol`, `depth` |
-| `aft_transform` | Structural code transforms (members, derives, decorators) | `op`, `filePath`, `container`, `target` |
 | `aft_refactor` | Workspace-wide move, extract, inline | `op`, `filePath`, `symbol`, `destination` |
 
 ---
@@ -957,33 +956,6 @@ in it) instead of pretending the removal succeeded. For languages whose grammar 
 safely regenerated (wildcard/group/rename forms), `organize` sorts verbatim and refuses
 rather than corrupting syntax; a generated line that fails to parse rolls back and reports
 `generated_invalid_syntax` instead of a false success.
-
----
-
-### aft_transform
-
-Scope-aware structural transformations that handle indentation correctly.
-
-| Op | Description |
-|----|-------------|
-| `add_member` | Insert a method or field into a class, struct, or impl block |
-| `add_derive` | Add Rust derive macros (deduplicates) |
-| `wrap_try_catch` | Wrap a TS/JS function body in try/catch |
-| `add_decorator` | Add a Python decorator to a function or class |
-| `add_struct_tags` | Add or update Go struct field tags |
-
-```json
-// Add a method to a TypeScript class
-{
-  "op": "add_member",
-  "filePath": "src/user.ts",
-  "container": "UserService",
-  "code": "async deleteUser(id: string): Promise<void> {\n  await this.db.users.delete(id);\n}",
-  "position": "last"
-}
-```
-
-All ops support `validate` (`"syntax"` or `"full"`). Use `aft_safety checkpoint` / `undo` before risky transforms.
 
 ---
 

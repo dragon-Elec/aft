@@ -329,18 +329,23 @@ fn path_arg_target(arg: &str, cwd: &Path) -> PathArgTarget {
         return PathArgTarget::None;
     };
 
+    // Check the raw string BEFORE PathBuf construction/canonicalization:
+    // - on Linux /dev/stderr etc. are symlinks (/proc/self/fd/2 -> /dev/pts/0)
+    //   that no longer match the allowlist once resolved;
+    // - on Windows, `cwd.join("/dev/null")` mangles the path to `C:\dev\null`,
+    //   so a PathBuf-based check never matches (the PR #107 tests failed on
+    //   Windows CI for exactly this reason). The agent typed a POSIX device
+    //   path; match it as the string it is.
+    if is_device_file(text) {
+        return PathArgTarget::None;
+    }
+
     let path = PathBuf::from(text);
     let resolved = if path.is_absolute() {
         path
     } else {
         cwd.join(path)
     };
-    // Check before canonicalization: on Linux /dev/stderr etc. are symlinks
-    // (/proc/self/fd/2 -> /dev/pts/0) that no longer match the allowlist
-    // once resolved.
-    if is_device_file(&resolved) {
-        return PathArgTarget::None;
-    }
     PathArgTarget::Path(resolve_existing(&resolved))
 }
 
@@ -455,10 +460,11 @@ fn push_xargs_ask(asks: &mut Vec<PermissionAsk>, seen: &mut HashSet<String>, tok
     push_bash_ask(asks, seen, tokens[index..].join(" "), &tokens[index..]);
 }
 
-fn is_device_file(path: &Path) -> bool {
-    let Some(s) = path.to_str() else {
-        return false;
-    };
+/// Match POSIX device-file paths on the RAW string the agent typed (not a
+/// canonicalized PathBuf — see the call site for why). `/dev/fd/` accepts
+/// only bare numeric descriptors: `/dev/fd/../sda` resolves to a real block
+/// device, and the scanner must fail closed on anything path-shaped.
+fn is_device_file(s: &str) -> bool {
     matches!(
         s,
         "/dev/null"
@@ -469,7 +475,9 @@ fn is_device_file(path: &Path) -> bool {
             | "/dev/stdout"
             | "/dev/stderr"
             | "/dev/tty"
-    ) || s.starts_with("/dev/fd/")
+    ) || s
+        .strip_prefix("/dev/fd/")
+        .is_some_and(|fd| !fd.is_empty() && fd.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn push_external_path(
@@ -544,6 +552,27 @@ mod tests {
         let path = arg_path("./file.log", &scan_cwd).unwrap();
 
         assert_eq!(path, normalize_path(&scan_cwd.join("file.log")));
+    }
+
+    #[test]
+    fn dev_fd_accepts_only_numeric_descriptors() {
+        // `/dev/fd/2` is a process file descriptor; `/dev/fd/../sda` resolves
+        // to a real block device. The scanner fails closed on the latter.
+        for arg in ["/dev/fd/0", "/dev/fd/2", "/dev/fd/255"] {
+            assert!(
+                matches!(path_arg_target(arg, Path::new("/tmp")), PathArgTarget::None),
+                "expected {arg} to be skipped as a device path"
+            );
+        }
+        for arg in ["/dev/fd/../sda", "/dev/fd/", "/dev/fd/2x", "/dev/fd/2/x"] {
+            assert!(
+                matches!(
+                    path_arg_target(arg, Path::new("/tmp")),
+                    PathArgTarget::Path(_)
+                ),
+                "expected {arg} to be treated as a regular path (fail closed)"
+            );
+        }
     }
 
     #[test]

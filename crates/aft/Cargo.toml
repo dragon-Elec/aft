@@ -91,6 +91,7 @@ tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-
 ndarray = "0.17.2"
 half = "2"
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+htmd = "0.5.4"
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"

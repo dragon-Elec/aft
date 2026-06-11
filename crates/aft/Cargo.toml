@@ -84,7 +84,10 @@ tree-sitter-scss = { package = "cortexkit-tree-sitter-scss", version = "1.0.1" }
 # the model on fresh installs; ureq feature = sync + rustls (no native-tls, for
 # clean cross-platform builds).
 ort = { version = "=2.0.0-rc.11", default-features = false, features = ["ndarray", "load-dynamic", "half"] }
-tokenizers = "0.22.2"
+# We only load tokenizer.json and encode; serde/json support is always-on in
+# tokenizers. The pure-Rust fancy-regex backend satisfies tokenizers
+# compile-time regex selection without pulling in onig's C library.
+tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"] }
 ndarray = "0.17.2"
 half = "2"
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }

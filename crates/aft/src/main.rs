@@ -975,17 +975,6 @@ where
     }
 }
 
-fn semantic_project_files_for_refresh(
-    root: &std::path::Path,
-    max_files: usize,
-) -> Result<Vec<std::path::PathBuf>, usize> {
-    aft::search_index::walk_project_files_bounded_default_matching(
-        root,
-        max_files,
-        aft::semantic_index::is_semantic_indexed_extension,
-    )
-}
-
 fn watcher_path_is_ignored_by_current_matcher(ctx: &AppContext, path: &std::path::Path) -> bool {
     if watcher_path_is_infra_skip(path) {
         return true;
@@ -1411,40 +1400,26 @@ fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
     }
 
     if config.semantic_search {
-        match semantic_project_files_for_refresh(&root, config.semantic.max_files) {
-            Ok(current_files) => {
-                if let Some(sender) = ctx.semantic_refresh_sender() {
-                    let file_count = current_files.len();
-                    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
-                        stage: "refreshing_corpus".to_string(),
-                        files: Some(file_count),
-                        entries_done: None,
-                        entries_total: None,
-                    };
-                    match sender.send(SemanticRefreshRequest::Corpus { current_files }) {
-                        Ok(()) => {
-                            status_changed = true;
-                        }
-                        Err(error) => {
-                            *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(
-                                format!("semantic corpus refresh worker unavailable: {error}"),
-                            );
-                            status_changed = true;
-                        }
-                    }
-                } else if ctx.semantic_index_rx().borrow().is_some() {
-                    ctx.mark_pending_semantic_corpus_refresh();
+        if let Some(sender) = ctx.semantic_refresh_sender() {
+            *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+                stage: "refreshing_corpus".to_string(),
+                files: None,
+                entries_done: None,
+                entries_total: None,
+            };
+            match sender.send(SemanticRefreshRequest::Corpus) {
+                Ok(()) => {
+                    status_changed = true;
+                }
+                Err(error) => {
+                    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(
+                        format!("semantic corpus refresh worker unavailable: {error}"),
+                    );
+                    status_changed = true;
                 }
             }
-            Err(_) => {
-                ctx.clear_semantic_refresh_worker();
-                *ctx.semantic_index().borrow_mut() = None;
-                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(format!(
-                    "too many files (>{}) for semantic indexing (max {})",
-                    config.semantic.max_files, config.semantic.max_files
-                ));
-                status_changed = true;
-            }
+        } else if ctx.semantic_index_rx().borrow().is_some() {
+            ctx.mark_pending_semantic_corpus_refresh();
         }
     }
 
@@ -1949,40 +1924,22 @@ fn drain_semantic_index_events(ctx: &AppContext) {
     }
 
     if replay_corpus_refresh {
-        if let Some(root) = ctx.canonical_cache_root_opt() {
-            let config = ctx.config().clone();
-            match semantic_project_files_for_refresh(&root, config.semantic.max_files) {
-                Ok(current_files) => {
-                    let file_count = current_files.len();
-                    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
-                        stage: "refreshing_corpus".to_string(),
-                        files: Some(file_count),
-                        entries_done: None,
-                        entries_total: None,
-                    };
-                    let sent = ctx.semantic_refresh_sender().is_some_and(|sender| {
-                        sender
-                            .send(SemanticRefreshRequest::Corpus { current_files })
-                            .is_ok()
-                    });
-                    if !sent {
-                        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(
-                            "semantic corpus refresh worker unavailable".to_string(),
-                        );
-                    }
-                    status_changed = true;
-                }
-                Err(_) => {
-                    ctx.clear_semantic_refresh_worker();
-                    *ctx.semantic_index().borrow_mut() = None;
-                    *ctx.semantic_index_status().borrow_mut() =
-                        SemanticIndexStatus::Failed(format!(
-                            "too many files (>{}) for semantic indexing (max {})",
-                            config.semantic.max_files, config.semantic.max_files
-                        ));
-                    status_changed = true;
-                }
+        if ctx.canonical_cache_root_opt().is_some() {
+            *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+                stage: "refreshing_corpus".to_string(),
+                files: None,
+                entries_done: None,
+                entries_total: None,
+            };
+            let sent = ctx
+                .semantic_refresh_sender()
+                .is_some_and(|sender| sender.send(SemanticRefreshRequest::Corpus).is_ok());
+            if !sent {
+                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(
+                    "semantic corpus refresh worker unavailable".to_string(),
+                );
             }
+            status_changed = true;
         }
     } else if !replay_refresh_paths.is_empty() {
         {
@@ -2059,6 +2016,15 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
                     }
                     status_changed = true;
                 }
+            }
+            SemanticRefreshEvent::CorpusStarted { files } => {
+                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+                    stage: "refreshing_corpus".to_string(),
+                    files: Some(files),
+                    entries_done: None,
+                    entries_total: None,
+                };
+                status_changed = true;
             }
             SemanticRefreshEvent::Completed {
                 added_entries,
@@ -2406,7 +2372,7 @@ mod watcher_filter_tests {
             .expect("semantic refresh request")
         {
             SemanticRefreshRequest::Files { paths } => paths,
-            SemanticRefreshRequest::Corpus { .. } => panic!("unexpected corpus refresh"),
+            SemanticRefreshRequest::Corpus => panic!("unexpected corpus refresh"),
         }
     }
 
@@ -3000,7 +2966,7 @@ mod watcher_filter_tests {
             .expect("semantic refresh request")
         {
             SemanticRefreshRequest::Files { paths } => assert_eq!(paths, vec![file]),
-            SemanticRefreshRequest::Corpus { .. } => panic!("unexpected corpus refresh"),
+            SemanticRefreshRequest::Corpus => panic!("unexpected corpus refresh"),
         }
     }
 
@@ -3036,7 +3002,7 @@ mod watcher_filter_tests {
                 .expect("retry request")
             {
                 SemanticRefreshRequest::Files { paths } => assert_eq!(paths, vec![file.clone()]),
-                SemanticRefreshRequest::Corpus { .. } => panic!("unexpected corpus refresh"),
+                SemanticRefreshRequest::Corpus => panic!("unexpected corpus refresh"),
             }
             assert_eq!(ctx.semantic_index_status().borrow().refreshing_count(), 1);
         });

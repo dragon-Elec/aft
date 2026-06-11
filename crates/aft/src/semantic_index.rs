@@ -1680,18 +1680,28 @@ impl SemanticIndex {
 
         // Files in cache that disappeared from disk OR are no longer in the
         // walked set. Both cases need their entries dropped.
+        enum IndexedFileCheck {
+            Deleted(PathBuf),
+            MissingMetadata(PathBuf),
+            Verified(PathBuf, FreshnessVerdict),
+        }
+
         let mut deleted: Vec<PathBuf> = Vec::new();
         let mut changed: Vec<PathBuf> = Vec::new();
         let indexed_paths: Vec<PathBuf> = self.file_mtimes.keys().cloned().collect();
-        for indexed_path in &indexed_paths {
+        let mut checks: Vec<Option<IndexedFileCheck>> = Vec::with_capacity(indexed_paths.len());
+        let mut strict_verify_inputs: Vec<(usize, PathBuf, FileFreshness)> = Vec::new();
+
+        for indexed_path in indexed_paths {
+            let check_index = checks.len();
             if !current_set.contains(indexed_path.as_path()) {
-                deleted.push(indexed_path.clone());
+                checks.push(Some(IndexedFileCheck::Deleted(indexed_path)));
                 continue;
             }
             let cached = match (
-                self.file_mtimes.get(indexed_path),
-                self.file_sizes.get(indexed_path),
-                self.file_hashes.get(indexed_path),
+                self.file_mtimes.get(&indexed_path),
+                self.file_sizes.get(&indexed_path),
+                self.file_hashes.get(&indexed_path),
             ) {
                 (Some(mtime), Some(size), Some(hash)) => Some(FileFreshness {
                     mtime: *mtime,
@@ -1700,19 +1710,40 @@ impl SemanticIndex {
                 }),
                 _ => None,
             };
-            match cached
-                .map(|freshness| cache_freshness::verify_file_strict(indexed_path, &freshness))
-            {
-                Some(FreshnessVerdict::HotFresh) => {}
-                Some(FreshnessVerdict::ContentFresh {
-                    new_mtime,
-                    new_size,
-                }) => {
-                    self.file_mtimes.insert(indexed_path.clone(), new_mtime);
-                    self.file_sizes.insert(indexed_path.clone(), new_size);
+            if let Some(freshness) = cached {
+                strict_verify_inputs.push((check_index, indexed_path, freshness));
+                checks.push(None);
+            } else {
+                checks.push(Some(IndexedFileCheck::MissingMetadata(indexed_path)));
+            }
+        }
+
+        for (check_index, path, verdict) in
+            cache_freshness::verify_files_strict_bounded(strict_verify_inputs)
+        {
+            checks[check_index] = Some(IndexedFileCheck::Verified(path, verdict));
+        }
+
+        for check in checks {
+            match check.expect("strict freshness check should be populated") {
+                IndexedFileCheck::Deleted(path) => deleted.push(path),
+                IndexedFileCheck::MissingMetadata(path) => changed.push(path),
+                IndexedFileCheck::Verified(_path, FreshnessVerdict::HotFresh) => {}
+                IndexedFileCheck::Verified(
+                    path,
+                    FreshnessVerdict::ContentFresh {
+                        new_mtime,
+                        new_size,
+                    },
+                ) => {
+                    self.file_mtimes.insert(path.clone(), new_mtime);
+                    self.file_sizes.insert(path, new_size);
                 }
-                Some(FreshnessVerdict::Stale | FreshnessVerdict::Deleted) | None => {
-                    changed.push(indexed_path.clone());
+                IndexedFileCheck::Verified(
+                    path,
+                    FreshnessVerdict::Stale | FreshnessVerdict::Deleted,
+                ) => {
+                    changed.push(path);
                 }
             }
         }

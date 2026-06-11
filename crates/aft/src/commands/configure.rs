@@ -188,15 +188,15 @@ fn spawn_semantic_refresh_worker(
         log_ctx::with_session(session_id, || {
             while let Ok(first_request) = request_rx.recv() {
                 let mut paths = Vec::new();
-                let mut corpus_files = None;
+                let mut corpus_requested = false;
                 match first_request {
                     SemanticRefreshRequest::Files {
                         paths: request_paths,
                     } => {
                         paths.extend(request_paths);
                     }
-                    SemanticRefreshRequest::Corpus { current_files } => {
-                        corpus_files = Some(current_files);
+                    SemanticRefreshRequest::Corpus => {
+                        corpus_requested = true;
                     }
                 }
 
@@ -204,7 +204,7 @@ fn spawn_semantic_refresh_worker(
                 let quiet_window = Duration::from_millis(SEMANTIC_REFRESH_QUIET_WINDOW_MS);
                 let mut deadline = Instant::now() + quiet_window;
 
-                while corpus_files.is_none() && paths.len() < SEMANTIC_REFRESH_MAX_BATCH_PATHS {
+                while !corpus_requested && paths.len() < SEMANTIC_REFRESH_MAX_BATCH_PATHS {
                     let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                         break;
                     };
@@ -218,9 +218,9 @@ fn spawn_semantic_refresh_worker(
                             }
                             deadline = Instant::now() + quiet_window;
                         }
-                        Ok(SemanticRefreshRequest::Corpus { current_files }) => {
+                        Ok(SemanticRefreshRequest::Corpus) => {
                             paths.clear();
-                            corpus_files = Some(current_files);
+                            corpus_requested = true;
                             break;
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
@@ -235,7 +235,32 @@ fn spawn_semantic_refresh_worker(
                     break;
                 }
 
-                if let Some(mut current_files) = corpus_files {
+                if corpus_requested {
+                    let mut current_files = match walk_semantic_project_files_bounded(
+                        &project_root,
+                        max_files,
+                    ) {
+                        Ok(files) => files,
+                        Err(observed) => {
+                            let error = format!(
+                                "too many files (>{}) for semantic indexing (max {})",
+                                max_files, max_files
+                            );
+                            slog_warn!(
+                                "skipping semantic corpus refresh: more than {} files exceeds limit of {}. \
+                                 Raise semantic.max_files or open a specific project directory.",
+                                observed.saturating_sub(1),
+                                max_files
+                            );
+                            if event_tx
+                                .send(SemanticRefreshEvent::CorpusFailed { error })
+                                .is_err()
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
                     current_files.sort();
                     current_files.dedup();
                     if current_files.len() > max_files {
@@ -245,6 +270,14 @@ fn spawn_semantic_refresh_worker(
                         );
                         let _ = event_tx.send(SemanticRefreshEvent::CorpusFailed { error });
                         continue;
+                    }
+                    if event_tx
+                        .send(SemanticRefreshEvent::CorpusStarted {
+                            files: current_files.len(),
+                        })
+                        .is_err()
+                    {
+                        break;
                     }
 
                     let mut embed = |texts: Vec<String>| model.embed(texts);

@@ -95,7 +95,9 @@ impl From<serde_json::Error> for InspectCacheError {
 /// preview is folded into all three Tier-2 aggregates — changes cached payload.
 /// v12: dead_code internal call rows include call-edge provenance, changing
 /// cached per-file contribution payloads and aggregate roll-up inputs.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 12;
+/// v13: dead_code callgraph snapshots are projected from the persisted
+/// CallgraphStore; per-row provenance now reflects store resolution tiers.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 13;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1354,6 +1356,6 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 12);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 13);
     }
 }

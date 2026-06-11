@@ -138,7 +138,7 @@ pub struct Config {
     /// the grep-rewrite footer: when true the footer steers to `aft_search`,
     /// otherwise to the `grep` tool. Not a capability gate.
     pub aft_search_registered: bool,
-    /// Enable the persisted callgraph store substrate (default: false).
+    /// Enable the persisted callgraph store substrate (default: true).
     pub callgraph_store: bool,
     /// Enable experimental bash command rewriting (default: false).
     pub experimental_bash_rewrite: bool,
@@ -157,7 +157,7 @@ pub struct Config {
     /// Maximum file size to fully index in bytes (default: 1MB).
     pub search_index_max_file_size: u64,
     /// Maximum number of source files allowed for legacy in-memory call-graph operations
-    /// (`trace_data`, symbol move analysis, and dead-code snapshots). Store-backed
+    /// (`trace_data` and symbol move analysis). Store-backed dead_code and
     /// edge-query commands (`callers`, `call_tree`, `impact`, `trace_to`,
     /// `trace_to_symbol`) are not capped by this setting. Does not affect
     /// `grep`, `glob`, `read`, `edit`, or other non-callgraph features.
@@ -227,7 +227,7 @@ impl Default for Config {
             search_index: false,
             semantic_search: false,
             aft_search_registered: false,
-            callgraph_store: false,
+            callgraph_store: true,
             experimental_bash_rewrite: false,
             experimental_bash_compress: false,
             experimental_bash_background: false,

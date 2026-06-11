@@ -1,5 +1,5 @@
 use rusqlite::{Connection, OpenFlags};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -25,9 +25,10 @@ pub fn project_dead_code_snapshot(db_path: &Path) -> Result<CallgraphSnapshot> {
     }
 
     let project_root = project_root_from_backend_state(&conn)?;
-    let files = project_files_from_store(&conn, &project_root)?;
-    let exported_symbols = exported_symbols_from_store(&conn, &project_root)?;
-    let outbound_calls = outbound_calls_from_store(&conn, &project_root)?;
+    let mut paths = SnapshotPathResolver::new(&project_root);
+    let files = project_files_from_store(&conn, &mut paths)?;
+    let exported_symbols = exported_symbols_from_store(&conn, &mut paths)?;
+    let outbound_calls = outbound_calls_from_store(&conn, &mut paths)?;
     let entry_points = entry_points_for_files(&project_root, &files);
 
     Ok(CallgraphSnapshot {
@@ -62,20 +63,21 @@ fn project_root_from_backend_state(conn: &Connection) -> Result<PathBuf> {
     }
 }
 
-fn project_files_from_store(conn: &Connection, project_root: &Path) -> Result<Vec<PathBuf>> {
+fn project_files_from_store(
+    conn: &Connection,
+    paths: &mut SnapshotPathResolver<'_>,
+) -> Result<Vec<PathBuf>> {
     let mut statement = conn.prepare("SELECT path FROM files ORDER BY path")?;
     let files = statement
         .query_map([], |row| row.get::<_, String>(0))?
-        .map(|path| {
-            path.map(|path| canonicalize_for_snapshot(&absolute_store_path(project_root, &path)))
-        })
+        .map(|path| path.map(|path| paths.resolve(&path)))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(files)
 }
 
 fn exported_symbols_from_store(
     conn: &Connection,
-    project_root: &Path,
+    paths: &mut SnapshotPathResolver<'_>,
 ) -> Result<Vec<CallgraphExport>> {
     let mut statement = conn.prepare(
         "SELECT file_path, name, kind, start_line, exported, is_default_export
@@ -97,7 +99,7 @@ fn exported_symbols_from_store(
     let mut exports = Vec::new();
     for row in rows {
         let row = row?;
-        let file = canonicalize_for_snapshot(&absolute_store_path(project_root, &row.file_path));
+        let file = paths.resolve(&row.file_path);
         if row.exported {
             exports.push(CallgraphExport {
                 file: file.clone(),
@@ -120,24 +122,25 @@ fn exported_symbols_from_store(
 
 fn outbound_calls_from_store(
     conn: &Connection,
-    project_root: &Path,
+    paths: &mut SnapshotPathResolver<'_>,
 ) -> Result<Vec<CallgraphOutboundCall>> {
     let mut statement = conn.prepare(
         "SELECT r.ref_id,
                 r.caller_file,
-                n.scoped_name,
+                n.name,
                 r.short_name,
                 r.full_ref,
                 r.status,
                 COALESCE(r.target_file, e.target_file),
-                COALESCE(r.target_symbol, e.target_symbol),
+                COALESCE(tn.name, r.target_symbol, e.target_symbol),
                 r.line,
                 COALESCE(e.provenance, r.provenance)
          FROM refs r
          LEFT JOIN nodes n ON n.id = r.caller_node
          LEFT JOIN edges e ON e.ref_id = r.ref_id AND e.kind = 'call'
+         LEFT JOIN nodes tn ON tn.id = e.target_node
          WHERE r.kind = 'call'
-         ORDER BY r.caller_file, n.scoped_name, r.line, r.byte_start, r.byte_end, r.ref_id",
+         ORDER BY r.caller_file, n.name, r.line, r.byte_start, r.byte_end, r.ref_id",
     )?;
     let rows = statement.query_map([], |row| {
         Ok(OutboundRow {
@@ -157,19 +160,17 @@ fn outbound_calls_from_store(
     let mut calls = Vec::new();
     for row in rows {
         let row = row?;
-        let caller_file =
-            canonicalize_for_snapshot(&absolute_store_path(project_root, &row.caller_file));
+        let caller_file = paths.resolve(&row.caller_file);
         let caller_symbol = caller_symbol_from_row(&row)?;
         let short_name = row
             .short_name
             .as_deref()
             .or(row.full_ref.as_deref())
             .unwrap_or_default();
-        let mut target = if is_resolved_status(&row.status) {
+        let mut target = if is_resolved_edge(&row.status, Some(row.provenance.as_str())) {
             match (row.target_file.as_deref(), row.target_symbol.as_deref()) {
                 (Some(target_file), Some(target_symbol)) => {
-                    let target_file =
-                        canonicalize_for_snapshot(&absolute_store_path(project_root, target_file));
+                    let target_file = paths.resolve(target_file);
                     format!("{}::{target_symbol}", target_file.display())
                 }
                 _ => short_name.to_string(),
@@ -216,8 +217,12 @@ fn caller_symbol_from_row(row: &OutboundRow) -> Result<String> {
     })
 }
 
-fn is_resolved_status(status: &str) -> bool {
+fn is_resolved_edge(status: &str, provenance: Option<&str>) -> bool {
     matches!(status, "resolved" | "resolved_local")
+        || provenance.is_some_and(|provenance| {
+            provenance != "name_match"
+                && (provenance.contains("treesitter") || provenance.contains("resolver"))
+        })
 }
 
 fn is_method_dispatch_callee(full_callee: &str, callee_name: &str) -> bool {
@@ -231,6 +236,29 @@ fn is_method_dispatch_callee(full_callee: &str, callee_name: &str) -> bool {
         .next()
         .map(|segment| segment.trim().trim_start_matches('?') == callee_name.trim())
         .unwrap_or(false)
+}
+
+struct SnapshotPathResolver<'a> {
+    project_root: &'a Path,
+    cache: HashMap<String, PathBuf>,
+}
+
+impl<'a> SnapshotPathResolver<'a> {
+    fn new(project_root: &'a Path) -> Self {
+        Self {
+            project_root,
+            cache: HashMap::new(),
+        }
+    }
+
+    fn resolve(&mut self, store_path: &str) -> PathBuf {
+        if let Some(path) = self.cache.get(store_path) {
+            return path.clone();
+        }
+        let path = canonicalize_for_snapshot(&absolute_store_path(self.project_root, store_path));
+        self.cache.insert(store_path.to_string(), path.clone());
+        path
+    }
 }
 
 fn absolute_store_path(project_root: &Path, store_path: &str) -> PathBuf {

@@ -15,8 +15,8 @@ use std::collections::{HashMap, HashSet};
 use crate::callgraph::CallGraph;
 use crate::config::{SemanticBackend, SemanticBackendConfig, UserServerDef};
 use crate::context::{
-    AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent,
-    SemanticRefreshRequest, SemanticRefreshWorkerSlot,
+    AppContext, CallgraphStoreAccess, SemanticIndexEvent, SemanticIndexStatus,
+    SemanticRefreshEvent, SemanticRefreshRequest, SemanticRefreshWorkerSlot,
 };
 use crate::harness::Harness;
 use crate::log_ctx;
@@ -1801,7 +1801,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     };
     if exceeds {
         slog_warn!(
-            "project has >{} source files. Legacy in-memory call-graph operations (trace_data, dead_code snapshots, symbol move analysis) will be disabled. Store-backed callers/call_tree/impact/trace_to/trace_to_symbol remain available.",
+            "project has >{} source files. Legacy in-memory call-graph operations (trace_data, symbol move analysis) will be disabled. Store-backed dead_code and callers/call_tree/impact/trace_to/trace_to_symbol remain available.",
             max_callgraph_files
         );
     }
@@ -2439,6 +2439,23 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // Initialize call graph with the project root
     let graph = CallGraph::new(root_path.clone());
     *ctx.callgraph().borrow_mut() = Some(graph);
+
+    if next_config.callgraph_store && !home_match {
+        match ctx.callgraph_store_for_ops() {
+            CallgraphStoreAccess::Ready(_) => {
+                slog_debug!("callgraph store ready at configure");
+            }
+            CallgraphStoreAccess::Building => {
+                slog_info!("callgraph store warm build scheduled at configure");
+            }
+            CallgraphStoreAccess::Unavailable => {
+                slog_info!("callgraph store unavailable at configure; dead_code will retry later");
+            }
+            CallgraphStoreAccess::Error(error) => {
+                slog_warn!("callgraph store configure warm failed: {}", error);
+            }
+        }
+    }
 
     let bg_storage_root = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
     crate::bash_background::repair_legacy_root_tasks(&bg_storage_root, harness);

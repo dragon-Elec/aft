@@ -489,6 +489,14 @@ fn store_trace_data_outputs_match_legacy_for_edge_cases() {
             0,
         ),
         ("visited-set cycle", "src/flow.ts", "cycleA", "value", 5),
+        ("direct self-recursion", "src/flow.ts", "f", "x", 5),
+        (
+            "mutual recursion through a self-call",
+            "src/flow.ts",
+            "mutualF",
+            "x",
+            5,
+        ),
         (
             "scoped class method",
             "src/flow.ts",
@@ -513,6 +521,32 @@ fn store_trace_data_outputs_match_legacy_for_edge_cases() {
     ] {
         assert_trace_data_parity(&root, &store, label, file, symbol, expression, depth);
     }
+}
+
+#[test]
+fn store_trace_data_self_recursion_does_not_change_callers_or_impact() {
+    let dir = tempdir().unwrap();
+    write_trace_data_parity_project(dir.path());
+    let root = std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
+    let store =
+        CallGraphStore::open(root.join(".trace-data-self-recursion-store"), root.clone()).unwrap();
+    store.cold_build(&project_files(&root)).unwrap();
+
+    let file = root.join("src/flow.ts");
+    let callers = serde_json::to_value(
+        callgraph_store_adapter::callers_result(&store, &file, "f", 2).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(callers["total_callers"], json!(0));
+    assert_eq!(callers["callers"], json!([]));
+
+    let impact = serde_json::to_value(
+        callgraph_store_adapter::impact_result(&store, &file, "f", 2).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(impact["total_affected"], json!(0));
+    assert_eq!(impact["affected_files"], json!(0));
+    assert_eq!(impact["callers"], json!([]));
 }
 
 #[test]
@@ -2072,6 +2106,19 @@ export function cycleA(value: string): void {
 
 export function cycleB(value: string): void {
   cycleA(value);
+}
+
+export function f(x: string): void {
+  f(x);
+}
+
+export function mutualF(x: string): void {
+  mutualF(x);
+  mutualG(x);
+}
+
+export function mutualG(x: string): void {
+  mutualF(x);
 }
 
 export class Worker {

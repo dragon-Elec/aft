@@ -1217,6 +1217,13 @@ impl CallGraphStore {
         outgoing_calls_for_node(&conn, node)
     }
 
+    /// Return resolved direct self-call refs suppressed from the general edge table.
+    pub fn resolved_self_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        ensure_database_ready(&conn)?;
+        resolved_self_calls_for_node(&conn, node)
+    }
+
     pub fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         ensure_database_ready(&conn)?;
@@ -1699,6 +1706,75 @@ fn outgoing_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<St
             row.get::<_, String>(7)?,
         ))
     })?;
+
+    let mut calls = Vec::new();
+    for row in rows {
+        let (
+            target_node,
+            target_file,
+            target_symbol,
+            line,
+            byte_start,
+            byte_end,
+            status,
+            provenance,
+        ) = row?;
+        let target = target_node
+            .as_deref()
+            .map(|node_id| load_node_by_id(conn, node_id))
+            .transpose()?
+            .flatten();
+        calls.push(StoreCallSite {
+            caller: node.clone(),
+            target_file,
+            target_symbol,
+            target,
+            line: line.max(0) as u32,
+            byte_start: byte_start.max(0) as usize,
+            byte_end: byte_end.max(0) as usize,
+            resolved: status == "resolved",
+            provenance,
+        });
+    }
+    Ok(calls)
+}
+
+fn resolved_self_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.target_node, r.target_file, r.target_symbol, r.line,
+                r.byte_start, r.byte_end, r.status, r.provenance
+         FROM refs r
+         WHERE r.caller_node = ?1
+           AND r.kind = 'call'
+           AND r.status <> 'unresolved'
+           AND r.target_file = ?2
+           AND r.target_symbol = ?3
+           AND r.provenance = ?4
+           AND NOT EXISTS (
+               SELECT 1 FROM edges e WHERE e.ref_id = r.ref_id AND e.kind = 'call'
+           )
+         ORDER BY r.byte_start, r.line, r.ref_id",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            &node.node_id,
+            &node.file,
+            &node.symbol,
+            PROVENANCE_TREESITTER
+        ],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        },
+    )?;
 
     let mut calls = Vec::new();
     for row in rows {

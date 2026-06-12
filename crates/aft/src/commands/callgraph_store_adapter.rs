@@ -1080,6 +1080,13 @@ fn trace_forward_calls_for_nodes(
         );
         calls.extend(
             store
+                .resolved_self_calls_of(node)?
+                .into_iter()
+                .filter(|site| site.resolved_by() == TRACE_DATA_RESOLVER_PROVENANCE)
+                .map(TraceForwardCall::Resolved),
+        );
+        calls.extend(
+            store
                 .unresolved_calls_of(node)?
                 .into_iter()
                 .map(TraceForwardCall::Unresolved),

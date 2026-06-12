@@ -2397,6 +2397,59 @@ mod status_bar_tests {
         assert!(removed);
         assert_eq!(ctx.status_bar_counts().expect("populated").errors, 0);
     }
+
+    #[test]
+    fn status_bar_filtered_counts_ignore_environmental_flap() {
+        use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
+        use crate::lsp::registry::ServerKind;
+        use crate::lsp::roots::ServerKey;
+
+        let ctx = ctx();
+        let root = std::path::PathBuf::from("/proj");
+        ctx.set_canonical_cache_root(root.clone());
+        ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false);
+
+        let file = root.join("aft.jsonc");
+        let key = ServerKey {
+            kind: ServerKind::TypeScript,
+            root: root.clone(),
+        };
+        let env = StoredDiagnostic {
+            file: file.clone(),
+            line: 1,
+            column: 1,
+            end_line: 1,
+            end_column: 2,
+            severity: DiagnosticSeverity::Error,
+            message: "Failed to load schema from https://example.com/schema.json".into(),
+            code: None,
+            source: Some("json".into()),
+        };
+
+        assert_eq!(ctx.status_bar_counts().expect("populated").errors, 0);
+
+        {
+            let mut lsp = ctx.lsp();
+            lsp.diagnostics_store_mut_for_test()
+                .publish(key.clone(), file.clone(), vec![env]);
+        }
+        assert_eq!(
+            ctx.status_bar_counts().expect("populated").errors,
+            0,
+            "environmental publish must not change status-bar E"
+        );
+
+        {
+            let mut lsp = ctx.lsp();
+            lsp.diagnostics_store_mut_for_test()
+                .publish(key, file, vec![]);
+        }
+        assert_eq!(
+            ctx.status_bar_counts().expect("populated").errors,
+            0,
+            "environmental clear must not change status-bar E"
+        );
+    }
 }
 
 #[cfg(test)]

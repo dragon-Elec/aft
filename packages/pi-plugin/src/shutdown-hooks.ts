@@ -79,12 +79,19 @@ function installProcessHandlers(): void {
 
   const signals = ["SIGTERM", "SIGINT", "SIGHUP"] as const;
   for (const sig of signals) {
-    process.on(sig, () => {
+    const handler = () => {
       const others = process.listenerCount(sig) - 1;
       if (!shouldForceExit(others)) {
         // Named deferral: a shutdown hang is then attributable to the OTHER
         // listener from the log alone.
-        log(`${sig}: deferring termination to ${others} other listener(s); cleanup only`);
+        const names = process
+          .listeners(sig)
+          .filter((fn) => fn !== handler)
+          .map((fn) => fn.name || fn.toString().slice(0, 80).replace(/\s+/g, " "))
+          .join(" | ");
+        log(
+          `${sig}: deferring termination to ${others} other listener(s); cleanup only. Others: ${names}`,
+        );
         void runCleanups(sig);
         return;
       }
@@ -104,7 +111,8 @@ function installProcessHandlers(): void {
       void Promise.race([runCleanups(sig), timeout]).finally(() => {
         process.exit(SIGNAL_EXIT_CODES[sig]);
       });
-    });
+    };
+    process.on(sig, handler);
   }
   process.on("beforeExit", () => {
     void runCleanups("beforeExit");

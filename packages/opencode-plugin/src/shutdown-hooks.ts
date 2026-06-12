@@ -97,7 +97,14 @@ function installProcessHandlers(): void {
         // Host owns termination; run best-effort cleanup alongside it. The log
         // line names the deferral so a hang is attributable to the OTHER
         // listener (this exact triage cost a cross-team debugging round).
-        log(`${sig}: deferring termination to ${others} other listener(s); cleanup only`);
+        const names = process
+          .listeners(sig)
+          .filter((fn) => fn !== handler)
+          .map((fn) => fn.name || fn.toString().slice(0, 80).replace(/\s+/g, " "))
+          .join(" | ");
+        log(
+          `${sig}: deferring termination to ${others} other listener(s); cleanup only. Others: ${names}`,
+        );
         void runCleanups(sig);
         return;
       }

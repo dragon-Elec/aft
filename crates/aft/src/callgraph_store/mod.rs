@@ -2176,6 +2176,18 @@ const STORE_DATA_PATH_COLUMNS: &[(&str, &str)] = &[
     ("backend_file_state", "file_path"),
 ];
 
+/// Reconcile `backend_file_state.workspace_root` when the opener's project root
+/// differs from what is stored. The store key is the git-root commit hash, so
+/// multiple live checkouts/clones share one on-disk generation.
+///
+/// Cheap in-place re-root is only safe when every previously stored root path is
+/// gone from disk (true move/rename). If any stale root still exists, another
+/// clone is still alive and rewriting metadata would ping-pong relative rows
+/// between trees (possibly on different branches). We then return
+/// [`OpenRootRepair::NeedsRebuild`] so the caller cold-builds for the current
+/// opener. That can make each clone rebuild on open when they alternate — bounded
+/// by open frequency — but each rebuild is correct for its opener, unlike silent
+/// cross-clone corruption.
 fn reconcile_workspace_roots(conn: &mut Connection, project_root: &Path) -> Result<OpenRootRepair> {
     let roots = stored_workspace_roots(conn)?;
     let current_root = project_root.display().to_string();
@@ -2189,6 +2201,22 @@ fn reconcile_workspace_roots(conn: &mut Connection, project_root: &Path) -> Resu
             current_root,
             reason: format!("absolute store data path row {sample}"),
         });
+    }
+
+    for stored_root in roots.iter() {
+        if stored_root == &current_root {
+            continue;
+        }
+        if Path::new(stored_root).exists() {
+            let reason = format!(
+                "previous root {stored_root} still exists — concurrent clone, rebuilding per-root"
+            );
+            return Ok(OpenRootRepair::NeedsRebuild {
+                previous_roots: roots,
+                current_root,
+                reason,
+            });
+        }
     }
 
     let tx = conn.transaction()?;

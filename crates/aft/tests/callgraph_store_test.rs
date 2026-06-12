@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{
     atomic::{AtomicI64, Ordering},
     Arc, RwLock,
@@ -1437,6 +1438,79 @@ fn store_cold_rebuilds_when_moved_database_has_absolute_data_paths() {
 }
 
 #[test]
+fn store_cold_rebuilds_when_concurrent_clone_root_still_exists() {
+    let dir = tempdir().unwrap();
+    let root_a = dir.path().join("root-a");
+    fs::create_dir_all(&root_a).unwrap();
+    write_file(
+        &root_a.join("main.ts"),
+        "export function entry() { leafA(); }\nfunction leafA() {}\n",
+    );
+    init_git_repo(&root_a);
+    let root_a = fs::canonicalize(&root_a).unwrap_or(root_a);
+    let store_dir = dir.path().join("store");
+    let (store, _) = CallGraphStore::cold_build_with_lease(
+        store_dir.clone(),
+        root_a.clone(),
+        &project_files(&root_a),
+    )
+    .unwrap();
+    let gen_a_sqlite = store.sqlite_path().to_path_buf();
+    assert_eq!(
+        backend_workspace_roots(&gen_a_sqlite),
+        vec![root_a.display().to_string()]
+    );
+    drop(store);
+
+    let root_b_raw = dir.path().join("root-b");
+    copy_dir_all(&root_a, &root_b_raw).unwrap();
+    let root_b = fs::canonicalize(&root_b_raw).unwrap_or(root_b_raw);
+    write_file(
+        &root_b.join("main.ts"),
+        "export function entry() { leafB(); }\nfunction leafB() {}\n",
+    );
+    assert!(
+        root_a.exists(),
+        "clone fixture must keep root A on disk so cheap re-root is refused"
+    );
+    assert_ne!(root_a, root_b);
+    assert_eq!(
+        aft::search_index::project_cache_key(&root_a),
+        aft::search_index::project_cache_key(&root_b),
+        "clone fixture must share the git-root cache key"
+    );
+
+    assert_eq!(
+        backend_workspace_roots(&gen_a_sqlite),
+        vec![root_a.display().to_string()],
+        "published generation must still list root A before opener B runs"
+    );
+
+    let reopened = CallGraphStore::open(store_dir, root_b.clone()).unwrap();
+    assert_ne!(
+        reopened.sqlite_path(),
+        gen_a_sqlite.as_path(),
+        "concurrent clone should publish a fresh generation via cold rebuild"
+    );
+    assert_eq!(
+        backend_workspace_roots(reopened.sqlite_path()),
+        vec![root_b.display().to_string()]
+    );
+    let tree = reopened
+        .call_tree(Path::new("main.ts"), "entry", 1)
+        .unwrap();
+    assert_eq!(
+        tree.children[0].name, "leafB",
+        "projection under B should serve B-built data"
+    );
+    assert_eq!(
+        backend_workspace_roots(&gen_a_sqlite),
+        vec![root_a.display().to_string()],
+        "old generation file must not have been cheap re-rooted in place (root A still on disk)"
+    );
+}
+
+#[test]
 fn read_only_open_does_not_re_root_moved_store_for_worktree_bridge() {
     let dir = tempdir().unwrap();
     let root_a = dir.path().join("main-checkout");
@@ -1756,6 +1830,48 @@ const TEST_STORE_DATA_PATH_COLUMNS: &[(&str, &str)] = &[
     ("dispatch_hints", "file"),
     ("backend_file_state", "file_path"),
 ];
+
+fn init_git_repo(root: &Path) {
+    let git = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .status()
+                .unwrap()
+                .success(),
+            "git {:?} in {}",
+            args,
+            root.display()
+        );
+    };
+    git(&["init"]);
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=AFT Tests",
+        "-c",
+        "user.email=aft-tests@example.com",
+        "commit",
+        "-m",
+        "initial",
+    ]);
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
 
 fn legacy_sqlite_path_for_root(store_dir: &Path, root: &Path) -> PathBuf {
     store_dir.join(format!(

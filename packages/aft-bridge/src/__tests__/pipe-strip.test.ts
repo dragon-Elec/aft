@@ -281,10 +281,7 @@ describe("maybeStripCompressorPipe", () => {
     });
 
     test("strips safe pipelines on both sides of an && chain", () => {
-      const result = maybeStripCompressorPipe(
-        "bun test | grep x && cargo test | tail -1",
-        true,
-      );
+      const result = maybeStripCompressorPipe("bun test | grep x && cargo test | tail -1", true);
       expect(result.command).toBe("bun test && cargo test");
       expect(result.stripped).toBe(true);
       expect(result.note).toContain("| grep x");
@@ -316,6 +313,18 @@ describe("maybeStripCompressorPipe", () => {
       expect(result.stripped).toBe(true);
       expect(result.note).not.toContain("tail -3");
       expect(result.note).toContain("| tail -1");
+    });
+
+    test("never promotes comment text to executable code", () => {
+      // `# && echo X` is inert comment text; splitting at that && and
+      // reassembling would EXECUTE it — the changed-semantics failure class.
+      const cmd = "bun test | sort # && echo SHOULD_NOT_RUN";
+      expect(maybeStripCompressorPipe(cmd, true)).toEqual({ command: cmd, stripped: false });
+      const semi = "bun test | tail -3 # ; rm -rf x";
+      expect(maybeStripCompressorPipe(semi, true)).toEqual({ command: semi, stripped: false });
+      // A quoted/anchored # is NOT a comment — still strippable.
+      const quoted = 'bun test | grep "fail #1"';
+      expect(maybeStripCompressorPipe(quoted, true).stripped).toBe(true);
     });
 
     test("does not treat a quoted && as a chain separator", () => {

@@ -50,9 +50,15 @@ fn message_contains_schema_fetch_failure(lower: &str) -> bool {
         "error fetching",
         "error resolving",
     ];
-    FETCH_VERBS
-        .iter()
-        .any(|verb| lower.contains(verb) && lower.contains("schema"))
+    // Verb + "schema" alone is too loose: real code diagnostics can contain
+    // both (Rust "failed to resolve: use of undeclared crate or module
+    // `schema`", ESLint import-resolution on a ./schema module). Genuine
+    // language-server schema-fetch failures always reference the remote
+    // schema by URL — require one. Hiding a real error is strictly worse
+    // than counting an environmental one, so favor false negatives.
+    let references_remote_schema =
+        lower.contains("schema") && (lower.contains("http://") || lower.contains("https://"));
+    references_remote_schema && FETCH_VERBS.iter().any(|verb| lower.contains(verb))
 }
 
 #[cfg(test)]
@@ -100,6 +106,26 @@ mod tests {
             "Type 'string' is not assignable to type 'number'.",
             Some("TS2322"),
             Some("typescript"),
+        )));
+    }
+
+    #[test]
+    fn rust_crate_named_schema_is_not_environmental() {
+        // Real compiler error mentioning a crate/module named `schema` must
+        // keep counting as an error (oracle finding: verb+keyword was too loose).
+        assert!(!is_environmental_diagnostic(&stored(
+            "failed to resolve: use of undeclared crate or module `schema`",
+            Some("E0433"),
+            Some("rust-analyzer"),
+        )));
+    }
+
+    #[test]
+    fn local_schema_module_import_error_is_not_environmental() {
+        assert!(!is_environmental_diagnostic(&stored(
+            "Unable to resolve path to module './schema'.",
+            Some("import/no-unresolved"),
+            Some("eslint"),
         )));
     }
 

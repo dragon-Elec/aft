@@ -189,6 +189,13 @@ function splitTopLevelCommandChain(command: string): ChainSegment[] | null {
     // rewriter reassembles; keep the whole command verbatim.
     if (char === "\n" || char === "\r") return null;
 
+    // Unquoted shell comment: everything after `#` is inert text, but it can
+    // CONTAIN separator-looking sequences (`# && echo x`). Splitting there and
+    // reassembling would promote comment text to executable code — the
+    // changed-semantics failure class. Bail on the whole command.
+    if (char === "#" && (index === 0 || command[index - 1] === " " || command[index - 1] === "\t"))
+      return null;
+
     if (char === "&" && next === "&") {
       segments.push({ segment: command.slice(start, index), separator: "&&" });
       start = index + 2;

@@ -92,9 +92,14 @@ function installProcessHandlers(): void {
         process.exit(SIGNAL_EXIT_CODES[sig]);
       }
       signalShutdownStarted = true;
+      // Record the intended code immediately so even an unexpected early exit
+      // (event loop drains mid-cleanup) reports the signal, not 0.
+      process.exitCode = SIGNAL_EXIT_CODES[sig];
+      // Deliberately ref'd: we own termination here, so keeping the process
+      // alive for at most the cap is the point — an unref'd timer would let
+      // the loop drain and exit before the race settles.
       const timeout = new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, SIGNAL_CLEANUP_TIMEOUT_MS);
-        (t as { unref?: () => void }).unref?.();
+        setTimeout(resolve, SIGNAL_CLEANUP_TIMEOUT_MS);
       });
       void Promise.race([runCleanups(sig), timeout]).finally(() => {
         process.exit(SIGNAL_EXIT_CODES[sig]);

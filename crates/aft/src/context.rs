@@ -28,6 +28,7 @@ use crate::parser::{SharedSymbolCache, SymbolCache};
 use crate::protocol::{
     ConfigureWarningsFrame, ProgressFrame, PushFrame, StatusChangedFrame, StatusPayload,
 };
+use crate::watcher_filter::{SharedGitignore, WatcherDispatchEvent, WatcherThreadHandle};
 
 pub type ProgressSender = Arc<Box<dyn Fn(PushFrame) + Send + Sync>>;
 pub type SharedProgressSender = Arc<Mutex<Option<ProgressSender>>>;
@@ -528,7 +529,8 @@ pub struct AppContext {
     semantic_refresh_worker: RefCell<Option<SemanticRefreshWorkerSlot>>,
     semantic_embedding_model: RefCell<Option<crate::semantic_index::EmbeddingModel>>,
     watcher: RefCell<Option<RecommendedWatcher>>,
-    watcher_rx: RefCell<Option<mpsc::Receiver<notify::Result<notify::Event>>>>,
+    watcher_rx: RefCell<Option<crossbeam_channel::Receiver<WatcherDispatchEvent>>>,
+    watcher_thread: RefCell<Option<WatcherThreadHandle>>,
     lsp_manager: RefCell<LspManager>,
     /// Shared registry of LSP child PIDs. Cloned and passed to the signal
     /// handler so it can SIGKILL all children before aft exits, preventing
@@ -566,7 +568,8 @@ pub struct AppContext {
     /// path-changes are interesting to AFT's caches. `None` when no project
     /// root is configured or when the project has no gitignore files; in that
     /// case the watcher falls back to a small hardcoded infra-directory skip.
-    gitignore: RefCell<Option<Arc<ignore::gitignore::Gitignore>>>,
+    gitignore: SharedGitignore,
+    gitignore_generation: Arc<AtomicU64>,
     /// Last-known Tier-2 + todos counts for the agent status bar, refreshed off
     /// the hot path (on `aft_inspect` reads and background Tier-2 completions).
     /// Errors/warnings are read live and not stored here.
@@ -578,6 +581,14 @@ pub struct AppContext {
     /// tsconfig-like watcher event and on `configure`. Owned here (not in
     /// `DiagnosticsStore`, which stays raw policy-free) per the v0.35 council.
     tsconfig_membership: RefCell<crate::lsp::tsconfig_membership::TsconfigMembershipCache>,
+}
+
+impl Drop for AppContext {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.watcher_thread.get_mut().take() {
+            runtime.shutdown_and_join();
+        }
+    }
 }
 
 /// Result of requesting the persisted callgraph store for a store-backed op.
@@ -661,6 +672,7 @@ impl AppContext {
             semantic_embedding_model: RefCell::new(None),
             watcher: RefCell::new(None),
             watcher_rx: RefCell::new(None),
+            watcher_thread: RefCell::new(None),
             lsp_manager: RefCell::new(lsp_manager),
             lsp_child_registry,
             stdout_writer,
@@ -676,7 +688,8 @@ impl AppContext {
             )),
             filter_registry_loaded: std::sync::atomic::AtomicBool::new(false),
             bash_compress_flag: Arc::new(std::sync::atomic::AtomicBool::new(bash_compress_enabled)),
-            gitignore: RefCell::new(None),
+            gitignore: Arc::new(std::sync::RwLock::new(None)),
+            gitignore_generation: Arc::new(AtomicU64::new(0)),
             status_bar_tier2: RefCell::new(StatusBarTier2::default()),
             tsconfig_membership: RefCell::new(
                 crate::lsp::tsconfig_membership::TsconfigMembershipCache::new(),
@@ -786,7 +799,30 @@ impl AppContext {
     /// Borrow the cached project gitignore matcher. Returns `None` when no
     /// project_root is configured or when the project has no gitignore files.
     pub fn gitignore(&self) -> Option<Arc<ignore::gitignore::Gitignore>> {
-        self.gitignore.borrow().clone()
+        self.gitignore
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Shared gitignore matcher handle for the watcher filter thread.
+    pub fn shared_gitignore(&self) -> SharedGitignore {
+        Arc::clone(&self.gitignore)
+    }
+
+    /// Monotonic generation bumped after every matcher rebuild/clear. The
+    /// watcher filter thread uses it to wait until the main thread has rebuilt
+    /// ignore rules after it reports an ignore-file change.
+    pub fn gitignore_generation(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.gitignore_generation)
+    }
+
+    fn set_gitignore(&self, matcher: Option<Arc<ignore::gitignore::Gitignore>>) {
+        *self
+            .gitignore
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = matcher;
+        self.gitignore_generation.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Rebuild the gitignore matcher from the current `project_root` and
@@ -811,7 +847,7 @@ impl AppContext {
     /// budget. The watcher event filter falls back to the hardcoded infra-dir
     /// skip list when no matcher is present.
     pub fn clear_gitignore(&self) {
-        *self.gitignore.borrow_mut() = None;
+        self.set_gitignore(None);
     }
 
     pub fn rebuild_gitignore(&self) {
@@ -820,7 +856,7 @@ impl AppContext {
         let root_raw = match self.config().project_root.clone() {
             Some(r) => r,
             None => {
-                *self.gitignore.borrow_mut() = None;
+                self.set_gitignore(None);
                 return;
             }
         };
@@ -935,14 +971,14 @@ impl AppContext {
                 let count = gi.num_ignores();
                 if count > 0 {
                     crate::slog_info!("gitignore matcher built: {} pattern(s)", count);
-                    *self.gitignore.borrow_mut() = Some(Arc::new(gi));
+                    self.set_gitignore(Some(Arc::new(gi)));
                 } else {
-                    *self.gitignore.borrow_mut() = None;
+                    self.set_gitignore(None);
                 }
             }
             Err(err) => {
                 crate::slog_warn!("gitignore matcher build failed: {}", err);
-                *self.gitignore.borrow_mut() = None;
+                self.set_gitignore(None);
             }
         }
     }
@@ -1802,9 +1838,32 @@ impl AppContext {
         &self.watcher
     }
 
-    /// Access the watcher event receiver.
-    pub fn watcher_rx(&self) -> &RefCell<Option<mpsc::Receiver<notify::Result<notify::Event>>>> {
+    /// Access the pre-filtered watcher event receiver.
+    pub fn watcher_rx(
+        &self,
+    ) -> &RefCell<Option<crossbeam_channel::Receiver<WatcherDispatchEvent>>> {
         &self.watcher_rx
+    }
+
+    /// Install a watcher filter thread and its dispatch receiver. The caller
+    /// must have stopped any previous watcher runtime first.
+    pub fn install_watcher_runtime(
+        &self,
+        rx: crossbeam_channel::Receiver<WatcherDispatchEvent>,
+        runtime: WatcherThreadHandle,
+    ) {
+        *self.watcher_rx.borrow_mut() = Some(rx);
+        *self.watcher_thread.borrow_mut() = Some(runtime);
+    }
+
+    /// Stop the watcher filter thread (if any) and clear the dispatch receiver.
+    /// Used on reconfigure, watcher failure, root deletion, and test teardown.
+    pub fn stop_watcher_runtime(&self) {
+        if let Some(runtime) = self.watcher_thread.borrow_mut().take() {
+            runtime.shutdown_and_join();
+        }
+        *self.watcher_rx.borrow_mut() = None;
+        *self.watcher.borrow_mut() = None;
     }
 
     /// Access the LSP manager.

@@ -51,6 +51,7 @@ mod inspect_dead_code_test;
 mod inspect_duplicates_test;
 mod inspect_engine_test;
 mod inspect_metrics_test;
+mod inspect_oxc_engine_test;
 mod inspect_tier2_reuse_test;
 mod inspect_tier2_scheduler_test;
 mod inspect_todos_test;

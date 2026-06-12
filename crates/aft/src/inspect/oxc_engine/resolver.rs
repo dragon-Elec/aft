@@ -1,0 +1,502 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+
+use oxc_resolver::{ResolveOptions, Resolver, TsconfigDiscovery};
+use rustc_hash::FxHashMap;
+use serde_json::Value;
+
+use super::types::{
+    DynamicImportFact, FileFacts, FileId, ImportFact, OxcResolvedEdge, ReExportFact,
+    ResolverConfigInput,
+};
+
+const JS_MODULE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
+const BUILD_OUTPUT_DIRS: &[&str] = &["dist", "build", "out", "output", "esm", "cjs"];
+
+#[derive(Debug, Clone)]
+pub struct ResolvedImport {
+    pub fact: ImportFact,
+    pub target: Option<FileId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedReExport {
+    pub fact: ReExportFact,
+    pub target: Option<FileId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedDynamicImport {
+    pub fact: DynamicImportFact,
+    pub target: Option<FileId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedModule {
+    pub facts: FileFacts,
+    pub imports: Vec<ResolvedImport>,
+    pub re_exports: Vec<ResolvedReExport>,
+    pub dynamic_imports: Vec<ResolvedDynamicImport>,
+}
+
+#[derive(Debug, Default)]
+pub struct ResolverConfigTracker {
+    inputs: BTreeMap<PathBuf, String>,
+}
+
+impl ResolverConfigTracker {
+    pub fn record_if_file(&mut self, path: &Path) {
+        if !path.is_file() {
+            return;
+        }
+        if let Ok(bytes) = fs::read(path) {
+            self.inputs.insert(
+                normalize_path(path),
+                blake3::hash(&bytes).to_hex().to_string(),
+            );
+        }
+    }
+
+    pub fn record_nearest(&mut self, start_dir: &Path, boundary: &Path, file_name: &str) {
+        if let Some(path) = nearest_named_file(start_dir, boundary, file_name) {
+            self.record_if_file(&path);
+        }
+    }
+
+    pub fn inputs(&self) -> Vec<ResolverConfigInput> {
+        self.inputs
+            .iter()
+            .map(|(path, hash)| ResolverConfigInput {
+                path: path.clone(),
+                content_hash: hash.clone(),
+            })
+            .collect()
+    }
+
+    pub fn fingerprint(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        for (path, hash) in &self.inputs {
+            hasher.update(path.to_string_lossy().as_bytes());
+            hasher.update(b"\0");
+            hasher.update(hash.as_bytes());
+            hasher.update(b"\0");
+        }
+        hasher.finalize().to_hex().to_string()
+    }
+}
+
+pub struct ModuleResolver {
+    project_root: PathBuf,
+    resolver: Resolver,
+    path_to_id: FxHashMap<PathBuf, FileId>,
+    file_set: BTreeSet<PathBuf>,
+    root_package_name: Option<String>,
+}
+
+impl ModuleResolver {
+    pub fn new(project_root: &Path, files: &[PathBuf]) -> Self {
+        let project_root = normalize_path(project_root);
+        let mut path_to_id = FxHashMap::default();
+        let mut file_set = BTreeSet::new();
+        for (idx, path) in files.iter().enumerate() {
+            let id = FileId(idx);
+            let normalized = normalize_path(path);
+            file_set.insert(normalized.clone());
+            path_to_id.insert(normalized.clone(), id);
+            if let Ok(canonical) = fs::canonicalize(path) {
+                path_to_id.insert(normalize_path(&canonical), id);
+            }
+        }
+        let root_package_name = package_json_name(&project_root.join("package.json"));
+        Self {
+            project_root,
+            resolver: create_resolver(),
+            path_to_id,
+            file_set,
+            root_package_name,
+        }
+    }
+
+    pub fn resolve_modules(
+        &self,
+        facts: &[FileFacts],
+    ) -> (
+        Vec<ResolvedModule>,
+        ResolverConfigTracker,
+        Vec<OxcResolvedEdge>,
+    ) {
+        let mut tracker = ResolverConfigTracker::default();
+        let mut edges = Vec::new();
+        let modules = facts
+            .iter()
+            .map(|file_facts| {
+                let imports = file_facts
+                    .imports
+                    .iter()
+                    .map(|import| {
+                        let target =
+                            self.resolve_specifier(&file_facts.path, &import.source, &mut tracker);
+                        edges.push(OxcResolvedEdge {
+                            from_file: file_facts.path.clone(),
+                            specifier: import.source.clone(),
+                            resolved_file: target.map(|id| facts[id.0].path.clone()),
+                            kind: format!("import::{:?}", import.kind),
+                        });
+                        ResolvedImport {
+                            fact: import.clone(),
+                            target,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let re_exports = file_facts
+                    .re_exports
+                    .iter()
+                    .map(|re_export| {
+                        let target = self.resolve_specifier(
+                            &file_facts.path,
+                            &re_export.source,
+                            &mut tracker,
+                        );
+                        edges.push(OxcResolvedEdge {
+                            from_file: file_facts.path.clone(),
+                            specifier: re_export.source.clone(),
+                            resolved_file: target.map(|id| facts[id.0].path.clone()),
+                            kind: format!("re_export::{:?}", re_export.kind),
+                        });
+                        ResolvedReExport {
+                            fact: re_export.clone(),
+                            target,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let dynamic_imports = file_facts
+                    .dynamic_imports
+                    .iter()
+                    .map(|dynamic| {
+                        let target = dynamic.source.as_ref().and_then(|source| {
+                            self.resolve_specifier(&file_facts.path, source, &mut tracker)
+                        });
+                        if let Some(source) = &dynamic.source {
+                            edges.push(OxcResolvedEdge {
+                                from_file: file_facts.path.clone(),
+                                specifier: source.clone(),
+                                resolved_file: target.map(|id| facts[id.0].path.clone()),
+                                kind: "dynamic_import".to_string(),
+                            });
+                        }
+                        ResolvedDynamicImport {
+                            fact: dynamic.clone(),
+                            target,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                ResolvedModule {
+                    facts: file_facts.clone(),
+                    imports,
+                    re_exports,
+                    dynamic_imports,
+                }
+            })
+            .collect::<Vec<_>>();
+        (modules, tracker, edges)
+    }
+
+    fn resolve_specifier(
+        &self,
+        from_file: &Path,
+        specifier: &str,
+        tracker: &mut ResolverConfigTracker,
+    ) -> Option<FileId> {
+        if is_external_builtin_or_url(specifier) {
+            return None;
+        }
+        let from_dir = from_file.parent().unwrap_or(&self.project_root);
+        tracker.record_nearest(from_dir, &self.project_root, "tsconfig.json");
+        tracker.record_nearest(from_dir, &self.project_root, "package.json");
+
+        let resolved_path = self
+            .resolve_with_oxc(from_file, from_dir, specifier)
+            .or_else(|| self.resolve_local_fallback(from_dir, specifier))
+            .or_else(|| self.resolve_package_fallback(specifier, tracker));
+
+        let resolved_path = resolved_path?;
+        self.id_for_resolved_path(&resolved_path)
+            .or_else(|| self.id_for_build_output_remap(&resolved_path))
+    }
+
+    fn resolve_with_oxc(
+        &self,
+        from_file: &Path,
+        from_dir: &Path,
+        specifier: &str,
+    ) -> Option<PathBuf> {
+        let resolved = self
+            .resolver
+            .resolve_file(from_file, specifier)
+            .or_else(|_| self.resolver.resolve(from_dir, specifier))
+            .ok()?;
+        Some(normalize_path(resolved.path()))
+    }
+
+    fn resolve_local_fallback(&self, from_dir: &Path, specifier: &str) -> Option<PathBuf> {
+        if !is_relative_or_absolute(specifier) {
+            return None;
+        }
+        let base = if specifier.starts_with('/') {
+            PathBuf::from(specifier)
+        } else {
+            from_dir.join(specifier)
+        };
+        candidate_paths(&base)
+            .into_iter()
+            .map(|candidate| normalize_path(&candidate))
+            .find(|candidate| self.file_set.contains(candidate) || candidate.is_file())
+    }
+
+    fn resolve_package_fallback(
+        &self,
+        specifier: &str,
+        tracker: &mut ResolverConfigTracker,
+    ) -> Option<PathBuf> {
+        let (package_name, subpath) = package_name_and_subpath(specifier)?;
+        let package_dir = if self.root_package_name.as_deref() == Some(package_name.as_str()) {
+            self.project_root.clone()
+        } else {
+            self.project_root.join("node_modules").join(&package_name)
+        };
+        let package_json = package_dir.join("package.json");
+        tracker.record_if_file(&package_json);
+        let value = fs::read_to_string(&package_json)
+            .ok()
+            .and_then(|source| serde_json::from_str::<Value>(&source).ok())?;
+
+        let mut entries = Vec::new();
+        if let Some(subpath) = subpath {
+            entries.push(subpath.trim_start_matches('/').to_string());
+        } else {
+            collect_package_entries(&value, &mut entries);
+        }
+
+        entries
+            .iter()
+            .flat_map(|entry| package_entry_bases(&package_dir, entry))
+            .flat_map(|base| candidate_paths(&base))
+            .map(|candidate| normalize_path(&candidate))
+            .find(|candidate| self.file_set.contains(candidate) || candidate.is_file())
+    }
+
+    fn id_for_resolved_path(&self, path: &Path) -> Option<FileId> {
+        let normalized = normalize_path(path);
+        self.path_to_id.get(&normalized).copied().or_else(|| {
+            fs::canonicalize(path)
+                .ok()
+                .and_then(|canonical| self.path_to_id.get(&normalize_path(&canonical)).copied())
+        })
+    }
+
+    fn id_for_build_output_remap(&self, path: &Path) -> Option<FileId> {
+        let rel = path.strip_prefix(&self.project_root).ok()?;
+        let rel_str = slash_path(rel);
+        let src_rel = remap_build_output_to_src(&rel_str)?;
+        package_entry_bases(&self.project_root, &src_rel)
+            .into_iter()
+            .flat_map(|base| candidate_paths(&base))
+            .map(|candidate| normalize_path(&candidate))
+            .find_map(|candidate| self.path_to_id.get(&candidate).copied())
+    }
+}
+
+fn create_resolver() -> Resolver {
+    Resolver::new(ResolveOptions {
+        extensions: vec![
+            ".ts".into(),
+            ".tsx".into(),
+            ".js".into(),
+            ".jsx".into(),
+            ".mts".into(),
+            ".mjs".into(),
+            ".cts".into(),
+            ".cjs".into(),
+            ".json".into(),
+        ],
+        extension_alias: vec![
+            (
+                ".js".into(),
+                vec![".ts".into(), ".tsx".into(), ".js".into()],
+            ),
+            (".jsx".into(), vec![".tsx".into(), ".jsx".into()]),
+            (".mjs".into(), vec![".mts".into(), ".mjs".into()]),
+            (".cjs".into(), vec![".cts".into(), ".cjs".into()]),
+        ],
+        condition_names: vec![
+            "types".into(),
+            "import".into(),
+            "module".into(),
+            "browser".into(),
+            "default".into(),
+        ],
+        main_fields: vec!["browser".into(), "module".into(), "main".into()],
+        alias_fields: vec![vec!["browser".into()]],
+        tsconfig: Some(TsconfigDiscovery::Auto),
+        ..Default::default()
+    })
+}
+
+fn is_external_builtin_or_url(specifier: &str) -> bool {
+    specifier.starts_with("node:") || specifier.starts_with("data:") || specifier.contains("://")
+}
+
+fn is_relative_or_absolute(specifier: &str) -> bool {
+    specifier.starts_with("./")
+        || specifier.starts_with("../")
+        || specifier.starts_with('/')
+        || specifier == "."
+        || specifier == ".."
+}
+
+fn nearest_named_file(start_dir: &Path, boundary: &Path, file_name: &str) -> Option<PathBuf> {
+    let boundary = normalize_path(boundary);
+    let mut current = normalize_path(start_dir);
+    loop {
+        let candidate = current.join(file_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if current == boundary || !current.starts_with(&boundary) {
+            return None;
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn candidate_paths(base: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    candidates.push(base.to_path_buf());
+
+    let has_remappable_ext = base
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| JS_MODULE_EXTENSIONS.contains(&ext))
+        .unwrap_or(false);
+
+    if base.extension().is_none() || has_remappable_ext {
+        for extension in JS_MODULE_EXTENSIONS {
+            candidates.push(base.with_extension(extension));
+        }
+    }
+
+    for extension in JS_MODULE_EXTENSIONS {
+        candidates.push(base.join(format!("index.{extension}")));
+    }
+
+    candidates
+}
+
+fn package_json_name(package_json: &Path) -> Option<String> {
+    let value = fs::read_to_string(package_json)
+        .ok()
+        .and_then(|source| serde_json::from_str::<Value>(&source).ok())?;
+    value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn package_name_and_subpath(specifier: &str) -> Option<(String, Option<String>)> {
+    if is_relative_or_absolute(specifier) || is_external_builtin_or_url(specifier) {
+        return None;
+    }
+    let mut parts = specifier.split('/');
+    let first = parts.next()?.to_string();
+    if first.starts_with('@') {
+        let second = parts.next()?;
+        let package = format!("{first}/{second}");
+        let rest = parts.collect::<Vec<_>>().join("/");
+        Some((package, (!rest.is_empty()).then_some(rest)))
+    } else {
+        let rest = parts.collect::<Vec<_>>().join("/");
+        Some((first, (!rest.is_empty()).then_some(rest)))
+    }
+}
+
+fn collect_package_entries(package_json: &Value, entries: &mut Vec<String>) {
+    if let Some(browser) = package_json.get("browser") {
+        collect_package_export_strings(browser, entries);
+    }
+    if let Some(module) = package_json.get("module").and_then(Value::as_str) {
+        entries.push(module.to_string());
+    }
+    if let Some(main) = package_json.get("main").and_then(Value::as_str) {
+        entries.push(main.to_string());
+    }
+    if let Some(exports) = package_json.get("exports") {
+        collect_package_export_strings(exports, entries);
+    }
+}
+
+fn collect_package_export_strings(value: &Value, entries: &mut Vec<String>) {
+    match value {
+        Value::String(entry) => entries.push(entry.clone()),
+        Value::Array(values) => {
+            for value in values {
+                collect_package_export_strings(value, entries);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                collect_package_export_strings(value, entries);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn package_entry_bases(package_dir: &Path, entry: &str) -> Vec<PathBuf> {
+    if entry.starts_with("node:") || entry.contains("://") {
+        return Vec::new();
+    }
+    let rel = entry.trim_start_matches("./").trim_start_matches('/');
+    let mut bases = Vec::new();
+    if let Some(src_rel) = remap_build_output_to_src(rel) {
+        bases.push(package_dir.join(src_rel));
+    }
+    bases.push(package_dir.join(rel));
+    bases
+}
+
+fn remap_build_output_to_src(rel: &str) -> Option<String> {
+    let mut components = rel.split('/');
+    let first = components.next()?;
+    if !BUILD_OUTPUT_DIRS.contains(&first) {
+        return None;
+    }
+    let rest = components.collect::<Vec<_>>();
+    if rest.is_empty() {
+        return None;
+    }
+    Some(format!("src/{}", rest.join("/")))
+}
+
+pub fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn slash_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}

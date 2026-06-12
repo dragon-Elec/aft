@@ -1,0 +1,498 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use aft::inspect::oxc_engine::{
+    analyze_files_with_cache, AnalyzeOptions, LivenessVerdict, OxcEngineResult, OxcExportVerdict,
+    OxcFactsCache,
+};
+
+fn fixture_project(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, Vec<PathBuf>) {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root = temp_dir.path().join("project");
+    fs::create_dir_all(&root).expect("create project root");
+    let paths = files
+        .iter()
+        .map(|(relative, contents)| write_file(&root, relative, contents))
+        .collect::<Vec<_>>();
+    (temp_dir, root, paths)
+}
+
+fn write_file(root: &Path, relative: &str, contents: &str) -> PathBuf {
+    let path = root.join(relative);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create parent");
+    }
+    fs::write(&path, contents).expect("write fixture file");
+    path
+}
+
+fn analyze(root: &Path, paths: &[PathBuf]) -> OxcEngineResult {
+    let mut cache = OxcFactsCache::new();
+    analyze_files_with_cache(root, paths, AnalyzeOptions::default(), &mut cache)
+        .expect("oxc analyze succeeds")
+}
+
+fn verdict<'a>(result: &'a OxcEngineResult, file: &str, symbol: &str) -> &'a OxcExportVerdict {
+    result
+        .files
+        .iter()
+        .find(|item| item.relative_file == file)
+        .unwrap_or_else(|| panic!("missing file verdicts for {file}: {:#?}", result.files))
+        .exports
+        .iter()
+        .find(|export| export.symbol == symbol)
+        .unwrap_or_else(|| panic!("missing export {file}:{symbol}: {:#?}", result.files))
+}
+
+fn assert_verdict(result: &OxcEngineResult, file: &str, symbol: &str, expected: LivenessVerdict) {
+    assert_eq!(
+        verdict(result, file, symbol).verdict,
+        expected,
+        "unexpected verdict for {file}:{symbol}: {:#?}",
+        verdict(result, file, symbol)
+    );
+}
+
+#[test]
+fn oxc_engine_named_barrel_reexport_chain_marks_consumed_exports_used() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "src/feature/storage.ts",
+            "export function enforceProjectCap() {}\nexport function upsertCommits() {}\nexport function deadOne() {}\n",
+        ),
+        (
+            "src/feature/index.ts",
+            "export { enforceProjectCap, upsertCommits } from './storage';\n",
+        ),
+        (
+            "src/main.ts",
+            "import { enforceProjectCap, upsertCommits } from './feature';\nenforceProjectCap();\nupsertCommits();\n",
+        ),
+    ]);
+
+    let result = analyze(&root, &paths);
+
+    assert!(result.errors.is_empty(), "{:#?}", result.errors);
+    assert_verdict(
+        &result,
+        "src/feature/storage.ts",
+        "enforceProjectCap",
+        LivenessVerdict::Used,
+    );
+    assert_verdict(
+        &result,
+        "src/feature/storage.ts",
+        "upsertCommits",
+        LivenessVerdict::Used,
+    );
+    assert_verdict(
+        &result,
+        "src/feature/storage.ts",
+        "deadOne",
+        LivenessVerdict::Unused,
+    );
+}
+
+#[test]
+fn oxc_engine_multiline_type_barrel_preserves_type_import_consumption() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "src/feature/storage.ts",
+            "export interface StoredThing { id: string }\nexport function enforceProjectCap() { return 1; }\nexport function deadOne() {}\n",
+        ),
+        (
+            "src/feature/index.ts",
+            "export {\n  type StoredThing,\n  enforceProjectCap,\n} from './storage';\n",
+        ),
+        (
+            "src/main.ts",
+            "import type { StoredThing } from './feature';\nimport { enforceProjectCap } from './feature';\nconst thing: StoredThing = { id: 'x' };\nenforceProjectCap();\nconsole.log(thing.id);\n",
+        ),
+    ]);
+
+    let result = analyze(&root, &paths);
+
+    assert_verdict(
+        &result,
+        "src/feature/storage.ts",
+        "StoredThing",
+        LivenessVerdict::Used,
+    );
+    assert_verdict(
+        &result,
+        "src/feature/storage.ts",
+        "enforceProjectCap",
+        LivenessVerdict::Used,
+    );
+    assert_verdict(
+        &result,
+        "src/feature/storage.ts",
+        "deadOne",
+        LivenessVerdict::Unused,
+    );
+}
+
+#[test]
+fn oxc_engine_star_reexport_preserves_wildcard_uncertainty_floor() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "src/feature/storage.ts",
+            "export function enforceProjectCap() {}\nexport function deadOne() {}\n",
+        ),
+        ("src/feature/index.ts", "export * from './storage';\n"),
+        (
+            "src/main.ts",
+            "import { enforceProjectCap } from './feature';\nenforceProjectCap();\n",
+        ),
+    ]);
+
+    let result = analyze(&root, &paths);
+
+    assert_verdict(
+        &result,
+        "src/feature/storage.ts",
+        "enforceProjectCap",
+        LivenessVerdict::Used,
+    );
+    assert_verdict(
+        &result,
+        "src/feature/storage.ts",
+        "deadOne",
+        LivenessVerdict::Uncertain,
+    );
+    assert_eq!(
+        verdict(&result, "src/feature/storage.ts", "deadOne").reason,
+        "wildcard_import"
+    );
+}
+
+#[test]
+fn oxc_engine_namespace_import_marks_target_exports_uncertain_without_member_precision() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "src/feature/storage.ts",
+            "export function enforceProjectCap() {}\nexport function deadOne() {}\n",
+        ),
+        (
+            "src/main.ts",
+            "import * as storage from './feature/storage';\nstorage.enforceProjectCap();\n",
+        ),
+    ]);
+
+    let result = analyze(&root, &paths);
+
+    assert_verdict(
+        &result,
+        "src/feature/storage.ts",
+        "enforceProjectCap",
+        LivenessVerdict::Uncertain,
+    );
+    assert_verdict(
+        &result,
+        "src/feature/storage.ts",
+        "deadOne",
+        LivenessVerdict::Uncertain,
+    );
+    assert_eq!(
+        verdict(&result, "src/feature/storage.ts", "deadOne").reason,
+        "namespace_import"
+    );
+}
+
+#[test]
+fn oxc_engine_namespace_reexport_marks_source_namespace_uncertain() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "src/feature/storage.ts",
+            "export function enforceProjectCap() {}\nexport function deadOne() {}\n",
+        ),
+        (
+            "src/feature/index.ts",
+            "export * as storage from './storage';\n",
+        ),
+        (
+            "src/main.ts",
+            "import { storage } from './feature';\nstorage.enforceProjectCap();\n",
+        ),
+    ]);
+
+    let result = analyze(&root, &paths);
+
+    assert_verdict(
+        &result,
+        "src/feature/storage.ts",
+        "enforceProjectCap",
+        LivenessVerdict::Uncertain,
+    );
+    assert_verdict(
+        &result,
+        "src/feature/storage.ts",
+        "deadOne",
+        LivenessVerdict::Uncertain,
+    );
+}
+
+#[test]
+fn oxc_engine_same_file_value_reference_keeps_composed_export_used() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "src/schema.ts",
+            "const z = { object: () => ({ extend: () => ({}) }) };\nexport const ChildSchema = z.object({});\nexport const ParentSchema = ChildSchema.extend({});\nexport const OrphanSchema = z.object({});\n",
+        ),
+    ]);
+
+    let result = analyze(&root, &paths);
+
+    assert_verdict(
+        &result,
+        "src/schema.ts",
+        "ChildSchema",
+        LivenessVerdict::Used,
+    );
+    assert_eq!(
+        verdict(&result, "src/schema.ts", "ChildSchema").reason,
+        "same_file_value_reference"
+    );
+    assert_verdict(
+        &result,
+        "src/schema.ts",
+        "ParentSchema",
+        LivenessVerdict::Unused,
+    );
+    assert_verdict(
+        &result,
+        "src/schema.ts",
+        "OrphanSchema",
+        LivenessVerdict::Unused,
+    );
+}
+
+#[test]
+fn oxc_engine_genuine_dead_exports_remain_unused() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "src/orphan.ts",
+            "export const UNUSED_CONST = 1;\nexport function neverCalled() {}\n",
+        ),
+        ("src/main.ts", "console.log('entry');\n"),
+    ]);
+
+    let result = analyze(&root, &paths);
+
+    assert_verdict(
+        &result,
+        "src/orphan.ts",
+        "UNUSED_CONST",
+        LivenessVerdict::Unused,
+    );
+    assert_verdict(
+        &result,
+        "src/orphan.ts",
+        "neverCalled",
+        LivenessVerdict::Unused,
+    );
+}
+
+#[test]
+fn oxc_engine_dynamic_imports_demote_to_uncertain_never_dead() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "src/plugin.ts",
+            "export function plugin() {}\nexport function other() {}\n",
+        ),
+        ("src/literal.ts", "await import('./plugin');\n"),
+        (
+            "src/computed.ts",
+            "const name = './anything';\nawait import(name);\n",
+        ),
+    ]);
+
+    let result = analyze(&root, &paths);
+
+    assert_verdict(
+        &result,
+        "src/plugin.ts",
+        "plugin",
+        LivenessVerdict::Uncertain,
+    );
+    assert_verdict(
+        &result,
+        "src/plugin.ts",
+        "other",
+        LivenessVerdict::Uncertain,
+    );
+    assert!(matches!(
+        verdict(&result, "src/plugin.ts", "plugin").reason.as_str(),
+        "dynamic_import" | "dynamic_import_nonliteral"
+    ));
+}
+
+#[test]
+fn oxc_engine_resolves_nodenext_js_specifier_to_ts_source() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "src/mod.ts",
+            "export function live() {}\nexport function dead() {}\n",
+        ),
+        ("src/main.ts", "import { live } from './mod.js';\nlive();\n"),
+    ]);
+
+    let result = analyze(&root, &paths);
+
+    assert_verdict(&result, "src/mod.ts", "live", LivenessVerdict::Used);
+    assert_verdict(&result, "src/mod.ts", "dead", LivenessVerdict::Unused);
+}
+
+#[test]
+fn oxc_engine_remaps_package_build_output_entry_to_source() {
+    let (_temp, root, mut paths) = fixture_project(&[
+        (
+            "package.json",
+            r#"{"name":"@fixtures/pkg","main":"dist/index.js","module":"dist/index.mjs","exports":"./dist/index.js"}"#,
+        ),
+        (
+            "src/index.ts",
+            "export function live() {}\nexport function dead() {}\n",
+        ),
+        (
+            "src/main.ts",
+            "import { live } from '@fixtures/pkg';\nlive();\n",
+        ),
+    ]);
+    paths.retain(|path| path.extension().and_then(|ext| ext.to_str()) != Some("json"));
+
+    let result = analyze(&root, &paths);
+
+    assert_verdict(&result, "src/index.ts", "live", LivenessVerdict::Used);
+    assert_verdict(&result, "src/index.ts", "dead", LivenessVerdict::Unused);
+    assert!(
+        result
+            .resolver_config_inputs
+            .iter()
+            .any(|input| input.path.ends_with("package.json")),
+        "package.json should be fingerprinted: {:#?}",
+        result.resolver_config_inputs
+    );
+}
+
+#[test]
+fn oxc_engine_resolves_tsconfig_paths_and_fingerprints_config() {
+    let (_temp, root, mut paths) = fixture_project(&[
+        (
+            "tsconfig.json",
+            r#"{"compilerOptions":{"baseUrl":".","paths":{"@lib/*":["src/lib/*"]}}}"#,
+        ),
+        (
+            "src/lib/mod.ts",
+            "export function live() {}\nexport function dead() {}\n",
+        ),
+        ("src/main.ts", "import { live } from '@lib/mod';\nlive();\n"),
+    ]);
+    paths.retain(|path| path.extension().and_then(|ext| ext.to_str()) != Some("json"));
+
+    let result = analyze(&root, &paths);
+
+    assert_verdict(&result, "src/lib/mod.ts", "live", LivenessVerdict::Used);
+    assert_verdict(&result, "src/lib/mod.ts", "dead", LivenessVerdict::Unused);
+    assert!(
+        result
+            .resolver_config_inputs
+            .iter()
+            .any(|input| input.path.ends_with("tsconfig.json")),
+        "tsconfig.json should be fingerprinted: {:#?}",
+        result.resolver_config_inputs
+    );
+}
+
+#[test]
+fn oxc_engine_resolver_fingerprint_changes_when_package_json_changes() {
+    let (_temp, root, mut paths) = fixture_project(&[
+        (
+            "package.json",
+            r#"{"name":"fingerprint-fixture","main":"dist/index.js"}"#,
+        ),
+        ("src/index.ts", "export function live() {}\n"),
+        (
+            "src/main.ts",
+            "import { live } from 'fingerprint-fixture';\nlive();\n",
+        ),
+    ]);
+    paths.retain(|path| path.extension().and_then(|ext| ext.to_str()) != Some("json"));
+    let mut cache = OxcFactsCache::new();
+
+    let first = analyze_files_with_cache(&root, &paths, AnalyzeOptions::default(), &mut cache)
+        .expect("first analyze");
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"fingerprint-fixture","main":"dist/index.js","browser":"dist/browser.js"}"#,
+    )
+    .expect("rewrite package");
+    let second = analyze_files_with_cache(&root, &paths, AnalyzeOptions::default(), &mut cache)
+        .expect("second analyze");
+
+    assert_ne!(
+        first.resolver_config_fingerprint(),
+        second.resolver_config_fingerprint()
+    );
+}
+
+#[test]
+fn oxc_engine_warm_facts_cache_resolves_3k_file_corpus_under_perf_gate() {
+    // CI perf gate for H1-1: on a warm facts cache, resolving and graphing a
+    // deterministic 3k-file TypeScript corpus must stay <= 1.5s. The threshold
+    // is intended for release-profile CI/macOS/Linux runners; debug local runs
+    // on very slow machines may need investigation rather than threshold drift.
+    const FILE_COUNT: usize = 3_000;
+    const CORPUS_SEED: u64 = 0xA17F_2026_0C0C_3000;
+    const EXPECTED_CORPUS_HASH: &str =
+        "466bda6471cd346a9d41a55d47548733fc0054f2e02699f390cd5306927bbf7f";
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root = temp_dir.path().join("project");
+    fs::create_dir_all(root.join("src")).expect("create src");
+    let mut paths = Vec::with_capacity(FILE_COUNT);
+    let mut corpus_hasher = blake3::Hasher::new();
+    corpus_hasher.update(&CORPUS_SEED.to_le_bytes());
+    for idx in 0..FILE_COUNT {
+        let relative = format!("src/f{idx:04}.ts");
+        let contents = if idx + 1 == FILE_COUNT {
+            format!("export const value{idx} = {idx};\n")
+        } else {
+            format!(
+                "import {{ value{} }} from './f{:04}';\nexport const value{} = value{} + {};\n",
+                idx + 1,
+                idx + 1,
+                idx,
+                idx + 1,
+                idx ^ (CORPUS_SEED as usize & 0xff)
+            )
+        };
+        corpus_hasher.update(relative.as_bytes());
+        corpus_hasher.update(b"\0");
+        corpus_hasher.update(contents.as_bytes());
+        paths.push(write_file(&root, &relative, &contents));
+    }
+    let corpus_hash = corpus_hasher.finalize().to_hex().to_string();
+    assert_eq!(corpus_hash, EXPECTED_CORPUS_HASH);
+
+    let mut cache = OxcFactsCache::new();
+    let first = analyze_files_with_cache(&root, &paths, AnalyzeOptions::default(), &mut cache)
+        .expect("cold analyze");
+    assert_eq!(first.stats.cache_misses, FILE_COUNT);
+    assert_eq!(cache.len(), FILE_COUNT);
+
+    let started = Instant::now();
+    let warm = analyze_files_with_cache(&root, &paths, AnalyzeOptions::default(), &mut cache)
+        .expect("warm analyze");
+    let elapsed = started.elapsed();
+
+    eprintln!("warm oxc 3k corpus resolution: {elapsed:?}");
+    assert_eq!(warm.stats.cache_hits, FILE_COUNT);
+    assert_eq!(warm.stats.cache_misses, 0);
+    assert!(
+        elapsed <= Duration::from_millis(1_500),
+        "warm oxc resolution over {FILE_COUNT} files took {elapsed:?}; stats={:#?}",
+        warm.stats
+    );
+}

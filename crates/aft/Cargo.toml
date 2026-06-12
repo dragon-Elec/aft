@@ -68,6 +68,15 @@ globset = "0.4"
 sha2 = "0.10"
 crc32fast = "1"
 blake3 = "1"
+oxc_allocator = "0.126"
+oxc_ast = "0.126"
+oxc_ast_visit = "0.126"
+oxc_parser = "0.126"
+oxc_resolver = "11"
+oxc_semantic = "0.126"
+oxc_span = "0.126"
+oxc_str = "0.126"
+rustc-hash = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 aft-tokenizer = { path = "../aft-tokenizer", version = "0.37.2" }
 

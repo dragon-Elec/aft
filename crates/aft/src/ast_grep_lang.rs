@@ -36,6 +36,7 @@ pub enum AstGrepLang {
     Php,
     Lua,
     Perl,
+    Pascal,
 }
 
 #[derive(Clone, Debug)]
@@ -112,6 +113,7 @@ impl AstGrepLang {
             LangId::Php => Some(Self::Php),
             LangId::Lua => Some(Self::Lua),
             LangId::Perl => Some(Self::Perl),
+            LangId::Pascal => Some(Self::Pascal),
             LangId::Scala => None,
             LangId::Bash => None, // ast-grep doesn't support Bash
             // Markdown, CSS, HTML etc. don't have meaningful AST patterns
@@ -143,11 +145,21 @@ impl AstGrepLang {
             "php" => Some(Self::Php),
             "lua" => Some(Self::Lua),
             "perl" | "pl" | "pm" => Some(Self::Perl),
+            "pascal" | "pas" | "pp" | "dpr" | "dpk" | "lpr" => Some(Self::Pascal),
             _ => None,
         }
     }
 
     pub(crate) fn compile_pattern(&self, pattern: &str) -> Result<Pattern, PatternError> {
+        if matches!(self, Self::Pascal) {
+            if pascal_pattern_is_declaration(pattern) {
+                return Pattern::try_new(pattern, self.clone());
+            }
+            let selector = pascal_snippet_selector(pattern)?;
+            let context = format!("procedure dummy; begin {pattern} end;");
+            return Pattern::contextual(&context, &selector, self.clone());
+        }
+
         if !matches!(self, Self::Php) {
             return Pattern::try_new(pattern, self.clone());
         }
@@ -185,6 +197,7 @@ impl AstGrepLang {
             Self::Php => &["inc", "php"],
             Self::Lua => &["lua"],
             Self::Perl => &["pl", "pm", "t"],
+            Self::Pascal => &["pas", "pp", "dpr", "dpk", "lpr"],
         }
     }
 
@@ -209,6 +222,52 @@ fn php_snippet_selector(pattern: &str) -> Result<String, PatternError> {
         node = node.child(0).expect("single child exists");
     }
     Ok(node.kind().into_owned())
+}
+
+fn pascal_pattern_is_declaration(pattern: &str) -> bool {
+    let trimmed = pattern.trim_start().to_lowercase();
+    trimmed.starts_with("program")
+        || trimmed.starts_with("unit")
+        || trimmed.starts_with("procedure")
+        || trimmed.starts_with("function")
+        || trimmed.starts_with("constructor")
+        || trimmed.starts_with("destructor")
+        || trimmed.starts_with("type")
+        || trimmed.starts_with("const")
+        || trimmed.starts_with("var")
+}
+
+fn pascal_snippet_selector(pattern: &str) -> Result<String, PatternError> {
+    let context = format!("procedure dummy; begin {pattern} end;");
+    let grep = AstGrepLang::Pascal.ast_grep(context);
+    let root = grep.root();
+    let mut node = root;
+    while node.children().len() == 1 {
+        node = node.child(0).expect("single child exists");
+    }
+    let mut block_node = None;
+    for child in node.children() {
+        if child.kind() == "block" {
+            block_node = Some(child);
+            break;
+        }
+    }
+    let Some(block) = block_node else {
+        return Err(PatternError::NoContent(
+            "invalid Pascal pattern structure".to_string(),
+        ));
+    };
+    let mut stmt_node = None;
+    for child in block.children() {
+        if child.kind() != "kBegin" && child.kind() != "kEnd" {
+            stmt_node = Some(child);
+            break;
+        }
+    }
+    let Some(stmt) = stmt_node else {
+        return Err(PatternError::NoContent("empty Pascal pattern".to_string()));
+    };
+    Ok(stmt.kind().into_owned())
 }
 
 fn pre_process_pattern_with_expando<'q>(query: &'q str, expando: char) -> Cow<'q, str> {
@@ -290,6 +349,7 @@ impl Language for AstGrepLang {
             | Self::Php
             | Self::Lua
             | Self::Perl => '\u{00B5}', // µ
+            Self::Pascal => '_',
             // $ is valid in TS, JS, Go, Solidity, and Vue template identifiers
             _ => '$',
         }
@@ -320,6 +380,7 @@ impl LanguageExt for AstGrepLang {
             Self::Php => tree_sitter_php::LANGUAGE_PHP.into(),
             Self::Lua => tree_sitter_lua::LANGUAGE.into(),
             Self::Perl => tree_sitter_perl::LANGUAGE.into(),
+            Self::Pascal => tree_sitter_pascal::LANGUAGE.into(),
         }
     }
 }
@@ -361,6 +422,7 @@ mod tests {
         assert_eq!(AstGrepLang::from_str("php"), Some(AstGrepLang::Php));
         assert_eq!(AstGrepLang::from_str("lua"), Some(AstGrepLang::Lua));
         assert_eq!(AstGrepLang::from_str("perl"), Some(AstGrepLang::Perl));
+        assert_eq!(AstGrepLang::from_str("pascal"), Some(AstGrepLang::Pascal));
         assert_eq!(AstGrepLang::from_str("markdown"), None);
     }
 
@@ -443,6 +505,11 @@ mod tests {
                 "sub greet { return 1; }\ngreet();\n",
                 "sub greet { return 1; }",
             ),
+            (
+                AstGrepLang::Pascal,
+                "procedure SayHello(name: string);\nbegin\n  writeln(name);\nend;",
+                "procedure $NAME($$$);",
+            ),
         ];
 
         for (lang, source, pattern) in probes {
@@ -497,6 +564,7 @@ helper();
         assert_eq!(AstGrepLang::Php.expando_char(), '\u{00B5}');
         assert_eq!(AstGrepLang::Lua.expando_char(), '\u{00B5}');
         assert_eq!(AstGrepLang::Perl.expando_char(), '\u{00B5}');
+        assert_eq!(AstGrepLang::Pascal.expando_char(), '_');
         assert_eq!(AstGrepLang::TypeScript.expando_char(), '$');
         assert_eq!(AstGrepLang::JavaScript.expando_char(), '$');
         assert_eq!(AstGrepLang::Go.expando_char(), '$');
@@ -565,6 +633,23 @@ helper();
         assert!(
             found.is_some(),
             "Solidity meta-var pattern must match — bug recurrence"
+        );
+    }
+
+    #[test]
+    fn pascal_meta_var_pattern_binds_capture() {
+        let lang = AstGrepLang::Pascal;
+        let source = "procedure SayHello(name: string);\nbegin\n  writeln(name);\nend;";
+        let grep = lang.ast_grep(source);
+        let root = grep.root();
+        let found = root.find("procedure $NAME($$$);");
+        assert!(
+            found.is_some(),
+            "Pascal meta-var pattern must match — bug recurrence"
+        );
+        assert_eq!(
+            found.unwrap().get_env().get_match("NAME").unwrap().text(),
+            "SayHello"
         );
     }
 

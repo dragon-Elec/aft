@@ -3126,6 +3126,11 @@ pub fn is_semantic_indexed_extension(path: &Path) -> bool {
                 | "vue"
                 | "yaml"
                 | "yml"
+                | "pas"
+                | "pp"
+                | "dpr"
+                | "dpk"
+                | "lpr"
         )
     )
 }

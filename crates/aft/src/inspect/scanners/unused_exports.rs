@@ -942,6 +942,7 @@ fn language_name(lang: LangId) -> &'static str {
         LangId::Php => "php",
         LangId::Lua => "lua",
         LangId::Perl => "perl",
+        LangId::Pascal => "pascal",
     }
 }
 

@@ -550,6 +550,7 @@ fn is_supported_language(lang: LangId) -> bool {
             | LangId::Php
             | LangId::Lua
             | LangId::Perl
+            | LangId::Pascal
     )
 }
 fn language_name(lang: LangId) -> &'static str {
@@ -580,6 +581,7 @@ fn language_name(lang: LangId) -> &'static str {
         LangId::Php => "php",
         LangId::Lua => "lua",
         LangId::Perl => "perl",
+        LangId::Pascal => "pascal",
     }
 }
 

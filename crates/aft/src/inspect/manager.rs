@@ -1796,6 +1796,7 @@ fn duplicates_supports_language(language: crate::parser::LangId) -> bool {
             | crate::parser::LangId::Php
             | crate::parser::LangId::Lua
             | crate::parser::LangId::Perl
+            | crate::parser::LangId::Pascal
     )
 }
 
@@ -1836,6 +1837,7 @@ fn language_name(language: crate::parser::LangId) -> &'static str {
         crate::parser::LangId::Php => "php",
         crate::parser::LangId::Lua => "lua",
         crate::parser::LangId::Perl => "perl",
+        crate::parser::LangId::Pascal => "pascal",
     }
 }
 

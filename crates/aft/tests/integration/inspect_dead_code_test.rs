@@ -160,6 +160,72 @@ fn contribution_has_internal_call(
     })
 }
 
+fn contribution_payload<'a>(success: &'a InspectScanSuccess, file: &str) -> &'a serde_json::Value {
+    success
+        .contributions
+        .iter()
+        .find(|contribution| contribution.contribution["file"] == file)
+        .map(|contribution| &contribution.contribution)
+        .unwrap_or_else(|| panic!("contribution for {file}"))
+}
+
+fn internal_call_row(
+    caller_symbol: &str,
+    file: &str,
+    symbol: &str,
+    line: u32,
+    provenance: &str,
+) -> (String, String, String, u32, String) {
+    (
+        caller_symbol.to_string(),
+        file.to_string(),
+        symbol.to_string(),
+        line,
+        provenance.to_string(),
+    )
+}
+
+fn internal_call_rows(
+    success: &InspectScanSuccess,
+    file: &str,
+) -> Vec<(String, String, String, u32, String)> {
+    let mut rows = contribution_payload(success, file)["internal_calls"]
+        .as_array()
+        .expect("internal_calls array")
+        .iter()
+        .map(|call| {
+            internal_call_row(
+                call["caller_symbol"].as_str().expect("caller_symbol"),
+                call["file"].as_str().expect("file"),
+                call["symbol"].as_str().expect("symbol"),
+                call["line"].as_u64().expect("line") as u32,
+                call["provenance"].as_str().expect("provenance"),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    rows
+}
+
+fn dispatched_method_names(success: &InspectScanSuccess, file: &str) -> Vec<String> {
+    let mut names = contribution_payload(success, file)
+        .get("dispatched_method_names")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| value.as_str().expect("method name").to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+fn dispatched_target(target: &str, full_callee: &str) -> String {
+    format!("{target}\u{1f}{full_callee}")
+}
+
 fn type_match_fixture_exports(root: &Path) -> Vec<CallgraphExport> {
     vec![
         export(root, "src/factory.rs", "make_live", "function", 3),
@@ -372,6 +438,105 @@ fn inspect_dead_code_flags_binary_export_but_suppresses_library_public_api() {
         success.aggregate["items"][0],
         json!({"file": "src/main.rs", "symbol": "unused_internal", "kind": "function", "line": 1})
     );
+}
+
+#[test]
+fn inspect_dead_code_keeps_outbound_contributions_identical_when_grouped_by_caller_file() {
+    let (_temp_dir, root, paths) = fixture_project(&[
+        (
+            "src/app.ts",
+            "import { helper } from './helper';\nexport function main(service: Service) { helper(); service.render(); }\n",
+        ),
+        (
+            "src/service.ts",
+            "export class Service { render() { finish(); } dormant() { orphan(); } }\n",
+        ),
+        ("src/helper.ts", "export function helper() {}\n"),
+        ("src/finish.ts", "export function finish() {}\n"),
+        ("src/orphan.ts", "export function orphan() {}\n"),
+    ]);
+    let normalized_app_caller = root.join("src").join("nested").join("..").join("app.ts");
+    let graph = snapshot(
+        paths.clone(),
+        vec![
+            export(&root, "src/app.ts", "main", "function", 2),
+            export(&root, "src/service.ts", "render", "method", 1),
+            export(&root, "src/service.ts", "dormant", "method", 1),
+            export(&root, "src/helper.ts", "helper", "function", 1),
+            export(&root, "src/finish.ts", "finish", "function", 1),
+            export(&root, "src/orphan.ts", "orphan", "function", 1),
+        ],
+        vec![
+            CallgraphOutboundCall {
+                caller_file: normalized_app_caller.clone(),
+                caller_symbol: "main".to_string(),
+                target: target(&root, "src/helper.ts", "helper"),
+                line: 2,
+                provenance: "treesitter".to_string(),
+            },
+            CallgraphOutboundCall {
+                caller_file: normalized_app_caller,
+                caller_symbol: "main".to_string(),
+                target: dispatched_target("render", "service.render"),
+                line: 3,
+                provenance: "treesitter".to_string(),
+            },
+            outbound(
+                &root,
+                "src/service.ts",
+                "Service::render",
+                &target(&root, "src/finish.ts", "finish"),
+                6,
+            ),
+            outbound(
+                &root,
+                "src/service.ts",
+                "Service::dormant",
+                &target(&root, "src/orphan.ts", "orphan"),
+                7,
+            ),
+        ],
+        vec![root.join("src/app.ts")],
+    );
+
+    let success = scan(job(&root, paths, Some(graph)));
+
+    assert_eq!(success.aggregate["count"], 2);
+    assert_eq!(
+        internal_call_rows(&success, "src/app.ts"),
+        vec![
+            internal_call_row("main", "src/helper.ts", "helper", 2, "treesitter"),
+            internal_call_row("main", "src/service.ts", "render", 3, "treesitter"),
+        ]
+    );
+    assert_eq!(
+        dispatched_method_names(&success, "src/app.ts"),
+        vec!["render"]
+    );
+    assert_eq!(
+        internal_call_rows(&success, "src/service.ts"),
+        vec![
+            internal_call_row(
+                "Service::dormant",
+                "src/orphan.ts",
+                "orphan",
+                7,
+                "treesitter"
+            ),
+            internal_call_row(
+                "Service::render",
+                "src/finish.ts",
+                "finish",
+                6,
+                "treesitter"
+            ),
+        ]
+    );
+    assert!(dispatched_method_names(&success, "src/service.ts").is_empty());
+    for file in ["src/helper.ts", "src/finish.ts", "src/orphan.ts"] {
+        assert!(internal_call_rows(&success, file).is_empty());
+        assert!(dispatched_method_names(&success, file).is_empty());
+    }
 }
 
 #[test]

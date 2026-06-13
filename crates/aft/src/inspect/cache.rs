@@ -99,7 +99,11 @@ impl From<serde_json::Error> for InspectCacheError {
 /// CallgraphStore; per-row provenance now reflects store resolution tiers.
 /// v14: TS/JS dead_code and unused_exports contributions carry oxc verdicts,
 /// provenance, and oxc honesty metadata.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 14;
+/// v15: dead_code reachability counts exact type_match call edges as resolved
+/// liveness (qualified-constructor calls like AppContext::new -> BackupStore::new
+/// no longer collapse to bare `new` and drop), changing the dead verdict for the
+/// same contribution set — existing caches must invalidate.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 15;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1395,6 +1399,6 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 14);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 15);
     }
 }

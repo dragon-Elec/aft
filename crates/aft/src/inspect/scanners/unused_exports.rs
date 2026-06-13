@@ -4,13 +4,16 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rayon::prelude::*;
+use serde::Serialize;
 use serde_json::{json, Value};
 use tree_sitter::{Node, Tree};
 
 use crate::cache_freshness;
 use crate::imports::{parse_file_imports, specifier_imported_name, ImportBlock, ImportStatement};
 use crate::inspect::job::is_test_support_file;
-use crate::inspect::oxc_engine::{LivenessVerdict, OxcEngineResult, OxcFileVerdicts};
+use crate::inspect::oxc_engine::{
+    ExportFact, FileFacts, LivenessVerdict, OxcEngineResult, FACTS_FORMAT_VERSION, OXC_PROVENANCE,
+};
 use crate::inspect::{
     FileContribution, InspectCategory, InspectJob, InspectResult, InspectScanSuccess,
 };
@@ -41,6 +44,21 @@ struct FileScan {
     exports: Vec<ExportSymbol>,
     imports: Vec<ImportEdge>,
     skipped_language: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct OxcUnusedExportsFactsPayload<'a> {
+    format_version: u32,
+    content_hash: &'a str,
+    exports: &'a [ExportFact],
+    imports: &'a [crate::inspect::oxc_engine::ImportFact],
+    re_exports: &'a [crate::inspect::oxc_engine::ReExportFact],
+    dynamic_imports: &'a [crate::inspect::oxc_engine::DynamicImportFact],
+    same_file_value_references: &'a std::collections::BTreeSet<String>,
+    used_import_bindings: &'a std::collections::BTreeSet<String>,
+    type_referenced_import_bindings: &'a std::collections::BTreeSet<String>,
+    value_referenced_import_bindings: &'a std::collections::BTreeSet<String>,
+    parse_error: &'a Option<String>,
 }
 
 pub fn run_unused_exports_scan(job: &InspectJob) -> InspectResult {
@@ -218,6 +236,11 @@ fn run_unused_exports_oxc_scan(
         },
     );
     let skipped_files_payload = oxc_skipped_files_payload(&project_root, oxc_result);
+    let facts_by_file = oxc_result
+        .facts
+        .iter()
+        .map(|facts| (normalize_path(&facts.path), facts))
+        .collect::<BTreeMap<_, _>>();
     let mut contributions = Vec::new();
     let mut count = 0usize;
     let mut items = Vec::new();
@@ -225,14 +248,15 @@ fn run_unused_exports_oxc_scan(
     let mut uncertain_items = Vec::new();
 
     for file in &oxc_result.files {
-        if let Some(contribution) = oxc_unused_exports_contribution(
-            &project_root,
-            file,
-            oxc_result.resolver_config_fingerprint(),
-            parse_errors_by_file.get(&normalize_path(&file.file)),
-            &skipped_files_payload,
-        ) {
-            contributions.push(contribution);
+        if let Some(facts) = facts_by_file.get(&normalize_path(&file.file)) {
+            if let Some(contribution) = oxc_unused_exports_contribution(
+                &project_root,
+                facts,
+                parse_errors_by_file.get(&normalize_path(&file.file)),
+                &skipped_files_payload,
+            ) {
+                contributions.push(contribution);
+            }
         }
 
         if public_api_entries.is_public_api_file(&file.file)
@@ -320,19 +344,43 @@ fn run_unused_exports_oxc_scan(
 
 fn oxc_unused_exports_contribution(
     project_root: &Path,
-    file: &OxcFileVerdicts,
-    resolver_config_fingerprint: &str,
+    facts: &FileFacts,
     parse_errors: Option<&Vec<String>>,
     skipped_files: &[Value],
 ) -> Option<FileContribution> {
-    let freshness = cache_freshness::collect(&file.file).ok()?;
-    let mut contribution = file.contribution_payload();
+    let freshness = cache_freshness::collect(&facts.path).ok()?;
+    let exports = facts
+        .exports
+        .iter()
+        .map(|export| {
+            json!({
+                "symbol": export.name.as_symbol(),
+                "kind": export.kind,
+                "line": export.line,
+            })
+        })
+        .collect::<Vec<_>>();
+    let facts_payload = OxcUnusedExportsFactsPayload {
+        format_version: FACTS_FORMAT_VERSION,
+        content_hash: &facts.content_hash,
+        exports: &facts.exports,
+        imports: &facts.imports,
+        re_exports: &facts.re_exports,
+        dynamic_imports: &facts.dynamic_imports,
+        same_file_value_references: &facts.same_file_value_references,
+        used_import_bindings: &facts.used_import_bindings,
+        type_referenced_import_bindings: &facts.type_referenced_import_bindings,
+        value_referenced_import_bindings: &facts.value_referenced_import_bindings,
+        parse_error: &facts.parse_error,
+    };
+    let mut contribution = json!({
+        "file": relative_string(project_root, &facts.path),
+        "exports": exports,
+        "imports": [],
+        "provenance": OXC_PROVENANCE,
+        "oxc_facts": facts_payload,
+    });
     if let Value::Object(object) = &mut contribution {
-        object.insert("imports".to_string(), json!([]));
-        object.insert(
-            "resolver_config_fingerprint".to_string(),
-            Value::String(resolver_config_fingerprint.to_string()),
-        );
         if let Some(parse_errors) = parse_errors {
             object.insert(
                 "parse_errors".to_string(),
@@ -341,7 +389,7 @@ fn oxc_unused_exports_contribution(
                         .iter()
                         .map(|message| {
                             json!({
-                                "file": relative_string(project_root, &file.file),
+                                "file": relative_string(project_root, &facts.path),
                                 "message": message,
                             })
                         })
@@ -358,9 +406,9 @@ fn oxc_unused_exports_contribution(
     }
     Some(FileContribution::new(
         InspectCategory::UnusedExports,
-        file.file.clone(),
+        facts.path.clone(),
         freshness,
-        contribution_with_relative_file(project_root, contribution, &file.file),
+        contribution_with_relative_file(project_root, contribution, &facts.path),
     ))
 }
 

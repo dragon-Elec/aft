@@ -14,6 +14,7 @@ pub mod types;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use oxc_span::SourceType;
 
@@ -27,12 +28,16 @@ pub use types::{
     OXC_PROVENANCE,
 };
 
-const FACTS_FORMAT_VERSION: u32 = 2;
+pub(crate) const FACTS_FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Default)]
 pub struct AnalyzeOptions {
     pub entry_points: Vec<PathBuf>,
     pub public_api_files: Vec<PathBuf>,
+    /// Files already proven stale by the inspect freshness layer. These paths
+    /// bypass the path metadata fast path so same-size/same-mtime edits are
+    /// still re-read and content-hashed before facts are reused.
+    pub force_reparse_files: Vec<PathBuf>,
     /// When true, imports/re-exports only make targets live after execution is
     /// reachable from entry/public files. Used by dead_code; unused_exports keeps
     /// the default import-usage semantics.
@@ -42,6 +47,14 @@ pub struct AnalyzeOptions {
 #[derive(Debug, Clone, Default)]
 pub struct OxcFactsCache {
     entries_by_hash: BTreeMap<String, FileFacts>,
+    entries_by_path: BTreeMap<PathBuf, OxcFactsPathEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct OxcFactsPathEntry {
+    mtime: SystemTime,
+    size: u64,
+    cache_key: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -63,33 +76,96 @@ impl OxcFactsCache {
         self.entries_by_hash.is_empty()
     }
 
-    fn facts_for_source(
+    fn facts_for_file(
+        &mut self,
+        file_id: FileId,
+        path: &Path,
+        force_reparse: bool,
+        stats: &mut OxcFactsCacheStats,
+    ) -> std::io::Result<FileFacts> {
+        let source_type = SourceType::from_path(path).unwrap_or_default();
+        let source_type_key = source_type_cache_key(source_type);
+        let metadata = fs::metadata(path)?;
+        let mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+        let size = metadata.len();
+        let path_key = path.to_path_buf();
+
+        if !force_reparse {
+            if let Some(entry) = self.entries_by_path.get(&path_key) {
+                if entry.mtime == mtime && entry.size == size {
+                    if let Some(cached) = self.entries_by_hash.get(&entry.cache_key) {
+                        stats.hits += 1;
+                        return Ok(rebind_facts(cached, file_id, path, &cached.content_hash));
+                    }
+                }
+            }
+        }
+
+        let source = fs::read_to_string(path)?;
+        Ok(self.facts_for_source_with_metadata(
+            file_id,
+            path,
+            &source,
+            source_type,
+            source_type_key,
+            Some((mtime, size)),
+            stats,
+        ))
+    }
+
+    fn facts_for_source_with_metadata(
         &mut self,
         file_id: FileId,
         path: &Path,
         source: &str,
+        source_type: SourceType,
+        source_type_key: String,
+        metadata: Option<(SystemTime, u64)>,
         stats: &mut OxcFactsCacheStats,
     ) -> FileFacts {
-        let source_type = SourceType::from_path(path).unwrap_or_default();
-        let source_type_key = source_type_cache_key(source_type);
         let content_hash = crate::cache_freshness::hash_bytes(source.as_bytes())
             .to_hex()
             .to_string();
         let cache_key = format!("v{FACTS_FORMAT_VERSION}:{source_type_key}:{content_hash}");
         if let Some(cached) = self.entries_by_hash.get(&cache_key) {
             stats.hits += 1;
-            let mut facts = cached.clone();
-            facts.file_id = file_id;
-            facts.path = path.to_path_buf();
-            facts.content_hash = content_hash;
-            return facts;
+            if let Some((mtime, size)) = metadata {
+                self.entries_by_path.insert(
+                    path.to_path_buf(),
+                    OxcFactsPathEntry {
+                        mtime,
+                        size,
+                        cache_key,
+                    },
+                );
+            }
+            return rebind_facts(cached, file_id, path, &content_hash);
         }
 
         stats.misses += 1;
         let facts = parse_file_facts(file_id, path, source, content_hash, source_type);
-        self.entries_by_hash.insert(cache_key, facts.clone());
+        self.entries_by_hash
+            .insert(cache_key.clone(), facts.clone());
+        if let Some((mtime, size)) = metadata {
+            self.entries_by_path.insert(
+                path.to_path_buf(),
+                OxcFactsPathEntry {
+                    mtime,
+                    size,
+                    cache_key,
+                },
+            );
+        }
         facts
     }
+}
+
+fn rebind_facts(cached: &FileFacts, file_id: FileId, path: &Path, content_hash: &str) -> FileFacts {
+    let mut facts = cached.clone();
+    facts.file_id = file_id;
+    facts.path = path.to_path_buf();
+    facts.content_hash = content_hash.to_string();
+    facts
 }
 
 fn source_type_cache_key(source_type: SourceType) -> String {
@@ -135,6 +211,7 @@ pub fn analyze_files_with_cache(
 ) -> Result<OxcEngineResult, String> {
     let project_root =
         fs::canonicalize(project_root).unwrap_or_else(|_| normalize_path(project_root));
+    let force_reparse_files = normalize_option_paths(&options.force_reparse_files);
     let normalized_files = normalize_file_set(&project_root, files);
     let files = normalized_files.files;
     let skipped_outside_root = normalized_files.skipped_outside_root;
@@ -143,29 +220,66 @@ pub fn analyze_files_with_cache(
     let mut facts = Vec::with_capacity(files.len());
 
     for (idx, path) in files.iter().enumerate() {
-        let source = match fs::read_to_string(path) {
-            Ok(source) => source,
-            Err(error) => {
-                errors.push(OxcEngineError {
-                    file: path.clone(),
-                    message: format!("read: {error}"),
-                });
-                continue;
-            }
-        };
-        let file_facts = cache.facts_for_source(FileId(idx), path, &source, &mut cache_stats);
-        if let Some(parse_error) = &file_facts.parse_error {
-            errors.push(OxcEngineError {
+        match cache.facts_for_file(
+            FileId(idx),
+            path,
+            force_reparse_files.contains(path),
+            &mut cache_stats,
+        ) {
+            Ok(file_facts) => facts.push(file_facts),
+            Err(error) => errors.push(OxcEngineError {
                 file: path.clone(),
+                message: format!("read: {error}"),
+            }),
+        }
+    }
+
+    Ok(analyze_preparsed_facts(
+        project_root,
+        facts,
+        options,
+        cache_stats,
+        errors,
+        skipped_outside_root,
+    ))
+}
+
+pub(crate) fn analyze_file_facts(
+    project_root: &Path,
+    facts: Vec<FileFacts>,
+    options: AnalyzeOptions,
+    skipped_outside_root: Vec<PathBuf>,
+) -> OxcEngineResult {
+    let project_root =
+        fs::canonicalize(project_root).unwrap_or_else(|_| normalize_path(project_root));
+    analyze_preparsed_facts(
+        project_root,
+        facts,
+        options,
+        OxcFactsCacheStats::default(),
+        Vec::new(),
+        skipped_outside_root,
+    )
+}
+
+fn analyze_preparsed_facts(
+    project_root: PathBuf,
+    mut facts: Vec<FileFacts>,
+    options: AnalyzeOptions,
+    cache_stats: OxcFactsCacheStats,
+    mut errors: Vec<OxcEngineError>,
+    skipped_outside_root: Vec<PathBuf>,
+) -> OxcEngineResult {
+    // Preserve dense FileId indexing when unreadable files were skipped or facts
+    // were reconstructed from contribution records.
+    for (idx, fact) in facts.iter_mut().enumerate() {
+        fact.file_id = FileId(idx);
+        if let Some(parse_error) = &fact.parse_error {
+            errors.push(OxcEngineError {
+                file: fact.path.clone(),
                 message: format!("parse: {parse_error}"),
             });
         }
-        facts.push(file_facts);
-    }
-
-    // Preserve dense FileId indexing when unreadable files were skipped.
-    for (idx, fact) in facts.iter_mut().enumerate() {
-        fact.file_id = FileId(idx);
     }
     let resolved_files = facts
         .iter()
@@ -190,13 +304,14 @@ pub fn analyze_files_with_cache(
     let resolver_config_inputs = tracker.inputs();
     let resolver_config_fingerprint = tracker.fingerprint();
 
-    Ok(OxcEngineResult {
+    OxcEngineResult {
         files: file_verdicts,
+        facts,
         resolver_config_inputs,
         resolver_config_fingerprint,
         edges,
         stats: OxcEngineStats {
-            files: facts.len(),
+            files: resolved_files.len(),
             cache_hits: cache_stats.hits,
             cache_misses: cache_stats.misses,
             resolved_edges,
@@ -204,7 +319,7 @@ pub fn analyze_files_with_cache(
         },
         errors,
         skipped_outside_root,
-    })
+    }
 }
 
 #[derive(Debug, Default)]

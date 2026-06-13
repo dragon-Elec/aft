@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use aft::callgraph::walk_project_files;
 use aft::inspect::oxc_engine::{
     analyze_files_with_cache, AnalyzeOptions, LivenessVerdict, OxcEngineResult, OxcExportVerdict,
     OxcFactsCache,
@@ -541,6 +542,132 @@ fn oxc_engine_resolver_fingerprint_changes_when_package_json_changes() {
     assert_ne!(
         first.resolver_config_fingerprint(),
         second.resolver_config_fingerprint()
+    );
+}
+
+#[test]
+fn oxc_engine_forced_stale_file_reparse_misses_only_changed_file() {
+    let (temp_dir, root, paths) = fixture_project(&[
+        (
+            "src/a.ts",
+            "import { b } from './b';
+export const a = b + 1;
+",
+        ),
+        (
+            "src/b.ts",
+            "import { c } from './c';
+export const b = c + 1;
+",
+        ),
+        (
+            "src/c.ts",
+            "export const c = 1;
+",
+        ),
+    ]);
+    let _keep = temp_dir;
+    let mut cache = OxcFactsCache::new();
+    let cold = analyze_files_with_cache(&root, &paths, AnalyzeOptions::default(), &mut cache)
+        .expect("cold analyze");
+    assert_eq!(cold.stats.cache_misses, 3);
+    assert_eq!(cold.stats.cache_hits, 0);
+
+    let changed = root.join("src/b.ts");
+    fs::write(
+        &changed,
+        "import { c } from './c';
+export const b = c + 2;
+export const b2 = b;
+",
+    )
+    .expect("rewrite changed file");
+    let warm = analyze_files_with_cache(
+        &root,
+        &paths,
+        AnalyzeOptions {
+            force_reparse_files: vec![changed],
+            ..AnalyzeOptions::default()
+        },
+        &mut cache,
+    )
+    .expect("warm analyze");
+
+    assert_eq!(warm.stats.cache_hits, 2);
+    assert_eq!(warm.stats.cache_misses, 1);
+    assert_verdict(&warm, "src/b.ts", "b2", LivenessVerdict::Unused);
+}
+
+#[test]
+#[ignore = "manual benchmark; needs AFT_BENCH_REPO pointing at a large checkout"]
+fn unused_exports_incremental_oxc_benchmark() {
+    let Ok(repo) = std::env::var("AFT_BENCH_REPO") else {
+        eprintln!("AFT_BENCH_REPO unset; skipping");
+        return;
+    };
+    let root = fs::canonicalize(Path::new(&repo)).expect("canonical bench repo");
+    let mut paths = walk_project_files(&root)
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| {
+                    matches!(
+                        ext,
+                        "ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs"
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    let Some(changed) = paths.first().cloned() else {
+        eprintln!("AFT_BENCH_REPO has no TS/JS source files; skipping");
+        return;
+    };
+
+    let mut cache = OxcFactsCache::new();
+    let cold_started = Instant::now();
+    let cold = analyze_files_with_cache(&root, &paths, AnalyzeOptions::default(), &mut cache)
+        .expect("cold bench analyze");
+    let cold_elapsed = cold_started.elapsed();
+
+    let original = fs::read_to_string(&changed).expect("read bench file");
+    fs::write(
+        &changed,
+        format!(
+            "{original}
+// aft unused_exports incremental benchmark touch
+"
+        ),
+    )
+    .expect("touch bench file");
+    let warm_started = Instant::now();
+    let warm_result = analyze_files_with_cache(
+        &root,
+        &paths,
+        AnalyzeOptions {
+            force_reparse_files: vec![changed.clone()],
+            ..AnalyzeOptions::default()
+        },
+        &mut cache,
+    );
+    let warm_elapsed = warm_started.elapsed();
+    fs::write(&changed, original).expect("restore bench file");
+    let warm = warm_result.expect("warm bench analyze");
+
+    eprintln!(
+        "unused_exports oxc incremental benchmark (PROVISIONAL/contended): files={} cold={:?} cold_stats={:?} warm={:?} warm_stats={:?} changed={}",
+        paths.len(),
+        cold_elapsed,
+        cold.stats,
+        warm_elapsed,
+        warm.stats,
+        changed.strip_prefix(&root).unwrap_or(&changed).display()
+    );
+    assert_eq!(warm.stats.cache_misses, 1);
+    assert_eq!(
+        warm.stats.cache_hits + warm.stats.cache_misses,
+        warm.stats.files
     );
 }
 

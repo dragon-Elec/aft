@@ -202,6 +202,8 @@ pub struct OxcEngineError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OxcEngineResult {
     pub files: Vec<OxcFileVerdicts>,
+    #[serde(default)]
+    pub facts: Vec<FileFacts>,
     pub resolver_config_inputs: Vec<ResolverConfigInput>,
     pub resolver_config_fingerprint: String,
     pub edges: Vec<OxcResolvedEdge>,

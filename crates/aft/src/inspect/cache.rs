@@ -103,7 +103,7 @@ impl From<serde_json::Error> for InspectCacheError {
 /// liveness (qualified-constructor calls like AppContext::new -> BackupStore::new
 /// no longer collapse to bare `new` and drop), changing the dead verdict for the
 /// same contribution set — existing caches must invalidate.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 15;
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 16;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1399,6 +1399,6 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 15);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 16);
     }
 }

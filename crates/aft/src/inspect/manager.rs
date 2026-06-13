@@ -17,7 +17,9 @@ use super::job::{
 };
 use super::oxc_engine::LivenessVerdict;
 use super::oxc_engine::{
-    analyze_files_with_cache, AnalyzeOptions, OxcEngineResult, OxcFactsCache, OXC_PROVENANCE,
+    analyze_file_facts, analyze_files_with_cache, AnalyzeOptions, DynamicImportFact, ExportFact,
+    FileFacts, FileId, ImportFact, OxcEngineResult, OxcFactsCache, ReExportFact,
+    FACTS_FORMAT_VERSION, OXC_PROVENANCE,
 };
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph_store::{project_dead_code_snapshot, CallGraphStore, CallGraphStoreError};
@@ -385,6 +387,7 @@ impl InspectManager {
         &self,
         job: &InspectJob,
         files: &[PathBuf],
+        force_reparse_files: &[PathBuf],
     ) -> Result<Option<OxcEngineResult>, String> {
         if !category_uses_oxc(job.category) {
             return Ok(None);
@@ -405,6 +408,7 @@ impl InspectManager {
         let options = AnalyzeOptions {
             entry_points,
             public_api_files: public_api_entries.public_api_files(),
+            force_reparse_files: force_reparse_files.to_vec(),
             entry_reachability: job.category == InspectCategory::DeadCode,
         };
 
@@ -767,8 +771,9 @@ impl InspectManager {
         phases.freshness = phase_started.elapsed();
 
         let mut scan_files = scan_by_relative.into_values().collect::<Vec<_>>();
+        let force_reparse_files = scan_files.clone();
         if !scan_files.is_empty() {
-            if category_uses_oxc(job.category) {
+            if job.category == InspectCategory::DeadCode {
                 scan_files = current_by_relative.values().cloned().collect::<Vec<_>>();
             }
             let mut scan_job = job.clone();
@@ -787,7 +792,8 @@ impl InspectManager {
                 std::thread::sleep(Duration::from_millis(10));
             }
             let scan_started = Instant::now();
-            let oxc_result = self.oxc_result_for_scan(&scan_job, &scan_job.scope_files)?;
+            let oxc_result =
+                self.oxc_result_for_scan(&scan_job, &scan_job.scope_files, &force_reparse_files)?;
             let scan_result = run_tier2_scan(&scan_job, oxc_result.as_ref());
             phases.scan += scan_started.elapsed();
             phases.scanned_files += scan_files.len();
@@ -845,11 +851,20 @@ impl InspectManager {
             });
         }
 
-        if category_contributions_depend_on_entry_points(job.category) {
-            // Manifest edits can change entry/public roots without touching any
-            // source file. Dead-code and unused-export file contributions embed
-            // those roots, so an aggregate hash miss for these categories must
-            // refresh every current contribution before rolling up again.
+        let refresh_unused_exports_facts = if job.category == InspectCategory::UnusedExports {
+            unused_exports_contributions_need_fact_refresh(cache, job)?
+        } else {
+            false
+        };
+        if category_contributions_depend_on_entry_points(job.category)
+            || refresh_unused_exports_facts
+        {
+            // Manifest edits can change dead-code entry/public roots without
+            // touching any source file. Dead-code contributions still embed
+            // those roots, so an aggregate hash miss must refresh every current
+            // contribution before rolling up again. Unused-exports contributions
+            // store raw oxc facts; only pre-facts/version-mismatched caches need
+            // this one-time full refresh before verdicts can be recomputed.
             let full_scan_files = current_by_relative.into_values().collect::<Vec<_>>();
             if !full_scan_files.is_empty() {
                 let mut rescan_job = job.clone();
@@ -863,7 +878,11 @@ impl InspectManager {
                     phases.snapshot += snapshot_started.elapsed();
                 }
                 let scan_started = Instant::now();
-                let oxc_result = self.oxc_result_for_scan(&rescan_job, &rescan_job.scope_files)?;
+                let oxc_result = self.oxc_result_for_scan(
+                    &rescan_job,
+                    &rescan_job.scope_files,
+                    &force_reparse_files,
+                )?;
                 let scan_result = run_tier2_scan(&rescan_job, oxc_result.as_ref());
                 phases.scan += scan_started.elapsed();
                 phases.scanned_files += full_scan_files.len();
@@ -1517,6 +1536,39 @@ fn load_contributions(
         })
 }
 
+fn unused_exports_contributions_need_fact_refresh(
+    cache: &InspectCache,
+    job: &InspectJob,
+) -> Result<bool, String> {
+    let contributions = load_contributions(cache, job)?;
+    Ok(contributions
+        .iter()
+        .any(unused_exports_contribution_needs_fact_refresh))
+}
+
+fn unused_exports_contribution_needs_fact_refresh(contribution: &FileContribution) -> bool {
+    let top_level_oxc = contribution
+        .contribution
+        .get("provenance")
+        .and_then(Value::as_str)
+        == Some(OXC_PROVENANCE);
+    let Ok(parsed) =
+        serde_json::from_value::<UnusedExportsContribution>(contribution.contribution.clone())
+    else {
+        return false;
+    };
+    let uses_oxc =
+        top_level_oxc || parsed.oxc_facts.is_some() || parsed.exports.iter().any(export_uses_oxc);
+    if !uses_oxc {
+        return false;
+    }
+
+    !matches!(
+        parsed.oxc_facts,
+        Some(facts) if facts.format_version == FACTS_FORMAT_VERSION
+    )
+}
+
 fn contribution_from_record(
     project_root: &Path,
     record: super::cache::ContributionRecord,
@@ -1645,6 +1697,10 @@ fn roll_up_unused_exports_contributions(
                 .ok()
         })
         .collect::<Vec<_>>();
+
+    if parsed.iter().any(|scan| scan.oxc_facts.is_some()) {
+        return roll_up_unused_exports_oxc_contributions(job, &parsed, drill_down_limit);
+    }
 
     let (public_api_entries, package_warnings) = unused_public_api_entries(&job.project_root);
     let mut imported_by: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
@@ -1775,6 +1831,130 @@ fn roll_up_unused_exports_contributions(
     aggregate
 }
 
+fn roll_up_unused_exports_oxc_contributions(
+    job: &InspectJob,
+    parsed: &[UnusedExportsContribution],
+    drill_down_limit: Option<usize>,
+) -> Value {
+    let (public_api_entries, package_warnings) = unused_public_api_entries(&job.project_root);
+    let facts = parsed
+        .iter()
+        .filter_map(|scan| {
+            let oxc_facts = scan.oxc_facts.as_ref()?;
+            let path = normalize_path(&job.project_root.join(&scan.file));
+            Some(FileFacts {
+                file_id: FileId(0),
+                path,
+                content_hash: oxc_facts.content_hash.clone(),
+                exports: oxc_facts.exports.clone(),
+                imports: oxc_facts.imports.clone(),
+                re_exports: oxc_facts.re_exports.clone(),
+                dynamic_imports: oxc_facts.dynamic_imports.clone(),
+                same_file_value_references: oxc_facts.same_file_value_references.clone(),
+                used_import_bindings: oxc_facts.used_import_bindings.clone(),
+                type_referenced_import_bindings: oxc_facts.type_referenced_import_bindings.clone(),
+                value_referenced_import_bindings: oxc_facts
+                    .value_referenced_import_bindings
+                    .clone(),
+                parse_error: oxc_facts.parse_error.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let oxc_result = analyze_file_facts(
+        &job.project_root,
+        facts,
+        AnalyzeOptions {
+            entry_points: Vec::new(),
+            public_api_files: super::entry_points::resolve_entry_points(&job.project_root)
+                .public_api_files(),
+            force_reparse_files: Vec::new(),
+            entry_reachability: false,
+        },
+        Vec::new(),
+    );
+    let roles = super::entry_points::resolve_project_roles(&job.project_root);
+
+    let mut count = 0usize;
+    let mut items = Vec::new();
+    let mut uncertain_count = 0usize;
+    let mut uncertain_items = Vec::new();
+    for file in &oxc_result.files {
+        if public_api_entries.contains(&file.relative_file)
+            || super::job::is_test_support_file(&file.relative_file)
+        {
+            continue;
+        }
+
+        for export in &file.exports {
+            match export.verdict {
+                LivenessVerdict::Used => {}
+                LivenessVerdict::Uncertain => {
+                    uncertain_count += 1;
+                    if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
+                        uncertain_items.push(json!({
+                            "file": file.relative_file,
+                            "symbol": export.symbol,
+                            "kind": export.kind,
+                            "line": export.line,
+                            "reason": export.reason,
+                            "provenance": export.provenance,
+                        }));
+                    }
+                }
+                LivenessVerdict::Unused => {
+                    count += 1;
+                    items.push(json!({
+                        "file": file.relative_file,
+                        "symbol": export.symbol,
+                        "kind": export.kind,
+                        "line": export.line,
+                        "provenance": export.provenance,
+                    }));
+                }
+            }
+        }
+    }
+
+    let items = super::entry_points::rank_and_truncate_items(items, &roles, drill_down_limit);
+    let top = super::entry_points::top_preview_symbols(&items);
+    let (mut parse_errors, skipped_files) = unused_exports_honesty_fields(parsed);
+    for scan in parsed {
+        if let Some(oxc_facts) = &scan.oxc_facts {
+            if oxc_facts.format_version != FACTS_FORMAT_VERSION {
+                parse_errors.push(json!({
+                    "file": scan.file,
+                    "message": format!(
+                        "unsupported oxc facts format {}; expected {}",
+                        oxc_facts.format_version, FACTS_FORMAT_VERSION
+                    ),
+                }));
+            }
+        }
+    }
+
+    let mut aggregate = json!({
+        "count": count,
+        "items": items,
+        "top": top,
+        "drill_down_capped": drill_down_limit.is_some_and(|limit| count > limit),
+        "scanned_files": parsed.len(),
+        "languages_skipped": skipped_languages(&job.scope_files, LanguageSkipMode::UnusedExports),
+        "uncertain_count": uncertain_count,
+        "uncertain_items": uncertain_items,
+        "complete": parse_errors.is_empty() && skipped_files.is_empty(),
+    });
+    if !parse_errors.is_empty() {
+        aggregate["parse_errors"] = Value::Array(parse_errors);
+    }
+    if !skipped_files.is_empty() {
+        aggregate["skipped_files"] = Value::Array(skipped_files);
+    }
+    if !package_warnings.is_empty() {
+        aggregate["note"] = Value::String(package_warnings.join("; "));
+    }
+    aggregate
+}
+
 fn unused_exports_honesty_fields(parsed: &[UnusedExportsContribution]) -> (Vec<Value>, Vec<Value>) {
     let mut parse_error_keys = BTreeSet::new();
     let mut parse_errors = Vec::new();
@@ -1851,6 +2031,8 @@ struct UnusedExportsContribution {
     #[serde(default)]
     imports: Vec<ImportContribution>,
     #[serde(default)]
+    oxc_facts: Option<OxcFactsContribution>,
+    #[serde(default)]
     parse_errors: Vec<Value>,
     #[serde(default)]
     skipped_files: Vec<Value>,
@@ -1860,6 +2042,22 @@ struct UnusedExportsContribution {
 struct ImportContribution {
     resolved_file: Option<String>,
     named: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OxcFactsContribution {
+    format_version: u32,
+    content_hash: String,
+    exports: Vec<ExportFact>,
+    imports: Vec<ImportFact>,
+    re_exports: Vec<ReExportFact>,
+    dynamic_imports: Vec<DynamicImportFact>,
+    same_file_value_references: BTreeSet<String>,
+    used_import_bindings: BTreeSet<String>,
+    type_referenced_import_bindings: BTreeSet<String>,
+    value_referenced_import_bindings: BTreeSet<String>,
+    #[serde(default)]
+    parse_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1876,10 +2074,7 @@ fn category_uses_oxc(category: InspectCategory) -> bool {
 }
 
 fn category_contributions_depend_on_entry_points(category: InspectCategory) -> bool {
-    matches!(
-        category,
-        InspectCategory::DeadCode | InspectCategory::UnusedExports
-    )
+    matches!(category, InspectCategory::DeadCode)
 }
 
 fn skipped_languages(files: &[PathBuf], mode: LanguageSkipMode) -> Vec<String> {

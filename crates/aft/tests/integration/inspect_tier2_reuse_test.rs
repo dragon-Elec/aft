@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use aft::config::Config;
 use aft::inspect::{InspectCategory, InspectManager, InspectScanSuccess, InspectSnapshot};
 use aft::parser::SymbolCache;
+use serde_json::Value;
 
 fn write_file(root: &Path, relative: &str, contents: &str) -> PathBuf {
     let path = root.join(relative);
@@ -169,4 +170,382 @@ fn inspect_tier2_reuse_rescans_same_size_content_change_with_restored_mtime() {
     );
     assert_eq!(second.aggregate["items"][0]["symbol"], "two");
     assert_ne!(second.aggregate, first.aggregate);
+}
+
+fn unused_contribution_payloads(
+    project_root: &Path,
+    success: &InspectScanSuccess,
+) -> Vec<(String, Value)> {
+    let mut payloads = success
+        .contributions
+        .iter()
+        .map(|contribution| {
+            let relative = contribution
+                .file_path
+                .strip_prefix(project_root)
+                .unwrap_or(&contribution.file_path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            (relative, contribution.contribution.clone())
+        })
+        .collect::<Vec<_>>();
+    payloads.sort_by(|left, right| left.0.cmp(&right.0));
+    payloads
+}
+
+fn assert_unused_exports_incremental_matches_cold<S, E>(name: &str, setup: S, edit: E)
+where
+    S: FnOnce(&Path),
+    E: FnOnce(&Path),
+{
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root = temp_dir.path().join(format!("project-{name}"));
+    fs::create_dir_all(&root).expect("create project");
+    setup(&root);
+
+    let warm_inspect_dir = temp_dir.path().join(format!("inspect-warm-{name}"));
+    let warm_manager = InspectManager::new();
+    let (first, _first_elapsed) = run_reuse_category(
+        &warm_manager,
+        snapshot(&root, &warm_inspect_dir),
+        InspectCategory::UnusedExports,
+    );
+    assert!(
+        !first.contributions.is_empty(),
+        "{name}: initial cold scan should populate contributions"
+    );
+
+    edit(&root);
+
+    let (warm, _warm_elapsed) = run_reuse_category(
+        &warm_manager,
+        snapshot(&root, &warm_inspect_dir),
+        InspectCategory::UnusedExports,
+    );
+    let cold_inspect_dir = temp_dir.path().join(format!("inspect-cold-{name}"));
+    let cold_manager = InspectManager::new();
+    let (cold, _cold_elapsed) = run_reuse_category(
+        &cold_manager,
+        snapshot(&root, &cold_inspect_dir),
+        InspectCategory::UnusedExports,
+    );
+
+    assert_eq!(warm.aggregate, cold.aggregate, "{name}: aggregate mismatch");
+    assert_eq!(
+        unused_contribution_payloads(&root, &warm),
+        unused_contribution_payloads(&root, &cold),
+        "{name}: per-file contribution payload mismatch"
+    );
+}
+
+#[test]
+fn inspect_unused_exports_incremental_oxc_invariants_match_cold() {
+    assert_unused_exports_incremental_matches_cold(
+        "last_importer_removed",
+        |root| {
+            write_file(
+                root,
+                "src/exported.ts",
+                "export const x = 1;
+export const y = 2;
+",
+            );
+            write_file(
+                root,
+                "src/use.ts",
+                "import { x } from './exported';
+console.log(x);
+",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "src/use.ts",
+                "console.log('import removed');
+",
+            );
+        },
+    );
+
+    assert_unused_exports_incremental_matches_cold(
+        "importer_deleted",
+        |root| {
+            write_file(
+                root,
+                "src/exported.ts",
+                "export const x = 1;
+",
+            );
+            write_file(
+                root,
+                "src/use.ts",
+                "import { x } from './exported';
+console.log(x);
+",
+            );
+        },
+        |root| {
+            fs::remove_file(root.join("src/use.ts")).expect("delete importer");
+        },
+    );
+
+    assert_unused_exports_incremental_matches_cold(
+        "file_renamed",
+        |root| {
+            write_file(
+                root,
+                "src/exported.ts",
+                "export const x = 1;
+",
+            );
+            write_file(
+                root,
+                "src/use.ts",
+                "import { x } from './exported';
+console.log(x);
+",
+            );
+        },
+        |root| {
+            fs::create_dir_all(root.join("src/moved")).expect("create moved dir");
+            fs::rename(
+                root.join("src/exported.ts"),
+                root.join("src/moved/exported.ts"),
+            )
+            .expect("rename exported file");
+        },
+    );
+
+    assert_unused_exports_incremental_matches_cold(
+        "tsconfig_alias_change",
+        |root| {
+            write_file(
+                root,
+                "tsconfig.json",
+                r#"{"compilerOptions":{"baseUrl":".","paths":{"@lib":["src/a.ts"]}}}"#,
+            );
+            write_file(
+                root,
+                "src/a.ts",
+                "export const x = 'a';
+",
+            );
+            write_file(
+                root,
+                "src/b.ts",
+                "export const x = 'b';
+",
+            );
+            write_file(
+                root,
+                "src/use.ts",
+                "import { x } from '@lib';
+console.log(x);
+",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "tsconfig.json",
+                r#"{"compilerOptions":{"baseUrl":".","paths":{"@lib":["src/b.ts"]}}}"#,
+            );
+        },
+    );
+
+    assert_unused_exports_incremental_matches_cold(
+        "barrel_target_changed",
+        |root| {
+            write_file(
+                root,
+                "src/target.ts",
+                "export const named = 1;
+export default function def() { return named; }
+",
+            );
+            write_file(
+                root,
+                "src/extra.ts",
+                "export const star = 1;
+",
+            );
+            write_file(
+                root,
+                "src/barrel.ts",
+                "export { named } from './target';
+export { default } from './target';
+export * from './extra';
+export * as ns from './target';
+",
+            );
+            write_file(
+                root,
+                "src/use.ts",
+                "import { named, default as def, star, ns } from './barrel';
+console.log(named, def, star, ns);
+",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "src/target.ts",
+                "export const named = 1;
+export const added = 2;
+export default function def() { return named + added; }
+",
+            );
+        },
+    );
+
+    assert_unused_exports_incremental_matches_cold(
+        "namespace_import_uncertain",
+        |root| {
+            write_file(
+                root,
+                "src/target.ts",
+                "export const a = 1;
+export const b = 2;
+",
+            );
+            write_file(
+                root,
+                "src/use.ts",
+                "import { a } from './target';
+console.log(a);
+",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "src/use.ts",
+                "import * as target from './target';
+console.log(target);
+",
+            );
+        },
+    );
+
+    assert_unused_exports_incremental_matches_cold(
+        "dynamic_import_added",
+        |root| {
+            write_file(
+                root,
+                "src/lazy.ts",
+                "export const lazy = 1;
+",
+            );
+            write_file(
+                root,
+                "src/main.ts",
+                "console.log('main');
+",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "src/main.ts",
+                "import('./lazy').then((module) => console.log(module));
+",
+            );
+        },
+    );
+
+    assert_unused_exports_incremental_matches_cold(
+        "dynamic_import_removed",
+        |root| {
+            write_file(
+                root,
+                "src/lazy.ts",
+                "export const lazy = 1;
+",
+            );
+            write_file(
+                root,
+                "src/main.ts",
+                "import('./lazy').then((module) => console.log(module));
+",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "src/main.ts",
+                "console.log('main');
+",
+            );
+        },
+    );
+
+    assert_unused_exports_incremental_matches_cold(
+        "new_sibling_resolution_candidate",
+        |root| {
+            write_file(
+                root,
+                "src/foo/index.ts",
+                "export const x = 1;
+export const oldOnly = 2;
+",
+            );
+            write_file(
+                root,
+                "src/use.ts",
+                "import { x } from './foo';
+console.log(x);
+",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "src/foo.ts",
+                "export const x = 1;
+export const newOnly = 3;
+",
+            );
+        },
+    );
+}
+
+#[test]
+fn inspect_unused_exports_twice_cold_is_deterministic() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root = temp_dir.path().join("project-twice-cold");
+    fs::create_dir_all(&root).expect("create project");
+    write_file(
+        root.as_path(),
+        "src/a.ts",
+        "export const a = 1;
+export const unused = 2;
+",
+    );
+    write_file(
+        root.as_path(),
+        "src/b.ts",
+        "import { a } from './a';
+console.log(a);
+",
+    );
+
+    let manager_a = InspectManager::new();
+    let (cold_a, _elapsed_a) = run_reuse_category(
+        &manager_a,
+        snapshot(&root, &temp_dir.path().join("inspect-cold-a")),
+        InspectCategory::UnusedExports,
+    );
+    let manager_b = InspectManager::new();
+    let (cold_b, _elapsed_b) = run_reuse_category(
+        &manager_b,
+        snapshot(&root, &temp_dir.path().join("inspect-cold-b")),
+        InspectCategory::UnusedExports,
+    );
+
+    assert_eq!(cold_a.aggregate, cold_b.aggregate);
+    assert_eq!(
+        unused_contribution_payloads(&root, &cold_a),
+        unused_contribution_payloads(&root, &cold_b)
+    );
 }

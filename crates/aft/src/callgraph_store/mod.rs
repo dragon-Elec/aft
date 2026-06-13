@@ -10,7 +10,7 @@ use crate::imports::{ImportKind, ImportStatement};
 use crate::parser::LangId;
 use crate::symbols::{Range, SymbolKind};
 use rayon::prelude::*;
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Statement, Transaction};
 use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -814,24 +814,30 @@ impl CallGraphStore {
         let tx = conn.transaction()?;
         clear_tables(&tx)?;
         insert_meta(&tx)?;
-        for extract in &extracts {
-            insert_file_extract(&tx, &self.project_root, extract)?;
+        drop_cold_build_secondary_indexes(&tx)?;
+        {
+            let workspace_root = self.project_root.display().to_string();
+            let mut inserts = ColdBuildInsertStatements::new(&tx)?;
+            for extract in &extracts {
+                insert_file_extract_prepared(&mut inserts, &workspace_root, extract)?;
+            }
+            for failure in &failures {
+                insert_backend_state_prepared(
+                    &mut inserts.backend_state,
+                    &workspace_root,
+                    &failure.rel_path,
+                    failure
+                        .freshness
+                        .as_ref()
+                        .map(|freshness| &freshness.content_hash),
+                    "stale",
+                )?;
+            }
+            for resolved in &resolved_refs {
+                insert_resolved_ref_prepared(&mut inserts, resolved)?;
+            }
         }
-        for failure in &failures {
-            mark_backend_state(
-                &tx,
-                &self.project_root,
-                &failure.rel_path,
-                failure
-                    .freshness
-                    .as_ref()
-                    .map(|freshness| &freshness.content_hash),
-                "stale",
-            )?;
-        }
-        for resolved in &resolved_refs {
-            insert_resolved_ref(&tx, resolved)?;
-        }
+        create_cold_build_secondary_indexes(&tx)?;
         let supplemental_edge_count = insert_method_dispatch_edges(&tx, &self.project_root, None)?;
         set_meta_ready(&tx, true)?;
         tx.commit()?;
@@ -2240,6 +2246,46 @@ fn clear_tables(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn drop_cold_build_secondary_indexes(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "DROP INDEX IF EXISTS idx_nodes_file;
+         DROP INDEX IF EXISTS idx_nodes_name;
+         DROP INDEX IF EXISTS idx_nodes_scoped;
+         DROP INDEX IF EXISTS idx_refs_short_name;
+         DROP INDEX IF EXISTS idx_refs_caller_file;
+         DROP INDEX IF EXISTS idx_refs_caller_node_kind;
+         DROP INDEX IF EXISTS idx_refs_target_file;
+         DROP INDEX IF EXISTS idx_file_dependencies_dep_file;
+         DROP INDEX IF EXISTS idx_edges_source_kind;
+         DROP INDEX IF EXISTS idx_edges_target_kind;
+         DROP INDEX IF EXISTS idx_edges_target_file_symbol;
+         DROP INDEX IF EXISTS idx_edges_ref_id;
+         DROP INDEX IF EXISTS idx_dispatch_hints_method;
+         DROP INDEX IF EXISTS idx_backend_file_state_file;",
+    )?;
+    Ok(())
+}
+
+fn create_cold_build_secondary_indexes(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_path);
+         CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
+         CREATE INDEX IF NOT EXISTS idx_nodes_scoped ON nodes(scoped_name);
+         CREATE INDEX IF NOT EXISTS idx_refs_short_name ON refs(short_name);
+         CREATE INDEX IF NOT EXISTS idx_refs_caller_file ON refs(caller_file);
+         CREATE INDEX IF NOT EXISTS idx_refs_caller_node_kind ON refs(caller_node, kind, status);
+         CREATE INDEX IF NOT EXISTS idx_refs_target_file ON refs(target_file);
+         CREATE INDEX IF NOT EXISTS idx_file_dependencies_dep_file ON file_dependencies(dep_file);
+         CREATE INDEX IF NOT EXISTS idx_edges_source_kind ON edges(source_node, kind);
+         CREATE INDEX IF NOT EXISTS idx_edges_target_kind ON edges(target_node, kind);
+         CREATE INDEX IF NOT EXISTS idx_edges_target_file_symbol ON edges(target_file, target_symbol, kind);
+         CREATE INDEX IF NOT EXISTS idx_edges_ref_id ON edges(ref_id, kind);
+         CREATE INDEX IF NOT EXISTS idx_dispatch_hints_method ON dispatch_hints(method_name);
+         CREATE INDEX IF NOT EXISTS idx_backend_file_state_file ON backend_file_state(file_path, backend);",
+    )?;
+    Ok(())
+}
+
 const STORE_DATA_PATH_COLUMNS: &[(&str, &str)] = &[
     ("files", "path"),
     ("nodes", "file_path"),
@@ -2628,11 +2674,28 @@ fn build_extracts_parallel(project_root: &Path, files: &[PathBuf]) -> BuildExtra
     BuildExtractsResult { extracts, failures }
 }
 
+fn collect_source_freshness(path: &Path, source: &str) -> std::io::Result<FileFreshness> {
+    let metadata = std::fs::metadata(path)?;
+    let size = metadata.len();
+    let content_hash = if size > cache_freshness::CONTENT_HASH_SIZE_CAP {
+        cache_freshness::zero_hash()
+    } else if source.len() as u64 == size {
+        cache_freshness::hash_bytes(source.as_bytes())
+    } else {
+        cache_freshness::hash_file_if_small(path, size)?.unwrap_or_else(cache_freshness::zero_hash)
+    };
+    Ok(FileFreshness {
+        mtime: metadata.modified().unwrap_or(UNIX_EPOCH),
+        size,
+        content_hash,
+    })
+}
+
 fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
     let abs_path = normalize_file_path(project_root, path)?;
     let rel_path = relative_path(project_root, &abs_path);
     let source = std::fs::read_to_string(&abs_path)?;
-    let freshness = cache_freshness::collect(&abs_path)?;
+    let freshness = collect_source_freshness(&abs_path, &source)?;
     let data = callgraph::build_file_data(&abs_path)?;
     let lang = data.lang;
     let mut nodes = build_node_records(&rel_path, &source, &data)?;
@@ -3862,6 +3925,195 @@ fn load_db_file_indexes(
     }
 
     Ok(files)
+}
+
+struct ColdBuildInsertStatements<'stmt> {
+    file: Statement<'stmt>,
+    node: Statement<'stmt>,
+    file_dependency: Statement<'stmt>,
+    dispatch_hint: Statement<'stmt>,
+    backend_state: Statement<'stmt>,
+    reference: Statement<'stmt>,
+    edge: Statement<'stmt>,
+}
+
+impl<'stmt> ColdBuildInsertStatements<'stmt> {
+    fn new(tx: &'stmt Transaction<'_>) -> Result<Self> {
+        Ok(Self {
+            file: tx.prepare(
+                "INSERT OR REPLACE INTO files(
+                    path, content_hash, mtime_ns, size, lang, is_dead_code_root,
+                    is_public_api, surface_fingerprint, indexed_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, 0, 0, ?6, ?7)",
+            )?,
+            node: tx.prepare(
+                "INSERT OR REPLACE INTO nodes(
+                    id, file_path, name, scoped_name, kind, start_line, start_col,
+                    end_line, end_col, range_ordinal, signature, exported,
+                    is_default_export, is_type_like, is_callgraph_entry_point, provenance
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            )?,
+            file_dependency: tx.prepare(
+                "INSERT OR IGNORE INTO file_dependencies(file_path, dep_file) VALUES(?1, ?2)",
+            )?,
+            dispatch_hint: tx.prepare(
+                "INSERT OR REPLACE INTO dispatch_hints(
+                    id, method_name, caller_node, file, line, byte_start, byte_end, provenance
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?,
+            backend_state: tx.prepare(
+                "INSERT OR REPLACE INTO backend_file_state(
+                    backend, workspace_root, file_path, content_hash, status, updated_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            )?,
+            reference: tx.prepare(
+                "INSERT OR REPLACE INTO refs(
+                    ref_id, caller_node, caller_file, kind, short_name, full_ref, module_path,
+                    import_kind, local_name, requested_name, namespace_alias, wildcard, line,
+                    byte_start, byte_end, status, target_node, target_file, target_symbol,
+                    provenance
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            )?,
+            edge: tx.prepare(
+                "INSERT OR REPLACE INTO edges(
+                    edge_id, ref_id, source_node, target_node, target_file, target_symbol,
+                    kind, line, provenance
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?,
+        })
+    }
+}
+
+fn insert_file_extract_prepared(
+    statements: &mut ColdBuildInsertStatements<'_>,
+    workspace_root: &str,
+    extract: &FileExtract,
+) -> Result<()> {
+    statements.file.execute(params![
+        extract.rel_path,
+        hash_to_hex(extract.freshness.content_hash),
+        system_time_to_ns(extract.freshness.mtime),
+        extract.freshness.size as i64,
+        lang_label(extract.lang),
+        extract.surface_fingerprint,
+        unix_seconds_now(),
+    ])?;
+    for node in &extract.nodes {
+        statements.node.execute(params![
+            node.id,
+            node.file_path,
+            node.name,
+            node.scoped_name,
+            node.kind,
+            node.range.start_line as i64,
+            node.range.start_col as i64,
+            node.range.end_line as i64,
+            node.range.end_col as i64,
+            node.range_ordinal as i64,
+            node.signature,
+            bool_int(node.exported),
+            bool_int(node.is_default_export),
+            bool_int(node.is_type_like),
+            bool_int(node.is_callgraph_entry_point),
+            PROVENANCE_TREESITTER,
+        ])?;
+    }
+
+    let mut dependencies = BTreeSet::new();
+    for raw_ref in &extract.raw_refs {
+        dependencies.extend(raw_ref.dependencies.iter().cloned());
+    }
+    for dep_file in &dependencies {
+        statements
+            .file_dependency
+            .execute(params![extract.rel_path, dep_file])?;
+    }
+
+    for hint in &extract.dispatch_hints {
+        statements.dispatch_hint.execute(params![
+            hint.id,
+            hint.method_name,
+            hint.caller_node,
+            hint.file,
+            hint.line as i64,
+            hint.byte_start as i64,
+            hint.byte_end as i64,
+            PROVENANCE_TREESITTER,
+        ])?;
+    }
+    insert_backend_state_prepared(
+        &mut statements.backend_state,
+        workspace_root,
+        &extract.rel_path,
+        Some(&extract.freshness.content_hash),
+        "fresh",
+    )?;
+    Ok(())
+}
+
+fn insert_backend_state_prepared(
+    stmt: &mut Statement<'_>,
+    workspace_root: &str,
+    rel_path: &str,
+    content_hash: Option<&blake3::Hash>,
+    status: &str,
+) -> Result<()> {
+    let hash = content_hash
+        .map(|hash| hash_to_hex(*hash))
+        .unwrap_or_else(|| hash_to_hex(cache_freshness::zero_hash()));
+    stmt.execute(params![
+        BACKEND_TREESITTER,
+        workspace_root,
+        rel_path,
+        hash,
+        status,
+        unix_seconds_now(),
+    ])?;
+    Ok(())
+}
+
+fn insert_resolved_ref_prepared(
+    statements: &mut ColdBuildInsertStatements<'_>,
+    resolved: &ResolvedRef,
+) -> Result<()> {
+    let raw = &resolved.raw;
+    debug_assert!(resolved.dependencies.is_superset(&raw.dependencies));
+    statements.reference.execute(params![
+        raw.ref_id,
+        raw.caller_node,
+        raw.caller_file,
+        raw.kind,
+        raw.short_name,
+        raw.full_ref,
+        raw.module_path,
+        raw.import_kind,
+        raw.local_name,
+        raw.requested_name,
+        raw.namespace_alias,
+        bool_int(raw.wildcard),
+        raw.line as i64,
+        raw.byte_start as i64,
+        raw.byte_end as i64,
+        resolved.status,
+        resolved.target_node,
+        resolved.target_file,
+        resolved.target_symbol,
+        PROVENANCE_TREESITTER,
+    ])?;
+    if let Some(edge) = &resolved.edge {
+        statements.edge.execute(params![
+            edge.edge_id,
+            raw.ref_id,
+            edge.source_node,
+            edge.target_node,
+            edge.target_file,
+            edge.target_symbol,
+            edge.kind,
+            edge.line as i64,
+            PROVENANCE_TREESITTER,
+        ])?;
+    }
+    Ok(())
 }
 
 fn insert_file_extract(
@@ -6278,6 +6530,286 @@ fn unix_seconds_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod cold_build_insert_tests {
+    use super::*;
+    use crate::imports::ImportBlock;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn source_freshness_matches_cache_collect_for_same_bytes() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("fixture.ts");
+        let source = "export function main() { return helper(); }\n";
+        fs::write(&path, source).expect("write fixture");
+
+        let expected = cache_freshness::collect(&path).expect("collect freshness from file");
+        let actual =
+            collect_source_freshness(&path, source).expect("collect freshness from source");
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn cold_build_prepared_bulk_insert_matches_reference_rows() {
+        let dir = tempdir().expect("temp dir");
+        let project_root = dir.path();
+        let extract = fixture_extract(project_root);
+        let resolved = fixture_resolved(&extract);
+
+        let reference = build_reference_connection(project_root, &extract, &resolved);
+        let optimized = build_optimized_connection(project_root, &extract, &resolved);
+
+        for table in [
+            "files",
+            "nodes",
+            "file_dependencies",
+            "dispatch_hints",
+            "refs",
+            "edges",
+        ] {
+            assert_eq!(table_rows(&reference, table), table_rows(&optimized, table),);
+        }
+        assert_eq!(
+            backend_state_rows(&reference),
+            backend_state_rows(&optimized),
+            "backend freshness rows must match apart from updated_at"
+        );
+        assert_eq!(secondary_indexes(&reference), secondary_indexes(&optimized));
+    }
+
+    fn build_reference_connection(
+        project_root: &Path,
+        extract: &FileExtract,
+        resolved: &ResolvedRef,
+    ) -> Connection {
+        let mut conn = Connection::open_in_memory().expect("open reference db");
+        configure_build_connection(&conn).expect("configure reference db");
+        initialize_schema(&conn).expect("initialize reference schema");
+        {
+            let tx = conn.transaction().expect("reference transaction");
+            clear_tables(&tx).expect("reference clear");
+            insert_meta(&tx).expect("reference meta");
+            insert_file_extract(&tx, project_root, extract).expect("reference file extract");
+            insert_resolved_ref(&tx, resolved).expect("reference resolved ref");
+            let supplemental = insert_method_dispatch_edges(&tx, project_root, None)
+                .expect("reference dispatch edges");
+            assert_eq!(supplemental, 0);
+            tx.commit().expect("reference commit");
+        }
+        conn
+    }
+
+    fn build_optimized_connection(
+        project_root: &Path,
+        extract: &FileExtract,
+        resolved: &ResolvedRef,
+    ) -> Connection {
+        let mut conn = Connection::open_in_memory().expect("open optimized db");
+        configure_build_connection(&conn).expect("configure optimized db");
+        initialize_schema(&conn).expect("initialize optimized schema");
+        {
+            let tx = conn.transaction().expect("optimized transaction");
+            clear_tables(&tx).expect("optimized clear");
+            insert_meta(&tx).expect("optimized meta");
+            drop_cold_build_secondary_indexes(&tx).expect("drop secondary indexes");
+            {
+                let workspace_root = project_root.display().to_string();
+                let mut inserts = ColdBuildInsertStatements::new(&tx).expect("prepare inserts");
+                insert_file_extract_prepared(&mut inserts, &workspace_root, extract)
+                    .expect("optimized file extract");
+                insert_resolved_ref_prepared(&mut inserts, resolved)
+                    .expect("optimized resolved ref");
+            }
+            create_cold_build_secondary_indexes(&tx).expect("create secondary indexes");
+            let supplemental = insert_method_dispatch_edges(&tx, project_root, None)
+                .expect("optimized dispatch edges");
+            assert_eq!(supplemental, 0);
+            tx.commit().expect("optimized commit");
+        }
+        conn
+    }
+
+    fn fixture_extract(project_root: &Path) -> FileExtract {
+        let rel_path = "src/main.ts".to_string();
+        let target_path = "src/helper.ts".to_string();
+        let node = NodeRecord {
+            id: "node-main".to_string(),
+            file_path: rel_path.clone(),
+            name: "main".to_string(),
+            scoped_name: "main".to_string(),
+            kind: "function".to_string(),
+            range: Range {
+                start_line: 0,
+                start_col: 0,
+                end_line: 0,
+                end_col: 32,
+            },
+            range_ordinal: 0,
+            signature: Some("export function main()".to_string()),
+            exported: true,
+            is_default_export: false,
+            is_type_like: false,
+            is_callgraph_entry_point: true,
+        };
+        let mut dependencies = BTreeSet::new();
+        dependencies.insert(target_path.clone());
+        let raw_ref = RawRef {
+            ref_id: "ref-main-helper".to_string(),
+            caller_node: Some(node.id.clone()),
+            caller_symbol: Some(node.scoped_name.clone()),
+            caller_file: rel_path.clone(),
+            kind: "call".to_string(),
+            short_name: Some("helper".to_string()),
+            full_ref: Some("helper".to_string()),
+            module_path: None,
+            import_kind: None,
+            local_name: Some("helper".to_string()),
+            requested_name: Some("helper".to_string()),
+            namespace_alias: None,
+            wildcard: false,
+            line: 1,
+            byte_start: 24,
+            byte_end: 32,
+            dependencies,
+        };
+        FileExtract {
+            abs_path: project_root.join(&rel_path),
+            rel_path,
+            freshness: FileFreshness {
+                mtime: UNIX_EPOCH + Duration::from_secs(123),
+                size: 40,
+                content_hash: cache_freshness::hash_bytes(b"fixture source"),
+            },
+            lang: LangId::TypeScript,
+            data: FileCallData {
+                calls_by_symbol: HashMap::new(),
+                exported_symbols: Vec::new(),
+                symbol_metadata: HashMap::new(),
+                default_export_symbol: None,
+                import_block: ImportBlock::empty(),
+                lang: LangId::TypeScript,
+            },
+            nodes: vec![node.clone()],
+            raw_refs: vec![raw_ref],
+            dispatch_hints: vec![DispatchHint {
+                id: "dispatch-main-helper".to_string(),
+                method_name: "helper".to_string(),
+                caller_node: node.id,
+                file: "src/main.ts".to_string(),
+                line: 1,
+                byte_start: 24,
+                byte_end: 32,
+            }],
+            surface_fingerprint: "surface".to_string(),
+        }
+    }
+
+    fn fixture_resolved(extract: &FileExtract) -> ResolvedRef {
+        let raw = extract.raw_refs[0].clone();
+        let mut dependencies = raw.dependencies.clone();
+        dependencies.insert("src/helper.ts".to_string());
+        ResolvedRef {
+            edge: Some(EdgeRecord {
+                edge_id: "edge-main-helper".to_string(),
+                source_node: raw.caller_node.clone().expect("caller node"),
+                target_node: Some("node-helper".to_string()),
+                target_file: "src/helper.ts".to_string(),
+                target_symbol: "helper".to_string(),
+                kind: "call".to_string(),
+                line: raw.line,
+            }),
+            raw,
+            status: "resolved".to_string(),
+            target_node: Some("node-helper".to_string()),
+            target_file: Some("src/helper.ts".to_string()),
+            target_symbol: Some("helper".to_string()),
+            dependencies,
+        }
+    }
+
+    fn table_rows(conn: &Connection, table: &str) -> Vec<String> {
+        let columns: Vec<String> = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("prepare table_info")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query table_info")
+            .collect::<std::result::Result<_, _>>()
+            .expect("collect columns");
+        let sql = format!(
+            "SELECT {} FROM {table} ORDER BY {}",
+            columns.join(", "),
+            columns.join(", ")
+        );
+        conn.prepare(&sql)
+            .expect("prepare table rows")
+            .query_map([], |row| row_to_strings(row, columns.len()))
+            .expect("query table rows")
+            .collect::<std::result::Result<_, _>>()
+            .expect("collect table rows")
+    }
+
+    fn backend_state_rows(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT backend, workspace_root, file_path, content_hash, status
+             FROM backend_file_state
+             ORDER BY backend, workspace_root, file_path, content_hash, status",
+        )
+        .expect("prepare backend rows")
+        .query_map([], |row| row_to_strings(row, 5))
+        .expect("query backend rows")
+        .collect::<std::result::Result<_, _>>()
+        .expect("collect backend rows")
+    }
+
+    fn secondary_indexes(conn: &Connection) -> Vec<String> {
+        let mut indexes = Vec::new();
+        for table in [
+            "files",
+            "nodes",
+            "refs",
+            "file_dependencies",
+            "edges",
+            "dispatch_hints",
+            "type_ref_names",
+            "backend_file_state",
+            "meta",
+        ] {
+            let sql = format!("PRAGMA index_list({table})");
+            let mut stmt = conn.prepare(&sql).expect("prepare index list");
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("query index list");
+            for name in rows {
+                let name = name.expect("index name");
+                if name.starts_with("idx_") {
+                    indexes.push(format!("{table}:{name}"));
+                }
+            }
+        }
+        indexes.sort();
+        indexes
+    }
+
+    fn row_to_strings(row: &rusqlite::Row<'_>, len: usize) -> rusqlite::Result<String> {
+        let mut values = Vec::with_capacity(len);
+        for index in 0..len {
+            let value = row.get_ref(index)?;
+            values.push(match value {
+                rusqlite::types::ValueRef::Null => "NULL".to_string(),
+                rusqlite::types::ValueRef::Integer(value) => value.to_string(),
+                rusqlite::types::ValueRef::Real(value) => value.to_string(),
+                rusqlite::types::ValueRef::Text(value) => {
+                    String::from_utf8_lossy(value).into_owned()
+                }
+                rusqlite::types::ValueRef::Blob(value) => format!("{value:?}"),
+            });
+        }
+        Ok(values.join("\u{1f}"))
+    }
 }
 
 #[cfg(test)]

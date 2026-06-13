@@ -46,27 +46,28 @@ export function maybeAppendConflictsHint(output: string): string {
 }
 
 /**
- * Return true when the command itself leads with a code-search command.
+ * Return true when any top-level statement of the command invokes a code-search
+ * command (grep/rg) as the first stage of its pipeline.
  *
- * This deliberately ignores grep/rg used as downstream filters (for example,
- * `bun test | grep fail`). It only inspects the first pipeline stage's first
- * quote/escape-aware token, after peeling a leading `cd <dir> &&` prefix.
- * Ambiguous shell syntax (notably unmatched quotes) returns false so the nudge
- * never fires spuriously.
+ * Splits the command into top-level statements (`&&`, `||`, `;`, `&`, newline)
+ * so a search buried after `cd`/`echo` (e.g. `cd x && echo y && grep z`, or a
+ * multi-line script) is still detected. grep/rg used as a downstream filter
+ * (`bun test | grep fail`) is ignored because it is not the first pipeline
+ * stage of its statement. Ambiguous shell syntax (unbalanced quotes/backticks)
+ * returns false so the nudge never fires spuriously.
  */
-export function commandLeadsWithCodeSearch(command: string): boolean {
-  const trimmed = command.trim();
-  if (!trimmed) return false;
+export function commandInvokesCodeSearch(command: string): boolean {
+  const statements = splitTopLevelStatements(command);
+  if (statements === null) return false;
 
-  const afterCd = peelLeadingCdAnd(trimmed);
-  if (afterCd === null) return false;
-
-  const firstStage = firstPipelineStage(afterCd);
-  if (firstStage === null) return false;
-
-  const firstToken = readShellToken(firstStage, skipSpaces(firstStage, 0));
-  if (firstToken === null) return false;
-  return firstToken.token === "grep" || firstToken.token === "rg";
+  for (const statement of statements) {
+    const firstStage = firstPipelineStage(statement);
+    if (firstStage === null) continue;
+    const firstToken = readShellToken(firstStage, skipSpaces(firstStage, 0));
+    if (firstToken === null) continue;
+    if (firstToken.token === "grep" || firstToken.token === "rg") return true;
+  }
+  return false;
 }
 
 /**
@@ -79,25 +80,88 @@ export function maybeAppendGrepSearchHint(
   aftSearchRegistered: boolean,
 ): string {
   if (output === "") return output;
-  if (!commandLeadsWithCodeSearch(command)) return output;
+  if (!commandInvokesCodeSearch(command)) return output;
   if (output.includes(GREP_SEARCH_HINT_PREFIX)) return output;
 
   const hint = aftSearchRegistered ? GREP_SEARCH_AFT_SEARCH_HINT : GREP_SEARCH_GREP_HINT;
   return `${output}\n\n${hint}`;
 }
 
-function peelLeadingCdAnd(command: string): string | null {
-  const first = readShellToken(command, skipSpaces(command, 0));
-  if (first === null) return null;
-  if (first.token !== "cd") return command;
+/**
+ * Split a command into top-level statements, breaking on `&&`, `||`, `;`, `&`,
+ * and newlines while respecting quotes, escapes, backticks, and parentheses
+ * (separators inside those constructs stay within the statement). A single `|`
+ * is a pipe, NOT a statement separator, so it stays inside the statement for
+ * the caller to inspect the first pipeline stage. Returns null when quoting is
+ * unbalanced so the nudge never fires on ambiguous input.
+ */
+function splitTopLevelStatements(command: string): string[] | null {
+  const statements: string[] = [];
+  let start = 0;
+  let quote: Quote = "none";
+  let escaped = false;
+  let inBacktick = false;
+  let parenDepth = 0;
 
-  const dir = readShellToken(command, skipSpaces(command, first.end));
-  if (dir === null) return null;
-  if (!dir.token) return command;
+  for (let index = 0; index < command.length; index++) {
+    const ch = command[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (quote === "single") {
+      if (ch === "'") quote = "none";
+      continue;
+    }
+    if (quote === "double") {
+      if (ch === "\\") escaped = true;
+      else if (ch === '"') quote = "none";
+      continue;
+    }
+    if (inBacktick) {
+      if (ch === "`") inBacktick = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === "'") {
+      quote = "single";
+      continue;
+    }
+    if (ch === '"') {
+      quote = "double";
+      continue;
+    }
+    if (ch === "`") {
+      inBacktick = true;
+      continue;
+    }
+    if (ch === "(") {
+      parenDepth++;
+      continue;
+    }
+    if (ch === ")") {
+      if (parenDepth > 0) parenDepth--;
+      continue;
+    }
+    if (parenDepth > 0) continue;
 
-  const afterDir = skipSpaces(command, dir.end);
-  if (!command.startsWith("&&", afterDir)) return command;
-  return command.slice(afterDir + 2).trim();
+    const next = command[index + 1];
+    if ((ch === "&" && next === "&") || (ch === "|" && next === "|")) {
+      statements.push(command.slice(start, index));
+      index++;
+      start = index + 1;
+    } else if (ch === ";" || ch === "\n" || ch === "&") {
+      statements.push(command.slice(start, index));
+      start = index + 1;
+    }
+  }
+
+  if (quote !== "none" || inBacktick || escaped) return null;
+  statements.push(command.slice(start));
+  return statements;
 }
 
 function firstPipelineStage(command: string): string | null {

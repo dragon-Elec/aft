@@ -11,7 +11,7 @@
 export { setActiveLogger } from "./active-logger.js";
 // --- bash output hints (shared by both plugin hosts) ---
 export {
-  commandLeadsWithCodeSearch,
+  commandInvokesCodeSearch,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
 } from "./bash-hints.js";

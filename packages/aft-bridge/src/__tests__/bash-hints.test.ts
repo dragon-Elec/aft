@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
-  commandLeadsWithCodeSearch,
+  commandInvokesCodeSearch,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
 } from "../bash-hints.js";
@@ -53,7 +53,7 @@ describe("maybeAppendConflictsHint", () => {
   });
 });
 
-describe("commandLeadsWithCodeSearch", () => {
+describe("commandInvokesCodeSearch", () => {
   const positives = [
     'grep -nE "x" src/',
     "grep foo file.ts | head",
@@ -63,6 +63,11 @@ describe("commandLeadsWithCodeSearch", () => {
     '"grep" -n pat file',
     "grep pat file || true",
     'grep "a|b" file | head',
+    // grep leading a non-first statement must still nudge (the reported bug):
+    "cd x; grep foo",
+    "false || grep pat",
+    "cd ~/proj && echo '=== marker ===' && grep -rn foo src/ | head -20",
+    "cd ~/proj\necho '=== marker ==='\ngrep -rn foo src/ | head -20",
   ];
 
   const negatives = [
@@ -71,22 +76,23 @@ describe("commandLeadsWithCodeSearch", () => {
     "echo hi | grep h",
     "make test | grep -i pass",
     "ls -la",
-    "cd x; grep foo",
     "FOO=1 grep pat file",
     "2>&1 grep pat",
-    "false || grep pat",
     'cd "unclosed && grep foo',
+    // grep only as a downstream filter across statements must not nudge:
+    "cd x && bun test | grep fail",
+    "echo 'grep is mentioned here' && ls",
   ];
 
   for (const command of positives) {
     test(`positive: ${command}`, () => {
-      expect(commandLeadsWithCodeSearch(command)).toBe(true);
+      expect(commandInvokesCodeSearch(command)).toBe(true);
     });
   }
 
   for (const command of negatives) {
     test(`negative: ${command}`, () => {
-      expect(commandLeadsWithCodeSearch(command)).toBe(false);
+      expect(commandInvokesCodeSearch(command)).toBe(false);
     });
   }
 });

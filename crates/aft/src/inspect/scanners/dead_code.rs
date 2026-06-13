@@ -28,6 +28,7 @@ use super::DEFAULT_EXPORT_MARKER_KIND;
 const MAX_DRILL_DOWN_ITEMS: usize = 100;
 
 type ExportNode = (String, String);
+type OutboundCallsByCallerFile<'a> = BTreeMap<PathBuf, Vec<&'a CallgraphOutboundCall>>;
 
 #[derive(Debug, Default)]
 struct ImportedExportLiveness {
@@ -97,6 +98,8 @@ fn run_dead_code_scan_with_oxc_started(
         .unwrap_or_default();
     let oxc_resolver_config_fingerprint =
         oxc_result.map(OxcEngineResult::resolver_config_fingerprint);
+    let outbound_calls_by_caller_file =
+        group_outbound_calls_by_caller_file(&job.project_root, &snapshot.outbound_calls);
 
     let contributions = job
         .scope_files
@@ -111,6 +114,7 @@ fn run_dead_code_scan_with_oxc_started(
                 &default_export_symbols_by_file,
                 &liveness_root_files,
                 &public_api_files,
+                &outbound_calls_by_caller_file,
                 &oxc_by_file,
                 &oxc_parse_errors_by_file,
                 &oxc_skipped_files,
@@ -166,6 +170,20 @@ fn exported_symbol_indexes(
     )
 }
 
+fn group_outbound_calls_by_caller_file<'a>(
+    project_root: &Path,
+    outbound_calls: &'a [CallgraphOutboundCall],
+) -> OutboundCallsByCallerFile<'a> {
+    let mut by_file: OutboundCallsByCallerFile<'a> = BTreeMap::new();
+    for call in outbound_calls {
+        by_file
+            .entry(normalize_absolute(project_root, &call.caller_file))
+            .or_default()
+            .push(call);
+    }
+    by_file
+}
+
 fn gather_file_contribution(
     job: &InspectJob,
     snapshot: &CallgraphSnapshot,
@@ -175,12 +193,18 @@ fn gather_file_contribution(
     default_export_symbols_by_file: &BTreeMap<String, String>,
     liveness_root_files: &BTreeSet<String>,
     public_api_files: &BTreeSet<String>,
+    outbound_calls_by_caller_file: &OutboundCallsByCallerFile<'_>,
     oxc_by_file: &BTreeMap<String, OxcFileVerdicts>,
     oxc_parse_errors_by_file: &BTreeMap<String, Vec<String>>,
     oxc_skipped_files: &[Value],
     oxc_resolver_config_fingerprint: Option<&str>,
 ) -> FileContribution {
     let file_name = relative_path(&job.project_root, file);
+    let normalized_file = normalize_absolute(&job.project_root, file);
+    let outbound_calls_for_file = outbound_calls_by_caller_file
+        .get(&normalized_file)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     let is_liveness_root_file = liveness_root_files.contains(&file_name);
     let is_public_api_file = public_api_files.contains(&file_name);
     let oxc_file = oxc_by_file.get(&file_name);
@@ -203,10 +227,9 @@ fn gather_file_contribution(
             .collect::<Vec<_>>()
     });
 
-    let mut internal_calls = snapshot
-        .outbound_calls
+    let mut internal_calls = outbound_calls_for_file
         .iter()
-        .filter(|call| same_file(&job.project_root, &call.caller_file, file))
+        .copied()
         .filter_map(|call| {
             project_internal_call(
                 &job.project_root,
@@ -238,10 +261,9 @@ fn gather_file_contribution(
             && left.line == right.line
     });
 
-    let dispatched_method_names = snapshot
-        .outbound_calls
+    let dispatched_method_names = outbound_calls_for_file
         .iter()
-        .filter(|call| same_file(&job.project_root, &call.caller_file, file))
+        .copied()
         .filter_map(dispatched_method_name_from_call)
         .collect::<BTreeSet<_>>()
         .into_iter()

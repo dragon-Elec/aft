@@ -212,6 +212,7 @@ fn language_key(path: &Path) -> &'static str {
         Some(LangId::Lua) => "lua",
         Some(LangId::Perl) => "perl",
         Some(LangId::Pascal) => "pascal",
+        Some(LangId::R) => "r",
         None => "unknown",
     }
 }

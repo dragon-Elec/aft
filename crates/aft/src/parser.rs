@@ -419,6 +419,15 @@ const PASCAL_QUERY: &str = r#"
   ]) @proc.def
 "#;
 
+const R_QUERY: &str = r#"
+;; R represents assignments as binary operators. The extractor filters these
+;; broad captures down to top-level assignment operators and classifies
+;; function-valued assignments as functions. Rightward function
+;; assignment parses as a function_definition whose body is a binary_operator.
+(binary_operator) @assign.def
+(function_definition) @function.def
+"#;
+
 const SCSS_QUERY: &str = r#"
 ;; SCSS definitions
 (mixin_statement
@@ -632,6 +641,7 @@ pub enum LangId {
     Perl,
     Yaml,
     Pascal,
+    R,
 }
 
 /// Maps file extension to language identifier.
@@ -665,6 +675,7 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
         "pl" | "pm" | "t" => Some(LangId::Perl),
         "yaml" | "yml" => Some(LangId::Yaml),
         "pas" | "pp" | "dpr" | "dpk" | "lpr" => Some(LangId::Pascal),
+        "R" | "r" => Some(LangId::R),
         _ => None,
     }
 }
@@ -699,6 +710,7 @@ pub fn grammar_for(lang: LangId) -> Language {
         LangId::Perl => tree_sitter_perl::LANGUAGE.into(),
         LangId::Yaml => tree_sitter_yaml::LANGUAGE.into(),
         LangId::Pascal => tree_sitter_pascal::LANGUAGE.into(),
+        LangId::R => tree_sitter_r::LANGUAGE.into(),
     }
 }
 
@@ -731,6 +743,7 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::Perl => Some(PERL_QUERY),
         LangId::Yaml => None, // YAML uses direct tree walking like JSON
         LangId::Pascal => Some(PASCAL_QUERY),
+        LangId::R => Some(R_QUERY),
     }
 }
 
@@ -777,6 +790,7 @@ static PERL_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Perl));
 static PASCAL_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Pascal));
+static R_QUERY_CACHE: LazyLock<Result<Query, String>> = LazyLock::new(|| compile_query(LangId::R));
 
 fn compile_query(lang: LangId) -> Result<Query, String> {
     let query_src = query_for(lang).ok_or_else(|| format!("missing query for {lang:?}"))?;
@@ -809,6 +823,7 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         LangId::Lua => Some(&*LUA_QUERY_CACHE),
         LangId::Perl => Some(&*PERL_QUERY_CACHE),
         LangId::Pascal => Some(&*PASCAL_QUERY_CACHE),
+        LangId::R => Some(&*R_QUERY_CACHE),
         LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json | LangId::Yaml => None,
     };
 
@@ -1425,6 +1440,7 @@ pub fn extract_symbols_from_tree(
         LangId::Lua => extract_lua_symbols(source, &root, query),
         LangId::Perl => extract_perl_symbols(source, &root, query),
         LangId::Pascal => extract_pascal_symbols(source, &root, query),
+        LangId::R => extract_r_symbols(source, &root, query),
         LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json | LangId::Yaml => {
             unreachable!("handled before query lookup")
         }
@@ -1527,7 +1543,7 @@ fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> 
                     && (text.starts_with("///") || text.starts_with("/**"))
                     && is_adjacent_line(&prev, &current, source)
             }
-            LangId::Ruby | LangId::Lua => {
+            LangId::Ruby | LangId::Lua | LangId::R => {
                 // Include adjacent `#`/`---` style comments used as documentation.
                 let text = node_text(source, &prev);
                 kind == "comment"
@@ -4085,6 +4101,217 @@ fn extract_solidity_symbols(
 
     dedup_symbols(&mut symbols);
     Ok(symbols)
+}
+
+fn extract_r_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
+    let lang = LangId::R;
+    let capture_names = query.capture_names();
+
+    let mut symbols = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, *root, source.as_bytes());
+
+    while let Some(m) = {
+        matches.advance();
+        matches.get()
+    } {
+        let mut assign_node = None;
+        let mut function_node = None;
+
+        for cap in m.captures {
+            let Some(&name) = capture_names.get(cap.index as usize) else {
+                continue;
+            };
+            match name {
+                "assign.def" => assign_node = Some(cap.node),
+                "function.def" => function_node = Some(cap.node),
+                _ => {}
+            }
+        }
+
+        if let Some(def_node) = function_node {
+            if let Some(symbol) = r_rightward_function_assignment_symbol(source, &def_node, lang) {
+                symbols.push(symbol);
+            }
+            continue;
+        }
+
+        let Some(def_node) = assign_node else {
+            continue;
+        };
+        let Some(assignment) = r_assignment_parts(source, &def_node) else {
+            continue;
+        };
+        let Some(name_node) = r_assignment_name_node(&assignment) else {
+            continue;
+        };
+        if name_node.kind() != "identifier" {
+            continue;
+        }
+
+        let value_is_function = r_node_contains_kind(&assignment.value, "function_definition");
+        if !value_is_function && !r_is_top_level_assignment(&def_node) {
+            continue;
+        }
+
+        symbols.push(Symbol {
+            name: node_text(source, &name_node).to_string(),
+            kind: if value_is_function {
+                SymbolKind::Function
+            } else {
+                SymbolKind::Variable
+            },
+            range: node_range_with_decorators(&def_node, source, lang),
+            signature: Some(extract_signature(source, &def_node)),
+            scope_chain: vec![],
+            exported: true,
+            parent: None,
+        });
+    }
+
+    dedup_symbols(&mut symbols);
+    Ok(symbols)
+}
+
+fn r_rightward_function_assignment_symbol(
+    source: &str,
+    function_node: &Node,
+    lang: LangId,
+) -> Option<Symbol> {
+    let body = function_node.child_by_field_name("body")?;
+    let assignment = r_assignment_parts(source, &body)?;
+    if !matches!(assignment.operator.as_str(), "->" | "->>") {
+        return None;
+    }
+    let function_text = node_text(source, function_node);
+    let name = r_rightward_assignment_name_from_text(function_text).or_else(|| {
+        let name_node = assignment.right;
+        (name_node.kind() == "identifier").then(|| node_text(source, &name_node).to_string())
+    })?;
+
+    let signature = r_rightward_function_signature(source, function_node, &name);
+
+    Some(Symbol {
+        name,
+        kind: SymbolKind::Function,
+        range: node_range_with_decorators(function_node, source, lang),
+        signature: Some(signature),
+        scope_chain: vec![],
+        exported: true,
+        parent: None,
+    })
+}
+
+fn r_rightward_function_signature(source: &str, function_node: &Node, name: &str) -> String {
+    let signature = extract_signature(source, function_node);
+    if signature.contains(name) {
+        signature
+    } else {
+        format!("{signature} -> {name}")
+    }
+}
+
+fn r_rightward_assignment_name_from_text(text: &str) -> Option<String> {
+    let (_, after) = text.rsplit_once("->>").or_else(|| text.rsplit_once("->"))?;
+    let trimmed = after.trim_start();
+    let name: String = trimmed
+        .chars()
+        .take_while(|ch| ch.is_alphanumeric() || *ch == '_' || *ch == '.')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+struct RAssignmentParts<'tree> {
+    operator: String,
+    left: Node<'tree>,
+    right: Node<'tree>,
+    value: Node<'tree>,
+}
+
+fn r_assignment_name_node<'tree>(assignment: &RAssignmentParts<'tree>) -> Option<Node<'tree>> {
+    match assignment.operator.as_str() {
+        "<-" | "=" | "<<-" => Some(assignment.left),
+        "->" | "->>" => Some(assignment.right),
+        _ => None,
+    }
+}
+
+fn r_assignment_parts<'tree>(source: &str, node: &Node<'tree>) -> Option<RAssignmentParts<'tree>> {
+    if node.kind() != "binary_operator" {
+        return None;
+    }
+
+    let mut operator = None;
+    let mut operator_index = None;
+    for index in 0..node.child_count() {
+        let child = node.child(index as u32)?;
+        let text = node_text(source, &child).trim();
+        if matches!(text, "<-" | "=" | "<<-" | "->" | "->>") {
+            operator = Some(text.to_string());
+            operator_index = Some(index);
+            break;
+        }
+    }
+
+    let operator = operator?;
+    let operator_index = operator_index?;
+
+    let left = r_nearest_named_child_before(node, operator_index)
+        .or_else(|| node.child_by_field_name("lhs"))
+        .or_else(|| node.child_by_field_name("left"))?;
+    let right = r_nearest_named_child_after(node, operator_index)
+        .or_else(|| node.child_by_field_name("rhs"))
+        .or_else(|| node.child_by_field_name("right"))?;
+
+    let value = match operator.as_str() {
+        "<-" | "=" | "<<-" => right,
+        "->" | "->>" => left,
+        _ => return None,
+    };
+
+    Some(RAssignmentParts {
+        operator,
+        left,
+        right,
+        value,
+    })
+}
+
+fn r_nearest_named_child_before<'tree>(node: &Node<'tree>, index: usize) -> Option<Node<'tree>> {
+    (0..index)
+        .rev()
+        .filter_map(|child_index| node.child(child_index as u32))
+        .find(|child| child.is_named())
+}
+
+fn r_nearest_named_child_after<'tree>(node: &Node<'tree>, index: usize) -> Option<Node<'tree>> {
+    ((index + 1)..node.child_count())
+        .filter_map(|child_index| node.child(child_index as u32))
+        .find(|child| child.is_named())
+}
+
+fn r_node_contains_kind(node: &Node, kind: &str) -> bool {
+    if node.kind() == kind {
+        return true;
+    }
+
+    let mut cursor = node.walk();
+    let found = node
+        .children(&mut cursor)
+        .any(|child| r_node_contains_kind(&child, kind));
+    found
+}
+
+fn r_is_top_level_assignment(node: &Node) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "program" => return true,
+            "braced_expression" | "function_definition" => return false,
+            _ => current = parent.parent(),
+        }
+    }
+    false
 }
 
 fn extract_json_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
@@ -8245,6 +8472,72 @@ spec:
         assert!(
             sym.name.contains("hello-"),
             "Symbol name should contain generateName fallback 'hello-'"
+        );
+    }
+
+    #[test]
+    fn detect_r_extensions_are_case_sensitive() {
+        assert_eq!(detect_language(Path::new("analysis.R")), Some(LangId::R));
+        assert_eq!(detect_language(Path::new("script.r")), Some(LangId::R));
+    }
+
+    #[test]
+    fn extract_r_symbols_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("analysis.R");
+        std::fs::write(
+            &file,
+            r#"
+# summary function
+summarise <- function(data, column) {
+  total <- sum(data[[column]])
+  total
+}
+
+normalise = function(x) {
+  x / max(x)
+}
+
+function(y) {
+  y + 1
+} -> transform_values
+
+threshold <- 10
+"done" -> status
+
+outer <- function(values) {
+  local_value <- 1
+  local_value
+}
+"#,
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        let get = |name: &str| {
+            symbols
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .unwrap_or_else(|| panic!("missing {name}; got {symbols:?}"))
+        };
+
+        assert_eq!(get("summarise").kind, SymbolKind::Function);
+        assert_eq!(get("normalise").kind, SymbolKind::Function);
+        assert_eq!(get("transform_values").kind, SymbolKind::Function);
+        assert!(
+            symbols
+                .iter()
+                .all(|symbol| !symbol.name.starts_with("function(")),
+            "rightward function assignments should use the RHS identifier: {symbols:?}"
+        );
+        assert_eq!(get("outer").kind, SymbolKind::Function);
+        assert_eq!(get("threshold").kind, SymbolKind::Variable);
+        assert_eq!(get("status").kind, SymbolKind::Variable);
+        assert!(
+            symbols.iter().all(|symbol| symbol.name != "local_value"),
+            "nested assignments should not surface as top-level variables: {symbols:?}"
         );
     }
 

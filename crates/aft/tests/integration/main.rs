@@ -81,6 +81,7 @@ mod parser_test;
 mod pascal_test;
 mod protocol_test;
 mod query_shape_test;
+mod r_test;
 mod safety_test;
 mod score_floor_drop_test;
 mod search_index_warm_restart_test;

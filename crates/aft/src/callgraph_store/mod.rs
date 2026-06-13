@@ -6369,6 +6369,7 @@ fn lang_label(lang: LangId) -> &'static str {
         LangId::Perl => "perl",
         LangId::Yaml => "yaml",
         LangId::Pascal => "pascal",
+        LangId::R => "r",
     }
 }
 
@@ -6401,6 +6402,7 @@ fn lang_from_label(label: &str) -> Option<LangId> {
         "perl" => Some(LangId::Perl),
         "yaml" => Some(LangId::Yaml),
         "pascal" => Some(LangId::Pascal),
+        "r" => Some(LangId::R),
         _ => None,
     }
 }

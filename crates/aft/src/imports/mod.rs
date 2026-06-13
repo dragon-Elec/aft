@@ -569,7 +569,8 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         | LangId::Html
         | LangId::Markdown
         | LangId::Yaml
-        | LangId::Pascal => None,
+        | LangId::Pascal
+        | LangId::R => None,
     }
 }
 

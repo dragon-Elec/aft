@@ -37,6 +37,7 @@ pub enum AstGrepLang {
     Lua,
     Perl,
     Pascal,
+    R,
 }
 
 #[derive(Clone, Debug)]
@@ -114,6 +115,7 @@ impl AstGrepLang {
             LangId::Lua => Some(Self::Lua),
             LangId::Perl => Some(Self::Perl),
             LangId::Pascal => Some(Self::Pascal),
+            LangId::R => Some(Self::R),
             LangId::Scala => None,
             LangId::Bash => None, // ast-grep doesn't support Bash
             // Markdown, CSS, HTML etc. don't have meaningful AST patterns
@@ -146,6 +148,7 @@ impl AstGrepLang {
             "lua" => Some(Self::Lua),
             "perl" | "pl" | "pm" => Some(Self::Perl),
             "pascal" | "pas" | "pp" | "dpr" | "dpk" | "lpr" => Some(Self::Pascal),
+            "r" => Some(Self::R),
             _ => None,
         }
     }
@@ -198,6 +201,7 @@ impl AstGrepLang {
             Self::Lua => &["lua"],
             Self::Perl => &["pl", "pm", "t"],
             Self::Pascal => &["pas", "pp", "dpr", "dpk", "lpr"],
+            Self::R => &["R", "r"],
         }
     }
 
@@ -348,7 +352,8 @@ impl Language for AstGrepLang {
             | Self::Swift
             | Self::Php
             | Self::Lua
-            | Self::Perl => '\u{00B5}', // µ
+            | Self::Perl
+            | Self::R => '\u{00B5}', // µ
             Self::Pascal => '_',
             // $ is valid in TS, JS, Go, Solidity, and Vue template identifiers
             _ => '$',
@@ -381,6 +386,7 @@ impl LanguageExt for AstGrepLang {
             Self::Lua => tree_sitter_lua::LANGUAGE.into(),
             Self::Perl => tree_sitter_perl::LANGUAGE.into(),
             Self::Pascal => tree_sitter_pascal::LANGUAGE.into(),
+            Self::R => tree_sitter_r::LANGUAGE.into(),
         }
     }
 }
@@ -423,6 +429,7 @@ mod tests {
         assert_eq!(AstGrepLang::from_str("lua"), Some(AstGrepLang::Lua));
         assert_eq!(AstGrepLang::from_str("perl"), Some(AstGrepLang::Perl));
         assert_eq!(AstGrepLang::from_str("pascal"), Some(AstGrepLang::Pascal));
+        assert_eq!(AstGrepLang::from_str("r"), Some(AstGrepLang::R));
         assert_eq!(AstGrepLang::from_str("markdown"), None);
     }
 
@@ -510,6 +517,11 @@ mod tests {
                 "procedure SayHello(name: string);\nbegin\n  writeln(name);\nend;",
                 "procedure $NAME($$$);",
             ),
+            (
+                AstGrepLang::R,
+                "result <- sum(values)\n",
+                "$NAME <- sum($VALUES)",
+            ),
         ];
 
         for (lang, source, pattern) in probes {
@@ -564,6 +576,7 @@ helper();
         assert_eq!(AstGrepLang::Php.expando_char(), '\u{00B5}');
         assert_eq!(AstGrepLang::Lua.expando_char(), '\u{00B5}');
         assert_eq!(AstGrepLang::Perl.expando_char(), '\u{00B5}');
+        assert_eq!(AstGrepLang::R.expando_char(), '\u{00B5}');
         assert_eq!(AstGrepLang::Pascal.expando_char(), '_');
         assert_eq!(AstGrepLang::TypeScript.expando_char(), '$');
         assert_eq!(AstGrepLang::JavaScript.expando_char(), '$');
@@ -651,6 +664,46 @@ helper();
             found.unwrap().get_env().get_match("NAME").unwrap().text(),
             "SayHello"
         );
+    }
+
+    #[test]
+    fn r_meta_var_pattern_uses_micro_expando_and_binds_capture() {
+        let lang = AstGrepLang::R;
+        let source = "result <- sum(values)\n";
+        let grep = lang.ast_grep(source);
+        let root = grep.root();
+        let found = root.find("$NAME <- sum($VALUES)");
+        assert!(
+            found.is_some(),
+            "R meta-var pattern must match — bug recurrence"
+        );
+        let found = found.unwrap();
+        let env = found.get_env();
+        assert_eq!(env.get_match("NAME").unwrap().text(), "result");
+        assert_eq!(env.get_match("VALUES").unwrap().text(), "values");
+    }
+
+    #[test]
+    fn r_micro_expando_parses_as_identifier_token() {
+        let lang = AstGrepLang::R;
+        let processed = lang.pre_process_pattern("$NAME <- $VALUE");
+        assert!(
+            processed.starts_with('\u{00B5}'),
+            "R meta-var should use µ expando, got {processed:?}"
+        );
+        let grep = lang.ast_grep(processed.as_ref());
+        let root = grep.root();
+        let assignment = root
+            .children()
+            .into_iter()
+            .find(|child| child.kind() == "binary_operator")
+            .expect("processed R assignment should parse as binary_operator");
+        let identifier = assignment
+            .children()
+            .into_iter()
+            .find(|child| child.kind() == "identifier")
+            .expect("µNAME should parse as one identifier token");
+        assert_eq!(identifier.text(), "µNAME");
     }
 
     #[test]

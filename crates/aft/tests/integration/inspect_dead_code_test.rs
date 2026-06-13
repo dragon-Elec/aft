@@ -226,6 +226,24 @@ fn dispatched_target(target: &str, full_callee: &str) -> String {
     format!("{target}\u{1f}{full_callee}")
 }
 
+fn contribution_bytes(success: &InspectScanSuccess) -> String {
+    let mut rows = success
+        .contributions
+        .iter()
+        .map(|contribution| {
+            (
+                contribution.contribution["file"]
+                    .as_str()
+                    .expect("contribution file")
+                    .to_string(),
+                contribution.contribution.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    serde_json::to_string(&rows).expect("serialize contribution rows")
+}
+
 fn type_match_fixture_exports(root: &Path) -> Vec<CallgraphExport> {
     vec![
         export(root, "src/factory.rs", "make_live", "function", 3),
@@ -1241,6 +1259,128 @@ fn inspect_dead_code_caps_drill_down_after_one_hundred_items() {
         100
     );
     assert_eq!(success.aggregate["drill_down_capped"], true);
+}
+
+#[test]
+fn inspect_dead_code_contributions_are_byte_identical_for_mixed_fixture() {
+    let (_temp_dir, root, paths) = fixture_project(&[
+        (
+            "src/app.ts",
+            "import { Service } from './service';\nexport function main(service: Service) { service.render(); }\n",
+        ),
+        (
+            "src/service.ts",
+            "export class Service { render(): Result { return {} as Result; } }\nexport interface Result { ok: boolean; }\n",
+        ),
+        ("src/barrel.ts", "export { Result } from './service';\n"),
+        (
+            "src/lib.rs",
+            "pub use foo::Foo;\nmod foo;\npub fn use_foo(value: Foo) {}\n",
+        ),
+        ("src/foo.rs", "pub struct Foo;\npub struct Dead;\n"),
+    ]);
+    let graph = snapshot(
+        paths.clone(),
+        vec![
+            export(&root, "src/app.ts", "main", "function", 2),
+            export(&root, "src/service.ts", "Service", "class", 1),
+            export(&root, "src/service.ts", "render", "method", 1),
+            export(&root, "src/service.ts", "Result", "interface", 2),
+            export(&root, "src/barrel.ts", "Result", "re_export", 1),
+            export(&root, "src/lib.rs", "Foo", "struct", 1),
+            export(&root, "src/lib.rs", "use_foo", "function", 3),
+            export(&root, "src/foo.rs", "Foo", "struct", 1),
+            export(&root, "src/foo.rs", "Dead", "struct", 2),
+        ],
+        vec![outbound(
+            &root,
+            "src/app.ts",
+            "main",
+            &dispatched_target("render", "service.render"),
+            2,
+        )],
+        vec![root.join("src/app.ts")],
+    );
+
+    let success = scan(job(&root, paths, Some(graph)));
+    let actual = contribution_bytes(&success);
+    let expected = serde_json::to_string(&vec![
+        (
+            "src/app.ts".to_string(),
+            json!({
+                "file": "src/app.ts",
+                "exports": [
+                    {"symbol": "main", "kind": "function", "line": 2, "is_entry_point": true}
+                ],
+                "internal_calls": [
+                    {"caller_symbol": "main", "file": "src/service.ts", "symbol": "render", "line": 2, "provenance": "treesitter"}
+                ],
+                "liveness_roots": ["<top-level>", "main"],
+                "dispatched_method_names": ["render"],
+                "imported_exports": [
+                    {"file": "src/service.ts", "symbol": "Service"}
+                ],
+                "type_ref_names": ["Service"]
+            }),
+        ),
+        (
+            "src/barrel.ts".to_string(),
+            json!({
+                "file": "src/barrel.ts",
+                "exports": [
+                    {"symbol": "Result", "kind": "re_export", "line": 1, "is_entry_point": false}
+                ],
+                "internal_calls": [
+                    {"caller_symbol": "Result", "file": "src/service.ts", "symbol": "Result", "line": 1, "provenance": "reexport"}
+                ],
+                "liveness_roots": []
+            }),
+        ),
+        (
+            "src/foo.rs".to_string(),
+            json!({
+                "file": "src/foo.rs",
+                "exports": [
+                    {"symbol": "Foo", "kind": "struct", "line": 1, "is_entry_point": false, "is_type_like": true},
+                    {"symbol": "Dead", "kind": "struct", "line": 2, "is_entry_point": false, "is_type_like": true}
+                ],
+                "internal_calls": [],
+                "liveness_roots": []
+            }),
+        ),
+        (
+            "src/lib.rs".to_string(),
+            json!({
+                "file": "src/lib.rs",
+                "exports": [
+                    {"symbol": "Foo", "kind": "struct", "line": 1, "is_entry_point": true, "is_type_like": true},
+                    {"symbol": "use_foo", "kind": "function", "line": 3, "is_entry_point": true}
+                ],
+                "internal_calls": [
+                    {"caller_symbol": "Foo", "file": "src/foo.rs", "symbol": "Foo", "line": 1, "provenance": "reexport"}
+                ],
+                "liveness_roots": ["<top-level>", "Foo", "use_foo"],
+                "type_ref_names": ["Foo"]
+            }),
+        ),
+        (
+            "src/service.ts".to_string(),
+            json!({
+                "file": "src/service.ts",
+                "exports": [
+                    {"symbol": "Service", "kind": "class", "line": 1, "is_entry_point": false},
+                    {"symbol": "render", "kind": "method", "line": 1, "is_entry_point": false},
+                    {"symbol": "Result", "kind": "interface", "line": 2, "is_entry_point": false, "is_type_like": true}
+                ],
+                "internal_calls": [],
+                "liveness_roots": [],
+                "type_ref_names": ["Result"]
+            }),
+        ),
+    ])
+    .expect("serialize expected contribution rows");
+
+    assert_eq!(actual, expected);
 }
 
 #[test]

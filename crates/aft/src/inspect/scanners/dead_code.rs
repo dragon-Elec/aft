@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
@@ -36,6 +36,130 @@ struct ImportedExportLiveness {
     namespace_exports: Vec<ImportedExportContribution>,
 }
 
+#[derive(Debug, Default)]
+struct FileAnalysis {
+    reexport_edges: Vec<InternalCall>,
+    imported_export_liveness: ImportedExportLiveness,
+    type_ref_names: BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct DeadCodeFileAnalyzer {
+    parsers: HashMap<LangId, tree_sitter::Parser>,
+}
+
+impl DeadCodeFileAnalyzer {
+    fn analyze_file(
+        &mut self,
+        project_root: &Path,
+        file: &Path,
+        file_name: &str,
+        has_oxc_file: bool,
+        exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+        default_export_symbols_by_file: &BTreeMap<String, String>,
+    ) -> FileAnalysis {
+        let Some(lang) = detect_language(file) else {
+            return FileAnalysis::default();
+        };
+        let needs_type_refs = supports_type_refs(lang);
+        let needs_ts_reexports =
+            matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript);
+        let needs_rust_reexports = matches!(lang, LangId::Rust);
+        let needs_imported_liveness = !has_oxc_file && needs_ts_reexports;
+
+        if !needs_type_refs
+            && !needs_ts_reexports
+            && !needs_rust_reexports
+            && !needs_imported_liveness
+        {
+            return FileAnalysis::default();
+        }
+
+        let Ok(source) = fs::read_to_string(file) else {
+            return FileAnalysis::default();
+        };
+        let needs_tree = needs_type_refs || needs_ts_reexports || needs_imported_liveness;
+        let tree = needs_tree
+            .then(|| self.parse_source(lang, &source))
+            .flatten();
+
+        let type_ref_names = if needs_type_refs {
+            tree.as_ref()
+                .map(|tree| extract_type_references(&source, tree.root_node(), lang))
+                .unwrap_or_default()
+        } else {
+            BTreeSet::new()
+        };
+
+        let reexport_edges = if needs_ts_reexports {
+            tree.as_ref()
+                .map(|tree| {
+                    ts_reexport_liveness_edges(
+                        project_root,
+                        file,
+                        file_name,
+                        &source,
+                        tree.root_node(),
+                        exported_symbols_by_file,
+                        default_export_symbols_by_file,
+                    )
+                })
+                .unwrap_or_default()
+        } else if needs_rust_reexports {
+            rust_reexport_liveness_edges(
+                project_root,
+                file,
+                file_name,
+                &source,
+                exported_symbols_by_file,
+                default_export_symbols_by_file,
+            )
+        } else {
+            Vec::new()
+        };
+
+        let imported_export_liveness = if needs_imported_liveness {
+            tree.as_ref()
+                .map(|tree| {
+                    imported_export_liveness_roots(
+                        project_root,
+                        file,
+                        &source,
+                        tree,
+                        lang,
+                        exported_symbols_by_file,
+                        default_export_symbols_by_file,
+                    )
+                })
+                .unwrap_or_default()
+        } else {
+            ImportedExportLiveness::default()
+        };
+
+        FileAnalysis {
+            reexport_edges,
+            imported_export_liveness,
+            type_ref_names,
+        }
+    }
+
+    fn parse_source(&mut self, lang: LangId, source: &str) -> Option<tree_sitter::Tree> {
+        let parser = match self.parsers.entry(lang) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let grammar = grammar_for(lang);
+                let mut parser = tree_sitter::Parser::new();
+                if parser.set_language(&grammar).is_err() {
+                    return None;
+                }
+                entry.insert(parser)
+            }
+        };
+
+        parser.parse(source, None)
+    }
+}
+
 pub fn run_dead_code_scan(job: &InspectJob) -> InspectResult {
     run_dead_code_scan_with_oxc_started(job, None, Instant::now())
 }
@@ -69,6 +193,7 @@ fn run_dead_code_scan_with_oxc_started(
     let public_api_files = collect_public_api_files(&job.project_root);
     let (exported_symbols_by_file, files_by_exported_symbol, default_export_symbols_by_file) =
         exported_symbol_indexes(job, snapshot);
+    let fallback_exports_by_file = fallback_export_contributions_by_file(job, snapshot);
     let oxc_by_file = oxc_result
         .map(|result| {
             result
@@ -104,11 +229,11 @@ fn run_dead_code_scan_with_oxc_started(
     let contributions = job
         .scope_files
         .par_iter()
-        .map(|file| {
+        .map_init(DeadCodeFileAnalyzer::default, |file_analyzer, file| {
             gather_file_contribution(
                 job,
-                snapshot,
                 file,
+                &fallback_exports_by_file,
                 &exported_symbols_by_file,
                 &files_by_exported_symbol,
                 &default_export_symbols_by_file,
@@ -119,6 +244,7 @@ fn run_dead_code_scan_with_oxc_started(
                 &oxc_parse_errors_by_file,
                 &oxc_skipped_files,
                 oxc_resolver_config_fingerprint,
+                file_analyzer,
             )
         })
         .collect::<Vec<_>>();
@@ -170,6 +296,32 @@ fn exported_symbol_indexes(
     )
 }
 
+fn fallback_export_contributions_by_file(
+    job: &InspectJob,
+    snapshot: &CallgraphSnapshot,
+) -> BTreeMap<String, Vec<ExportContribution>> {
+    let mut by_file: BTreeMap<String, Vec<ExportContribution>> = BTreeMap::new();
+    for export in &snapshot.exported_symbols {
+        if export.kind == DEFAULT_EXPORT_MARKER_KIND {
+            continue;
+        }
+        by_file
+            .entry(relative_path(&job.project_root, &export.file))
+            .or_default()
+            .push(ExportContribution {
+                symbol: export.symbol.clone(),
+                kind: export.kind.clone(),
+                line: export.line,
+                is_type_like: is_type_like_kind(&export.kind),
+                is_entry_point: false,
+                verdict: None,
+                reason: None,
+                provenance: None,
+            });
+    }
+    by_file
+}
+
 fn group_outbound_calls_by_caller_file<'a>(
     project_root: &Path,
     outbound_calls: &'a [CallgraphOutboundCall],
@@ -186,8 +338,8 @@ fn group_outbound_calls_by_caller_file<'a>(
 
 fn gather_file_contribution(
     job: &InspectJob,
-    snapshot: &CallgraphSnapshot,
     file: &Path,
+    fallback_exports_by_file: &BTreeMap<String, Vec<ExportContribution>>,
     exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
     files_by_exported_symbol: &BTreeMap<String, BTreeSet<String>>,
     default_export_symbols_by_file: &BTreeMap<String, String>,
@@ -198,6 +350,7 @@ fn gather_file_contribution(
     oxc_parse_errors_by_file: &BTreeMap<String, Vec<String>>,
     oxc_skipped_files: &[Value],
     oxc_resolver_config_fingerprint: Option<&str>,
+    file_analyzer: &mut DeadCodeFileAnalyzer,
 ) -> FileContribution {
     let file_name = relative_path(&job.project_root, file);
     let normalized_file = normalize_absolute(&job.project_root, file);
@@ -209,23 +362,23 @@ fn gather_file_contribution(
     let is_public_api_file = public_api_files.contains(&file_name);
     let oxc_file = oxc_by_file.get(&file_name);
     let mut exports = oxc_file.map(oxc_export_contributions).unwrap_or_else(|| {
-        snapshot
-            .exported_symbols
-            .iter()
-            .filter(|export| same_file(&job.project_root, &export.file, file))
-            .filter(|export| export.kind != DEFAULT_EXPORT_MARKER_KIND)
-            .map(|export| ExportContribution {
-                symbol: export.symbol.clone(),
-                kind: export.kind.clone(),
-                line: export.line,
-                is_type_like: is_type_like_kind(&export.kind),
-                is_entry_point: false,
-                verdict: None,
-                reason: None,
-                provenance: None,
-            })
-            .collect::<Vec<_>>()
+        fallback_exports_by_file
+            .get(&file_name)
+            .cloned()
+            .unwrap_or_default()
     });
+    let FileAnalysis {
+        reexport_edges,
+        imported_export_liveness,
+        type_ref_names,
+    } = file_analyzer.analyze_file(
+        &job.project_root,
+        file,
+        &file_name,
+        oxc_file.is_some(),
+        exported_symbols_by_file,
+        default_export_symbols_by_file,
+    );
 
     let mut internal_calls = outbound_calls_for_file
         .iter()
@@ -240,13 +393,7 @@ fn gather_file_contribution(
             )
         })
         .collect::<Vec<_>>();
-    internal_calls.extend(reexport_liveness_edges(
-        &job.project_root,
-        file,
-        &file_name,
-        exported_symbols_by_file,
-        default_export_symbols_by_file,
-    ));
+    internal_calls.extend(reexport_edges);
     internal_calls.sort_by(|left, right| {
         left.caller_symbol
             .cmp(&right.caller_symbol)
@@ -268,18 +415,6 @@ fn gather_file_contribution(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let imported_export_liveness = if oxc_file.is_some() {
-        ImportedExportLiveness::default()
-    } else {
-        imported_export_liveness_roots(
-            &job.project_root,
-            file,
-            exported_symbols_by_file,
-            default_export_symbols_by_file,
-        )
-    };
-    let type_ref_names = collect_type_ref_names(file);
-
     let liveness_roots = liveness_roots_for_file(
         &file_name,
         &exports,
@@ -786,63 +921,18 @@ fn project_internal_call(
     })
 }
 
-fn reexport_liveness_edges(
-    project_root: &Path,
-    file: &Path,
-    file_name: &str,
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
-    default_export_symbols_by_file: &BTreeMap<String, String>,
-) -> Vec<InternalCall> {
-    let Some(lang) = detect_language(file) else {
-        return Vec::new();
-    };
-    let Ok(source) = fs::read_to_string(file) else {
-        return Vec::new();
-    };
-
-    match lang {
-        LangId::TypeScript | LangId::Tsx | LangId::JavaScript => ts_reexport_liveness_edges(
-            project_root,
-            file,
-            file_name,
-            &source,
-            lang,
-            exported_symbols_by_file,
-            default_export_symbols_by_file,
-        ),
-        LangId::Rust => rust_reexport_liveness_edges(
-            project_root,
-            file,
-            file_name,
-            &source,
-            exported_symbols_by_file,
-            default_export_symbols_by_file,
-        ),
-        _ => Vec::new(),
-    }
-}
-
 fn ts_reexport_liveness_edges(
     project_root: &Path,
     file: &Path,
     file_name: &str,
     source: &str,
-    lang: LangId,
+    root: tree_sitter::Node,
     exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
     default_export_symbols_by_file: &BTreeMap<String, String>,
 ) -> Vec<InternalCall> {
-    let grammar = grammar_for(lang);
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&grammar).is_err() {
-        return Vec::new();
-    }
-    let Some(tree) = parser.parse(source, None) else {
-        return Vec::new();
-    };
-
     let from_dir = file.parent().unwrap_or_else(|| Path::new("."));
     let mut edges = Vec::new();
-    let mut cursor = tree.root_node().walk();
+    let mut cursor = root.walk();
     if !cursor.goto_first_child() {
         return edges;
     }
@@ -1325,27 +1415,13 @@ struct RustReexportSpecifier {
 fn imported_export_liveness_roots(
     project_root: &Path,
     file: &Path,
+    source: &str,
+    tree: &tree_sitter::Tree,
+    lang: LangId,
     exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
     default_export_symbols_by_file: &BTreeMap<String, String>,
 ) -> ImportedExportLiveness {
-    let Some(lang) = detect_language(file)
-        .filter(|lang| matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript))
-    else {
-        return ImportedExportLiveness::default();
-    };
-    let Ok(source) = fs::read_to_string(file) else {
-        return ImportedExportLiveness::default();
-    };
-    let grammar = grammar_for(lang);
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&grammar).is_err() {
-        return ImportedExportLiveness::default();
-    }
-    let Some(tree) = parser.parse(&source, None) else {
-        return ImportedExportLiveness::default();
-    };
-
-    let import_block = parse_imports(&source, &tree, lang);
+    let import_block = parse_imports(source, tree, lang);
     let from_dir = file.parent().unwrap_or_else(|| Path::new("."));
     let mut root_exports: BTreeSet<ExportNode> = BTreeSet::new();
     let mut namespace_exports: BTreeSet<ExportNode> = BTreeSet::new();
@@ -1784,25 +1860,6 @@ fn language_for_file(file: &str) -> &'static str {
     }
 }
 
-fn collect_type_ref_names(file: &Path) -> BTreeSet<String> {
-    let Some(lang) = detect_language(file).filter(|lang| supports_type_refs(*lang)) else {
-        return BTreeSet::new();
-    };
-    let Ok(source) = fs::read_to_string(file) else {
-        return BTreeSet::new();
-    };
-    let grammar = grammar_for(lang);
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&grammar).is_err() {
-        return BTreeSet::new();
-    }
-    let Some(tree) = parser.parse(&source, None) else {
-        return BTreeSet::new();
-    };
-
-    extract_type_references(&source, tree.root_node(), lang)
-}
-
 fn supports_type_refs(lang: LangId) -> bool {
     matches!(
         lang,
@@ -1821,10 +1878,6 @@ fn collect_freshness(file: &Path) -> FileFreshness {
         size: 0,
         content_hash: cache_freshness::zero_hash(),
     })
-}
-
-fn same_file(project_root: &Path, left: &Path, right: &Path) -> bool {
-    normalize_absolute(project_root, left) == normalize_absolute(project_root, right)
 }
 
 fn relative_path(project_root: &Path, path: &Path) -> String {

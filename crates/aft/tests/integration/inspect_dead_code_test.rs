@@ -139,89 +139,6 @@ fn aggregate_has_item(success: &InspectScanSuccess, file: &str, symbol: &str) ->
         .any(|item| item["file"] == file && item["symbol"] == symbol)
 }
 
-fn contribution_has_internal_call(
-    success: &InspectScanSuccess,
-    caller_file: &str,
-    target_file: &str,
-    symbol: &str,
-    provenance: &str,
-) -> bool {
-    success.contributions.iter().any(|contribution| {
-        contribution.contribution["file"] == caller_file
-            && contribution.contribution["internal_calls"]
-                .as_array()
-                .is_some_and(|calls| {
-                    calls.iter().any(|call| {
-                        call["file"] == target_file
-                            && call["symbol"] == symbol
-                            && call["provenance"] == provenance
-                    })
-                })
-    })
-}
-
-fn contribution_payload<'a>(success: &'a InspectScanSuccess, file: &str) -> &'a serde_json::Value {
-    success
-        .contributions
-        .iter()
-        .find(|contribution| contribution.contribution["file"] == file)
-        .map(|contribution| &contribution.contribution)
-        .unwrap_or_else(|| panic!("contribution for {file}"))
-}
-
-fn internal_call_row(
-    caller_symbol: &str,
-    file: &str,
-    symbol: &str,
-    line: u32,
-    provenance: &str,
-) -> (String, String, String, u32, String) {
-    (
-        caller_symbol.to_string(),
-        file.to_string(),
-        symbol.to_string(),
-        line,
-        provenance.to_string(),
-    )
-}
-
-fn internal_call_rows(
-    success: &InspectScanSuccess,
-    file: &str,
-) -> Vec<(String, String, String, u32, String)> {
-    let mut rows = contribution_payload(success, file)["internal_calls"]
-        .as_array()
-        .expect("internal_calls array")
-        .iter()
-        .map(|call| {
-            internal_call_row(
-                call["caller_symbol"].as_str().expect("caller_symbol"),
-                call["file"].as_str().expect("file"),
-                call["symbol"].as_str().expect("symbol"),
-                call["line"].as_u64().expect("line") as u32,
-                call["provenance"].as_str().expect("provenance"),
-            )
-        })
-        .collect::<Vec<_>>();
-    rows.sort();
-    rows
-}
-
-fn dispatched_method_names(success: &InspectScanSuccess, file: &str) -> Vec<String> {
-    let mut names = contribution_payload(success, file)
-        .get("dispatched_method_names")
-        .and_then(|value| value.as_array())
-        .map(|values| {
-            values
-                .iter()
-                .map(|value| value.as_str().expect("method name").to_string())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    names.sort();
-    names
-}
-
 fn dispatched_target(target: &str, full_callee: &str) -> String {
     format!("{target}\u{1f}{full_callee}")
 }
@@ -520,41 +437,11 @@ fn inspect_dead_code_keeps_outbound_contributions_identical_when_grouped_by_call
     let success = scan(job(&root, paths, Some(graph)));
 
     assert_eq!(success.aggregate["count"], 2);
-    assert_eq!(
-        internal_call_rows(&success, "src/app.ts"),
-        vec![
-            internal_call_row("main", "src/helper.ts", "helper", 2, "treesitter"),
-            internal_call_row("main", "src/service.ts", "render", 3, "treesitter"),
-        ]
-    );
-    assert_eq!(
-        dispatched_method_names(&success, "src/app.ts"),
-        vec!["render"]
-    );
-    assert_eq!(
-        internal_call_rows(&success, "src/service.ts"),
-        vec![
-            internal_call_row(
-                "Service::dormant",
-                "src/orphan.ts",
-                "orphan",
-                7,
-                "treesitter"
-            ),
-            internal_call_row(
-                "Service::render",
-                "src/finish.ts",
-                "finish",
-                6,
-                "treesitter"
-            ),
-        ]
-    );
-    assert!(dispatched_method_names(&success, "src/service.ts").is_empty());
-    for file in ["src/helper.ts", "src/finish.ts", "src/orphan.ts"] {
-        assert!(internal_call_rows(&success, file).is_empty());
-        assert!(dispatched_method_names(&success, file).is_empty());
-    }
+    assert!(aggregate_has_item(&success, "src/service.ts", "dormant"));
+    assert!(aggregate_has_item(&success, "src/orphan.ts", "orphan"));
+    assert!(!aggregate_has_item(&success, "src/service.ts", "render"));
+    assert!(!aggregate_has_item(&success, "src/finish.ts", "finish"));
+    assert!(!aggregate_has_item(&success, "src/helper.ts", "helper"));
 }
 
 #[test]
@@ -1177,17 +1064,6 @@ impl NeverConstructed {
     );
 
     assert!(
-        contribution_has_internal_call(
-            &first_success,
-            "src/factory.rs",
-            "src/live_widget.rs",
-            "new",
-            "type_match",
-        ),
-        "qualified type_match constructor edge should project to an existing dead-code node; contributions: {:#?}",
-        first_success.contributions
-    );
-    assert!(
         !aggregate_has_item(&first_success, "src/live_widget.rs", "new"),
         "LiveWidget::new is reached only through a type_match edge and must not be dead: {:#}",
         first_success.aggregate
@@ -1309,16 +1185,12 @@ fn inspect_dead_code_contributions_are_byte_identical_for_mixed_fixture() {
             "src/app.ts".to_string(),
             json!({
                 "file": "src/app.ts",
+                "facts_format_version": 1,
                 "exports": [
-                    {"symbol": "main", "kind": "function", "line": 2, "is_entry_point": true}
+                    {"symbol": "main", "kind": "function", "line": 2}
                 ],
-                "internal_calls": [
-                    {"caller_symbol": "main", "file": "src/service.ts", "symbol": "render", "line": 2, "provenance": "treesitter"}
-                ],
-                "liveness_roots": ["<top-level>", "main"],
-                "dispatched_method_names": ["render"],
-                "imported_exports": [
-                    {"file": "src/service.ts", "symbol": "Service"}
+                "raw_imports": [
+                    {"source": "./service", "names": ["Service"], "default_import": null, "namespace_import": null}
                 ],
                 "type_ref_names": ["Service"]
             }),
@@ -1327,39 +1199,38 @@ fn inspect_dead_code_contributions_are_byte_identical_for_mixed_fixture() {
             "src/barrel.ts".to_string(),
             json!({
                 "file": "src/barrel.ts",
+                "facts_format_version": 1,
                 "exports": [
-                    {"symbol": "Result", "kind": "re_export", "line": 1, "is_entry_point": false}
+                    {"symbol": "Result", "kind": "re_export", "line": 1}
                 ],
-                "internal_calls": [
-                    {"caller_symbol": "Result", "file": "src/service.ts", "symbol": "Result", "line": 1, "provenance": "reexport"}
-                ],
-                "liveness_roots": []
+                "raw_reexports": [
+                    {"language": "ts", "source": "./service", "kind": "named", "imported": "Result", "exported": "Result", "line": 1}
+                ]
             }),
         ),
         (
             "src/foo.rs".to_string(),
             json!({
                 "file": "src/foo.rs",
+                "facts_format_version": 1,
                 "exports": [
-                    {"symbol": "Foo", "kind": "struct", "line": 1, "is_entry_point": false, "is_type_like": true},
-                    {"symbol": "Dead", "kind": "struct", "line": 2, "is_entry_point": false, "is_type_like": true}
-                ],
-                "internal_calls": [],
-                "liveness_roots": []
+                    {"symbol": "Foo", "kind": "struct", "line": 1, "is_type_like": true},
+                    {"symbol": "Dead", "kind": "struct", "line": 2, "is_type_like": true}
+                ]
             }),
         ),
         (
             "src/lib.rs".to_string(),
             json!({
                 "file": "src/lib.rs",
+                "facts_format_version": 1,
                 "exports": [
-                    {"symbol": "Foo", "kind": "struct", "line": 1, "is_entry_point": true, "is_type_like": true},
-                    {"symbol": "use_foo", "kind": "function", "line": 3, "is_entry_point": true}
+                    {"symbol": "Foo", "kind": "struct", "line": 1, "is_type_like": true},
+                    {"symbol": "use_foo", "kind": "function", "line": 3}
                 ],
-                "internal_calls": [
-                    {"caller_symbol": "Foo", "file": "src/foo.rs", "symbol": "Foo", "line": 1, "provenance": "reexport"}
+                "raw_reexports": [
+                    {"language": "rust", "source": "foo", "kind": "named", "imported": "Foo", "exported": "Foo", "line": 1}
                 ],
-                "liveness_roots": ["<top-level>", "Foo", "use_foo"],
                 "type_ref_names": ["Foo"]
             }),
         ),
@@ -1367,13 +1238,12 @@ fn inspect_dead_code_contributions_are_byte_identical_for_mixed_fixture() {
             "src/service.ts".to_string(),
             json!({
                 "file": "src/service.ts",
+                "facts_format_version": 1,
                 "exports": [
-                    {"symbol": "Service", "kind": "class", "line": 1, "is_entry_point": false},
-                    {"symbol": "render", "kind": "method", "line": 1, "is_entry_point": false},
-                    {"symbol": "Result", "kind": "interface", "line": 2, "is_entry_point": false, "is_type_like": true}
+                    {"symbol": "Service", "kind": "class", "line": 1},
+                    {"symbol": "render", "kind": "method", "line": 1},
+                    {"symbol": "Result", "kind": "interface", "line": 2, "is_type_like": true}
                 ],
-                "internal_calls": [],
-                "liveness_roots": [],
                 "type_ref_names": ["Result"]
             }),
         ),
@@ -1423,14 +1293,11 @@ fn inspect_dead_code_contribution_shape_matches_contract() {
         contribution.contribution,
         json!({
             "file": "src/foo.ts",
+            "facts_format_version": 1,
             "exports": [
-                {"symbol": "Foo", "kind": "class", "line": 1, "is_entry_point": false},
-                {"symbol": "helper", "kind": "function", "line": 2, "is_entry_point": false}
-            ],
-            "internal_calls": [
-                {"caller_symbol": "helper", "file": "src/bar.ts", "symbol": "Bar", "line": 2, "provenance": "treesitter"}
-            ],
-            "liveness_roots": []
+                {"symbol": "Foo", "kind": "class", "line": 1},
+                {"symbol": "helper", "kind": "function", "line": 2}
+            ]
         })
     );
 }

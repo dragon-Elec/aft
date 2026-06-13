@@ -599,6 +599,52 @@ export const b2 = b;
 }
 
 #[test]
+fn oxc_engine_dead_code_forced_stale_file_reparse_misses_only_changed_file() {
+    let (temp_dir, root, paths) = fixture_project(&[
+        (
+            "src/main.ts",
+            "import { b } from './b';\nexport function main() { return b; }\n",
+        ),
+        (
+            "src/b.ts",
+            "import { c } from './c';\nexport const b = c + 1;\n",
+        ),
+        ("src/c.ts", "export const c = 1;\n"),
+    ]);
+    let _keep = temp_dir;
+    let mut cache = OxcFactsCache::new();
+    let options = AnalyzeOptions {
+        entry_points: vec![root.join("src/main.ts")],
+        entry_reachability: true,
+        ..AnalyzeOptions::default()
+    };
+    let cold = analyze_files_with_cache(&root, &paths, options.clone(), &mut cache)
+        .expect("cold dead_code analyze");
+    assert_eq!(cold.stats.cache_misses, 3);
+    assert_eq!(cold.stats.cache_hits, 0);
+
+    let changed = root.join("src/b.ts");
+    fs::write(
+        &changed,
+        "import { c } from './c';\nexport const b = c + 2;\nexport const b2 = b;\n",
+    )
+    .expect("rewrite changed file");
+    let warm = analyze_files_with_cache(
+        &root,
+        &paths,
+        AnalyzeOptions {
+            force_reparse_files: vec![changed],
+            ..options
+        },
+        &mut cache,
+    )
+    .expect("warm dead_code analyze");
+
+    assert_eq!(warm.stats.cache_hits, 2);
+    assert_eq!(warm.stats.cache_misses, 1);
+}
+
+#[test]
 #[ignore = "manual benchmark; needs AFT_BENCH_REPO pointing at a large checkout"]
 fn unused_exports_incremental_oxc_benchmark() {
     let Ok(repo) = std::env::var("AFT_BENCH_REPO") else {

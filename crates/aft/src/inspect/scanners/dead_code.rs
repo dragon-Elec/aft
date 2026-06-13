@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
 
 use rayon::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::cache_freshness::{self, FileFreshness};
@@ -15,7 +15,9 @@ use crate::inspect::job::{
     is_test_support_file, CALLGRAPH_PROVENANCE_REEXPORT, DISPATCHED_CALLEE_SEPARATOR,
 };
 use crate::inspect::oxc_engine::{
-    LivenessVerdict, OxcEngineResult, OxcFileVerdicts, OXC_PROVENANCE,
+    analyze_file_facts, AnalyzeOptions, DynamicImportFact, ExportFact, FileFacts, FileId,
+    ImportFact, LivenessVerdict, OxcEngineResult, OxcFileVerdicts, ReExportFact, ReExportKind,
+    FACTS_FORMAT_VERSION, OXC_PROVENANCE,
 };
 use crate::inspect::{
     CallgraphOutboundCall, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob,
@@ -26,6 +28,7 @@ use crate::parser::{detect_language, grammar_for, LangId};
 use super::DEFAULT_EXPORT_MARKER_KIND;
 
 const MAX_DRILL_DOWN_ITEMS: usize = 100;
+pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 1;
 
 type ExportNode = (String, String);
 type OutboundCallsByCallerFile<'a> = BTreeMap<PathBuf, Vec<&'a CallgraphOutboundCall>>;
@@ -38,8 +41,8 @@ struct ImportedExportLiveness {
 
 #[derive(Debug, Default)]
 struct FileAnalysis {
-    reexport_edges: Vec<InternalCall>,
-    imported_export_liveness: ImportedExportLiveness,
+    raw_imports: Vec<RawImportContribution>,
+    raw_reexports: Vec<RawReexportContribution>,
     type_ref_names: BTreeSet<String>,
 }
 
@@ -48,37 +51,41 @@ struct DeadCodeFileAnalyzer {
     parsers: HashMap<LangId, tree_sitter::Parser>,
 }
 
+#[derive(Debug, Serialize)]
+struct OxcDeadCodeFactsPayload<'a> {
+    format_version: u32,
+    content_hash: &'a str,
+    exports: &'a [ExportFact],
+    imports: &'a [ImportFact],
+    re_exports: &'a [ReExportFact],
+    dynamic_imports: &'a [DynamicImportFact],
+    same_file_value_references: &'a BTreeSet<String>,
+    used_import_bindings: &'a BTreeSet<String>,
+    type_referenced_import_bindings: &'a BTreeSet<String>,
+    value_referenced_import_bindings: &'a BTreeSet<String>,
+    parse_error: &'a Option<String>,
+}
+
 impl DeadCodeFileAnalyzer {
-    fn analyze_file(
-        &mut self,
-        project_root: &Path,
-        file: &Path,
-        file_name: &str,
-        has_oxc_file: bool,
-        exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
-        default_export_symbols_by_file: &BTreeMap<String, String>,
-    ) -> FileAnalysis {
+    fn analyze_file(&mut self, file: &Path, has_oxc_file: bool) -> FileAnalysis {
         let Some(lang) = detect_language(file) else {
             return FileAnalysis::default();
         };
         let needs_type_refs = supports_type_refs(lang);
-        let needs_ts_reexports =
-            matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript);
+        let is_ts_js = matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript);
+        // Oxc FileFacts are the raw TS/JS import/re-export/dynamic-import facts.
+        // Only the legacy non-oxc TS/JS path needs tree-sitter import/re-export facts here.
+        let needs_ts_raw_facts = is_ts_js && !has_oxc_file;
         let needs_rust_reexports = matches!(lang, LangId::Rust);
-        let needs_imported_liveness = !has_oxc_file && needs_ts_reexports;
 
-        if !needs_type_refs
-            && !needs_ts_reexports
-            && !needs_rust_reexports
-            && !needs_imported_liveness
-        {
+        if !needs_type_refs && !needs_ts_raw_facts && !needs_rust_reexports {
             return FileAnalysis::default();
         }
 
         let Ok(source) = fs::read_to_string(file) else {
             return FileAnalysis::default();
         };
-        let needs_tree = needs_type_refs || needs_ts_reexports || needs_imported_liveness;
+        let needs_tree = needs_type_refs || needs_ts_raw_facts;
         let tree = needs_tree
             .then(|| self.parse_source(lang, &source))
             .flatten();
@@ -91,54 +98,27 @@ impl DeadCodeFileAnalyzer {
             BTreeSet::new()
         };
 
-        let reexport_edges = if needs_ts_reexports {
+        let raw_imports = if needs_ts_raw_facts {
             tree.as_ref()
-                .map(|tree| {
-                    ts_reexport_liveness_edges(
-                        project_root,
-                        file,
-                        file_name,
-                        &source,
-                        tree.root_node(),
-                        exported_symbols_by_file,
-                        default_export_symbols_by_file,
-                    )
-                })
+                .map(|tree| raw_imports_from_tree(&source, tree, lang))
                 .unwrap_or_default()
-        } else if needs_rust_reexports {
-            rust_reexport_liveness_edges(
-                project_root,
-                file,
-                file_name,
-                &source,
-                exported_symbols_by_file,
-                default_export_symbols_by_file,
-            )
         } else {
             Vec::new()
         };
 
-        let imported_export_liveness = if needs_imported_liveness {
+        let raw_reexports = if needs_ts_raw_facts {
             tree.as_ref()
-                .map(|tree| {
-                    imported_export_liveness_roots(
-                        project_root,
-                        file,
-                        &source,
-                        tree,
-                        lang,
-                        exported_symbols_by_file,
-                        default_export_symbols_by_file,
-                    )
-                })
+                .map(|tree| ts_raw_reexport_contributions(&source, tree.root_node()))
                 .unwrap_or_default()
+        } else if needs_rust_reexports {
+            rust_raw_reexport_contributions(&source)
         } else {
-            ImportedExportLiveness::default()
+            Vec::new()
         };
 
         FileAnalysis {
-            reexport_edges,
-            imported_export_liveness,
+            raw_imports,
+            raw_reexports,
             type_ref_names,
         }
     }
@@ -185,22 +165,14 @@ fn run_dead_code_scan_with_oxc_started(
         return InspectResult::success(job, success, started.elapsed());
     };
 
-    let liveness_root_files = snapshot
-        .entry_points
-        .iter()
-        .map(|file| relative_path(&job.project_root, file))
-        .collect::<BTreeSet<_>>();
-    let public_api_files = collect_public_api_files(&job.project_root);
-    let (exported_symbols_by_file, files_by_exported_symbol, default_export_symbols_by_file) =
-        exported_symbol_indexes(job, snapshot);
     let fallback_exports_by_file = fallback_export_contributions_by_file(job, snapshot);
-    let oxc_by_file = oxc_result
+    let oxc_facts_by_file = oxc_result
         .map(|result| {
             result
-                .files
+                .facts
                 .iter()
                 .cloned()
-                .map(|file| (relative_path(&job.project_root, &file.file), file))
+                .map(|facts| (relative_path(&job.project_root, &facts.path), facts))
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
@@ -221,10 +193,6 @@ fn run_dead_code_scan_with_oxc_started(
     let oxc_skipped_files = oxc_result
         .map(|result| oxc_skipped_files_payload(&job.project_root, result))
         .unwrap_or_default();
-    let oxc_resolver_config_fingerprint =
-        oxc_result.map(OxcEngineResult::resolver_config_fingerprint);
-    let outbound_calls_by_caller_file =
-        group_outbound_calls_by_caller_file(&job.project_root, &snapshot.outbound_calls);
 
     let contributions = job
         .scope_files
@@ -234,23 +202,24 @@ fn run_dead_code_scan_with_oxc_started(
                 job,
                 file,
                 &fallback_exports_by_file,
-                &exported_symbols_by_file,
-                &files_by_exported_symbol,
-                &default_export_symbols_by_file,
-                &liveness_root_files,
-                &public_api_files,
-                &outbound_calls_by_caller_file,
-                &oxc_by_file,
+                &oxc_facts_by_file,
                 &oxc_parse_errors_by_file,
                 &oxc_skipped_files,
-                oxc_resolver_config_fingerprint,
                 file_analyzer,
             )
         })
         .collect::<Vec<_>>();
 
+    let public_api_files = collect_public_api_files(&job.project_root);
     let roles = crate::inspect::entry_points::resolve_project_roles(&job.project_root);
-    let aggregate = aggregate_dead_code_contributions(&contributions, &public_api_files, &roles);
+    let aggregate = aggregate_dead_code_contributions_with_snapshot(
+        &job.project_root,
+        snapshot,
+        &contributions,
+        &public_api_files,
+        &roles,
+        Some(MAX_DRILL_DOWN_ITEMS),
+    );
     let success = InspectScanSuccess {
         scanned_files: job.scope_files.clone(),
         contributions,
@@ -258,42 +227,6 @@ fn run_dead_code_scan_with_oxc_started(
     };
 
     InspectResult::success(job, success, started.elapsed())
-}
-
-fn exported_symbol_indexes(
-    job: &InspectJob,
-    snapshot: &CallgraphSnapshot,
-) -> (
-    BTreeMap<String, BTreeSet<String>>,
-    BTreeMap<String, BTreeSet<String>>,
-    BTreeMap<String, String>,
-) {
-    let mut exported_symbols_by_file: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut files_by_exported_symbol: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut default_export_symbols_by_file: BTreeMap<String, String> = BTreeMap::new();
-
-    for export in &snapshot.exported_symbols {
-        let file = relative_path(&job.project_root, &export.file);
-        if export.kind == DEFAULT_EXPORT_MARKER_KIND {
-            default_export_symbols_by_file.insert(file, export.symbol.clone());
-            continue;
-        }
-
-        exported_symbols_by_file
-            .entry(file.clone())
-            .or_default()
-            .insert(export.symbol.clone());
-        files_by_exported_symbol
-            .entry(export.symbol.clone())
-            .or_default()
-            .insert(file);
-    }
-
-    (
-        exported_symbols_by_file,
-        files_by_exported_symbol,
-        default_export_symbols_by_file,
-    )
 }
 
 fn fallback_export_contributions_by_file(
@@ -340,94 +273,30 @@ fn gather_file_contribution(
     job: &InspectJob,
     file: &Path,
     fallback_exports_by_file: &BTreeMap<String, Vec<ExportContribution>>,
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
-    files_by_exported_symbol: &BTreeMap<String, BTreeSet<String>>,
-    default_export_symbols_by_file: &BTreeMap<String, String>,
-    liveness_root_files: &BTreeSet<String>,
-    public_api_files: &BTreeSet<String>,
-    outbound_calls_by_caller_file: &OutboundCallsByCallerFile<'_>,
-    oxc_by_file: &BTreeMap<String, OxcFileVerdicts>,
+    oxc_facts_by_file: &BTreeMap<String, FileFacts>,
     oxc_parse_errors_by_file: &BTreeMap<String, Vec<String>>,
     oxc_skipped_files: &[Value],
-    oxc_resolver_config_fingerprint: Option<&str>,
     file_analyzer: &mut DeadCodeFileAnalyzer,
 ) -> FileContribution {
     let file_name = relative_path(&job.project_root, file);
-    let normalized_file = normalize_absolute(&job.project_root, file);
-    let outbound_calls_for_file = outbound_calls_by_caller_file
-        .get(&normalized_file)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    let is_liveness_root_file = liveness_root_files.contains(&file_name);
-    let is_public_api_file = public_api_files.contains(&file_name);
-    let oxc_file = oxc_by_file.get(&file_name);
-    let mut exports = oxc_file.map(oxc_export_contributions).unwrap_or_else(|| {
-        fallback_exports_by_file
-            .get(&file_name)
-            .cloned()
-            .unwrap_or_default()
-    });
+    let oxc_facts = oxc_facts_by_file.get(&file_name);
+    let exports = oxc_facts
+        .map(oxc_fact_export_contributions)
+        .unwrap_or_else(|| {
+            fallback_exports_by_file
+                .get(&file_name)
+                .cloned()
+                .unwrap_or_default()
+        });
     let FileAnalysis {
-        reexport_edges,
-        imported_export_liveness,
+        raw_imports,
+        raw_reexports,
         type_ref_names,
-    } = file_analyzer.analyze_file(
-        &job.project_root,
-        file,
-        &file_name,
-        oxc_file.is_some(),
-        exported_symbols_by_file,
-        default_export_symbols_by_file,
-    );
-
-    let mut internal_calls = outbound_calls_for_file
-        .iter()
-        .copied()
-        .filter_map(|call| {
-            project_internal_call(
-                &job.project_root,
-                call,
-                &file_name,
-                exported_symbols_by_file,
-                files_by_exported_symbol,
-            )
-        })
-        .collect::<Vec<_>>();
-    internal_calls.extend(reexport_edges);
-    internal_calls.sort_by(|left, right| {
-        left.caller_symbol
-            .cmp(&right.caller_symbol)
-            .then_with(|| left.file.cmp(&right.file))
-            .then_with(|| left.symbol.cmp(&right.symbol))
-            .then_with(|| left.line.cmp(&right.line))
-    });
-    internal_calls.dedup_by(|left, right| {
-        left.caller_symbol == right.caller_symbol
-            && left.file == right.file
-            && left.symbol == right.symbol
-            && left.line == right.line
-    });
-
-    let dispatched_method_names = outbound_calls_for_file
-        .iter()
-        .copied()
-        .filter_map(dispatched_method_name_from_call)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let liveness_roots = liveness_roots_for_file(
-        &file_name,
-        &exports,
-        &internal_calls,
-        is_liveness_root_file,
-        is_public_api_file,
-    );
-    for export in &mut exports {
-        export.is_entry_point = liveness_roots.contains(&export.symbol);
-    }
+    } = file_analyzer.analyze_file(file, oxc_facts.is_some());
 
     let mut payload = json!({
         "file": file_name,
+        "facts_format_version": DEAD_CODE_FACTS_FORMAT_VERSION,
         "exports": exports
             .iter()
             .map(|export| {
@@ -435,62 +304,36 @@ fn gather_file_contribution(
                     "symbol": export.symbol,
                     "kind": export.kind,
                     "line": export.line,
-                    "is_entry_point": export.is_entry_point,
                 });
                 if export.is_type_like {
                     value["is_type_like"] = json!(true);
                 }
-                if let Some(verdict) = export.verdict {
-                    value["verdict"] = json!(verdict);
-                }
-                if let Some(reason) = &export.reason {
-                    value["reason"] = json!(reason);
-                }
-                if let Some(provenance) = &export.provenance {
-                    value["provenance"] = json!(provenance);
-                }
                 value
             })
             .collect::<Vec<_>>(),
-        "internal_calls": internal_calls
-            .into_iter()
-            .map(|call| json!({
-                "caller_symbol": call.caller_symbol,
-                "file": call.file,
-                "symbol": call.symbol,
-                "line": call.line,
-                "provenance": call.provenance,
-            }))
-            .collect::<Vec<_>>(),
-        "liveness_roots": liveness_roots,
     });
-    if !dispatched_method_names.is_empty() {
-        payload["dispatched_method_names"] = json!(dispatched_method_names);
+
+    if !raw_imports.is_empty() {
+        payload["raw_imports"] = json!(raw_imports);
     }
-    if !imported_export_liveness.root_exports.is_empty() {
-        payload["imported_exports"] = json!(imported_export_liveness
-            .root_exports
-            .iter()
-            .map(|root| json!({
-                "file": root.file,
-                "symbol": root.symbol,
-            }))
-            .collect::<Vec<_>>());
+    if !raw_reexports.is_empty() {
+        payload["raw_reexports"] = json!(raw_reexports);
     }
-    if !imported_export_liveness.namespace_exports.is_empty() {
-        payload["namespace_imported_exports"] = json!(imported_export_liveness
-            .namespace_exports
-            .iter()
-            .map(|root| json!({
-                "file": root.file,
-                "symbol": root.symbol,
-            }))
-            .collect::<Vec<_>>());
-    }
-    if let Some(fingerprint) = oxc_resolver_config_fingerprint {
-        if oxc_file.is_some() {
-            payload["resolver_config_fingerprint"] = json!(fingerprint);
-        }
+    if let Some(facts) = oxc_facts {
+        payload["provenance"] = json!(OXC_PROVENANCE);
+        payload["oxc_facts"] = json!(OxcDeadCodeFactsPayload {
+            format_version: FACTS_FORMAT_VERSION,
+            content_hash: &facts.content_hash,
+            exports: &facts.exports,
+            imports: &facts.imports,
+            re_exports: &facts.re_exports,
+            dynamic_imports: &facts.dynamic_imports,
+            same_file_value_references: &facts.same_file_value_references,
+            used_import_bindings: &facts.used_import_bindings,
+            type_referenced_import_bindings: &facts.type_referenced_import_bindings,
+            value_referenced_import_bindings: &facts.value_referenced_import_bindings,
+            parse_error: &facts.parse_error,
+        });
     }
     if let Some(parse_errors) = oxc_parse_errors_by_file.get(&file_name) {
         payload["parse_errors"] = json!(parse_errors
@@ -501,7 +344,7 @@ fn gather_file_contribution(
             }))
             .collect::<Vec<_>>());
     }
-    if oxc_file.is_some() && !oxc_skipped_files.is_empty() {
+    if oxc_facts.is_some() && !oxc_skipped_files.is_empty() {
         payload["skipped_files"] = Value::Array(oxc_skipped_files.to_vec());
     }
 
@@ -512,6 +355,23 @@ fn gather_file_contribution(
         payload,
     )
     .with_type_ref_names(type_ref_names)
+}
+
+fn oxc_fact_export_contributions(facts: &FileFacts) -> Vec<ExportContribution> {
+    facts
+        .exports
+        .iter()
+        .map(|export| ExportContribution {
+            symbol: export.name.as_symbol(),
+            kind: export.kind.clone(),
+            line: export.line,
+            is_type_like: export.is_type_only || is_type_like_kind(&export.kind),
+            is_entry_point: false,
+            verdict: None,
+            reason: None,
+            provenance: None,
+        })
+        .collect()
 }
 
 fn oxc_export_contributions(file: &OxcFileVerdicts) -> Vec<ExportContribution> {
@@ -557,43 +417,268 @@ pub(crate) fn callgraph_unavailable_aggregate(scanned_files: usize) -> serde_jso
     })
 }
 
-pub(crate) fn aggregate_dead_code_contributions(
-    contributions: &[FileContribution],
-    public_api_files: &BTreeSet<String>,
-    roles: &crate::inspect::entry_points::ProjectRoles,
-) -> serde_json::Value {
-    aggregate_dead_code_contributions_with_limit(
-        contributions,
-        public_api_files,
-        roles,
-        Some(MAX_DRILL_DOWN_ITEMS),
-    )
-}
-
-pub(crate) fn aggregate_dead_code_contributions_with_limit(
+pub(crate) fn aggregate_dead_code_contributions_with_snapshot(
+    project_root: &Path,
+    snapshot: &CallgraphSnapshot,
     contributions: &[FileContribution],
     public_api_files: &BTreeSet<String>,
     roles: &crate::inspect::entry_points::ProjectRoles,
     drill_down_limit: Option<usize>,
 ) -> serde_json::Value {
-    let parsed = contributions
+    let parsed = parse_dead_code_contributions(contributions);
+    let materialized =
+        materialize_dead_code_contributions(project_root, snapshot, parsed, public_api_files);
+    aggregate_materialized_dead_code_contributions(
+        &materialized,
+        public_api_files,
+        roles,
+        drill_down_limit,
+        contributions.len(),
+    )
+}
+
+fn parse_dead_code_contributions(contributions: &[FileContribution]) -> Vec<DeadCodeContribution> {
+    contributions
         .iter()
         .filter_map(|contribution| {
             serde_json::from_value::<DeadCodeContribution>(contribution.contribution.clone()).ok()
         })
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>()
+}
 
-    let edges_by_source = edges_by_source(&parsed);
-    let dispatched_method_names = collect_dispatched_method_names(&parsed);
-    let reachable = reachable_exports(&parsed, &edges_by_source, &dispatched_method_names);
-    let referenced_type_names = collect_referenced_type_names(&parsed);
+fn materialize_dead_code_contributions(
+    project_root: &Path,
+    snapshot: &CallgraphSnapshot,
+    parsed: Vec<DeadCodeContribution>,
+    public_api_files: &BTreeSet<String>,
+) -> Vec<DeadCodeContribution> {
+    let liveness_root_files = snapshot
+        .entry_points
+        .iter()
+        .map(|file| relative_path(project_root, file))
+        .collect::<BTreeSet<_>>();
+    let (exported_symbols_by_file, files_by_exported_symbol, default_export_symbols_by_file) =
+        exported_symbol_indexes_from_contributions(project_root, snapshot, &parsed);
+    let outbound_calls_by_caller_file =
+        group_outbound_calls_by_caller_file(project_root, &snapshot.outbound_calls);
+    let oxc_by_file = oxc_verdicts_by_file(project_root, snapshot, &parsed, public_api_files);
+
+    parsed
+        .into_iter()
+        .map(|mut contribution| {
+            let _facts_format_version = contribution.facts_format_version;
+            let absolute_file = project_root.join(&contribution.file);
+            let normalized_file = normalize_absolute(project_root, &absolute_file);
+            let outbound_calls_for_file = outbound_calls_by_caller_file
+                .get(&normalized_file)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let mut exports = oxc_by_file
+                .get(&contribution.file)
+                .map(oxc_export_contributions)
+                .unwrap_or_else(|| contribution.exports.clone());
+
+            let mut internal_calls = outbound_calls_for_file
+                .iter()
+                .copied()
+                .filter_map(|call| {
+                    project_internal_call(
+                        project_root,
+                        call,
+                        &contribution.file,
+                        &exported_symbols_by_file,
+                        &files_by_exported_symbol,
+                    )
+                })
+                .collect::<Vec<_>>();
+            internal_calls.extend(resolve_raw_reexport_liveness_edges(
+                project_root,
+                &contribution.file,
+                &contribution.raw_reexports,
+                &exported_symbols_by_file,
+                &default_export_symbols_by_file,
+            ));
+            if let Some(oxc_facts) = &contribution.oxc_facts {
+                internal_calls.extend(resolve_oxc_reexport_liveness_edges(
+                    project_root,
+                    &contribution.file,
+                    oxc_facts,
+                    &exported_symbols_by_file,
+                    &default_export_symbols_by_file,
+                ));
+            }
+            sort_dedup_internal_calls(&mut internal_calls);
+
+            let dispatched_method_names = outbound_calls_for_file
+                .iter()
+                .copied()
+                .filter_map(dispatched_method_name_from_call)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let imported_export_liveness = resolve_raw_imported_export_liveness_roots(
+                project_root,
+                &contribution.file,
+                &contribution.raw_imports,
+                &exported_symbols_by_file,
+                &default_export_symbols_by_file,
+            );
+            let liveness_roots = liveness_roots_for_file(
+                &contribution.file,
+                &exports,
+                &internal_calls,
+                liveness_root_files.contains(&contribution.file),
+                public_api_files.contains(&contribution.file),
+            );
+            for export in &mut exports {
+                export.is_entry_point = liveness_roots.contains(&export.symbol);
+            }
+
+            contribution.exports = exports;
+            contribution.internal_calls = internal_calls
+                .into_iter()
+                .map(InternalCallContribution::from)
+                .collect();
+            contribution.liveness_roots = liveness_roots;
+            contribution.imported_exports = imported_export_liveness.root_exports;
+            contribution.namespace_imported_exports = imported_export_liveness.namespace_exports;
+            contribution.dispatched_method_names = dispatched_method_names;
+            contribution
+        })
+        .collect()
+}
+
+fn exported_symbol_indexes_from_contributions(
+    project_root: &Path,
+    snapshot: &CallgraphSnapshot,
+    contributions: &[DeadCodeContribution],
+) -> (
+    BTreeMap<String, BTreeSet<String>>,
+    BTreeMap<String, BTreeSet<String>>,
+    BTreeMap<String, String>,
+) {
+    let mut exported_symbols_by_file: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut files_by_exported_symbol: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut default_export_symbols_by_file: BTreeMap<String, String> = BTreeMap::new();
+
+    for contribution in contributions {
+        for export in &contribution.exports {
+            exported_symbols_by_file
+                .entry(contribution.file.clone())
+                .or_default()
+                .insert(export.symbol.clone());
+            files_by_exported_symbol
+                .entry(export.symbol.clone())
+                .or_default()
+                .insert(contribution.file.clone());
+        }
+    }
+
+    for export in &snapshot.exported_symbols {
+        let file = relative_path(project_root, &export.file);
+        if export.kind == DEFAULT_EXPORT_MARKER_KIND {
+            default_export_symbols_by_file.insert(file, export.symbol.clone());
+        }
+    }
+
+    (
+        exported_symbols_by_file,
+        files_by_exported_symbol,
+        default_export_symbols_by_file,
+    )
+}
+
+fn oxc_verdicts_by_file(
+    project_root: &Path,
+    snapshot: &CallgraphSnapshot,
+    contributions: &[DeadCodeContribution],
+    public_api_files: &BTreeSet<String>,
+) -> BTreeMap<String, OxcFileVerdicts> {
+    let facts = contributions
+        .iter()
+        .filter_map(|contribution| {
+            let oxc_facts = contribution.oxc_facts.as_ref()?;
+            if oxc_facts.format_version != FACTS_FORMAT_VERSION {
+                return None;
+            }
+            Some(FileFacts {
+                file_id: FileId(0),
+                path: normalize_path(&project_root.join(&contribution.file)),
+                content_hash: oxc_facts.content_hash.clone(),
+                exports: oxc_facts.exports.clone(),
+                imports: oxc_facts.imports.clone(),
+                re_exports: oxc_facts.re_exports.clone(),
+                dynamic_imports: oxc_facts.dynamic_imports.clone(),
+                same_file_value_references: oxc_facts.same_file_value_references.clone(),
+                used_import_bindings: oxc_facts.used_import_bindings.clone(),
+                type_referenced_import_bindings: oxc_facts.type_referenced_import_bindings.clone(),
+                value_referenced_import_bindings: oxc_facts
+                    .value_referenced_import_bindings
+                    .clone(),
+                parse_error: oxc_facts.parse_error.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if facts.is_empty() {
+        return BTreeMap::new();
+    }
+
+    analyze_file_facts(
+        project_root,
+        facts,
+        AnalyzeOptions {
+            entry_points: snapshot.entry_points.iter().cloned().collect(),
+            public_api_files: public_api_files
+                .iter()
+                .map(|file| project_root.join(file))
+                .collect(),
+            force_reparse_files: Vec::new(),
+            entry_reachability: true,
+        },
+        Vec::new(),
+    )
+    .files
+    .into_iter()
+    .map(|file| (file.relative_file.clone(), file))
+    .collect()
+}
+
+fn sort_dedup_internal_calls(internal_calls: &mut Vec<InternalCall>) {
+    internal_calls.sort_by(|left, right| {
+        left.caller_symbol
+            .cmp(&right.caller_symbol)
+            .then_with(|| left.file.cmp(&right.file))
+            .then_with(|| left.symbol.cmp(&right.symbol))
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.provenance.cmp(&right.provenance))
+    });
+    internal_calls.dedup_by(|left, right| {
+        left.caller_symbol == right.caller_symbol
+            && left.file == right.file
+            && left.symbol == right.symbol
+            && left.line == right.line
+            && left.provenance == right.provenance
+    });
+}
+
+fn aggregate_materialized_dead_code_contributions(
+    parsed: &[DeadCodeContribution],
+    public_api_files: &BTreeSet<String>,
+    roles: &crate::inspect::entry_points::ProjectRoles,
+    drill_down_limit: Option<usize>,
+    scanned_files: usize,
+) -> serde_json::Value {
+    let edges_by_source = edges_by_source(parsed);
+    let dispatched_method_names = collect_dispatched_method_names(parsed);
+    let reachable = reachable_exports(parsed, &edges_by_source, &dispatched_method_names);
+    let referenced_type_names = collect_referenced_type_names(parsed);
 
     let mut by_language: BTreeMap<String, usize> = BTreeMap::new();
     let mut count = 0usize;
     let mut dead_items = Vec::new();
     let mut uncertain_count = 0usize;
     let mut uncertain_items: Vec<serde_json::Value> = Vec::new();
-    for contribution in &parsed {
+    for contribution in parsed {
         // Test-support files (fixtures, corpora, mock data) are consumed by
         // path, never imported, so their exports always look dead. Skip
         // REPORTING them — their edges already kept real code live above.
@@ -661,7 +746,7 @@ pub(crate) fn aggregate_dead_code_contributions_with_limit(
         crate::inspect::entry_points::rank_and_truncate_items(dead_items, roles, drill_down_limit);
     let top = crate::inspect::entry_points::top_preview_symbols(&dead_items);
 
-    let (parse_errors, skipped_files) = dead_code_honesty_fields(&parsed);
+    let (parse_errors, skipped_files) = dead_code_honesty_fields(parsed);
     let mut aggregate = json!({
         "count": count,
         "items": dead_items,
@@ -671,7 +756,7 @@ pub(crate) fn aggregate_dead_code_contributions_with_limit(
         "uncertain_count": uncertain_count,
         "uncertain_items": uncertain_items,
         "callgraph_available": true,
-        "scanned_files": contributions.len(),
+        "scanned_files": scanned_files,
         "complete": parse_errors.is_empty() && skipped_files.is_empty(),
     });
     if !parse_errors.is_empty() {
@@ -921,36 +1006,69 @@ fn project_internal_call(
     })
 }
 
-fn ts_reexport_liveness_edges(
-    project_root: &Path,
-    file: &Path,
-    file_name: &str,
+fn raw_imports_from_tree(
+    source: &str,
+    tree: &tree_sitter::Tree,
+    lang: LangId,
+) -> Vec<RawImportContribution> {
+    parse_imports(source, tree, lang)
+        .imports
+        .into_iter()
+        .map(|import| RawImportContribution {
+            source: import.module_path,
+            names: import.names,
+            default_import: import.default_import,
+            namespace_import: import.namespace_import,
+        })
+        .collect()
+}
+
+fn ts_raw_reexport_contributions(
     source: &str,
     root: tree_sitter::Node,
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
-    default_export_symbols_by_file: &BTreeMap<String, String>,
-) -> Vec<InternalCall> {
-    let from_dir = file.parent().unwrap_or_else(|| Path::new("."));
-    let mut edges = Vec::new();
+) -> Vec<RawReexportContribution> {
+    let mut reexports = Vec::new();
     let mut cursor = root.walk();
     if !cursor.goto_first_child() {
-        return edges;
+        return reexports;
     }
 
     loop {
         let node = cursor.node();
         if node.kind() == "export_statement" {
             if let Some(module_path) = export_source_module(source, node) {
-                if let Some(module_entry) = resolve_import_module_path(from_dir, &module_path) {
-                    edges.extend(ts_reexport_edges_for_statement(
-                        project_root,
-                        file_name,
-                        source,
-                        node,
-                        &module_entry,
-                        exported_symbols_by_file,
-                        default_export_symbols_by_file,
-                    ));
+                let line = (node.start_position().row + 1) as u32;
+                let raw_export = node_text(source, node).trim();
+                for specifier in ts_reexport_specifiers(raw_export) {
+                    reexports.push(RawReexportContribution {
+                        language: "ts".to_string(),
+                        source: module_path.clone(),
+                        kind: "named".to_string(),
+                        imported: Some(specifier.imported),
+                        exported: Some(specifier.exported),
+                        line,
+                    });
+                }
+                if raw_export.contains('*') {
+                    if let Some(namespace_export) = ts_namespace_reexport_name(raw_export) {
+                        reexports.push(RawReexportContribution {
+                            language: "ts".to_string(),
+                            source: module_path.clone(),
+                            kind: "namespace".to_string(),
+                            imported: Some("*".to_string()),
+                            exported: Some(namespace_export),
+                            line,
+                        });
+                    } else {
+                        reexports.push(RawReexportContribution {
+                            language: "ts".to_string(),
+                            source: module_path.clone(),
+                            kind: "star".to_string(),
+                            imported: Some("*".to_string()),
+                            exported: None,
+                            line,
+                        });
+                    }
                 }
             }
         }
@@ -960,72 +1078,274 @@ fn ts_reexport_liveness_edges(
         }
     }
 
-    edges
+    reexports
 }
 
-fn ts_reexport_edges_for_statement(
+fn rust_raw_reexport_contributions(source: &str) -> Vec<RawReexportContribution> {
+    rust_pub_use_statements(source)
+        .into_iter()
+        .flat_map(|(statement, line)| {
+            rust_reexport_specifiers(&statement)
+                .into_iter()
+                .map(move |specifier| RawReexportContribution {
+                    language: "rust".to_string(),
+                    source: specifier.module_path.join("::"),
+                    kind: if specifier.imported == "*" {
+                        "star".to_string()
+                    } else {
+                        "named".to_string()
+                    },
+                    imported: Some(specifier.imported),
+                    exported: Some(specifier.exported),
+                    line,
+                })
+        })
+        .collect()
+}
+
+fn resolve_raw_reexport_liveness_edges(
     project_root: &Path,
     file_name: &str,
-    source: &str,
-    node: tree_sitter::Node,
-    module_entry: &Path,
+    raw_reexports: &[RawReexportContribution],
     exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
     default_export_symbols_by_file: &BTreeMap<String, String>,
 ) -> Vec<InternalCall> {
     let mut edges = Vec::new();
-    let line = (node.start_position().row + 1) as u32;
-    let raw_export = node_text(source, node).trim();
+    let file = project_root.join(file_name);
+    let from_dir = file.parent().unwrap_or_else(|| Path::new("."));
 
-    for specifier in ts_reexport_specifiers(raw_export) {
-        if !file_exports_symbol(file_name, &specifier.exported, exported_symbols_by_file) {
-            continue;
-        }
-        if let Some((target_file, target_symbol)) = resolve_imported_export_liveness_root(
-            project_root,
-            module_entry,
-            &specifier.imported,
-            exported_symbols_by_file,
-            default_export_symbols_by_file,
-        ) {
-            edges.push(InternalCall {
-                caller_symbol: specifier.exported,
-                file: target_file,
-                symbol: target_symbol,
-                line,
-                provenance: CALLGRAPH_PROVENANCE_REEXPORT.to_string(),
-            });
-        }
-    }
-
-    if raw_export.contains('*') {
-        if let Some(namespace_export) = ts_namespace_reexport_name(raw_export) {
-            if file_exports_symbol(file_name, &namespace_export, exported_symbols_by_file) {
-                edges.extend(reexport_edges_for_all_target_symbols(
+    for raw in raw_reexports {
+        match raw.language.as_str() {
+            "ts" => {
+                let Some(module_entry) = resolve_import_module_path(from_dir, &raw.source) else {
+                    continue;
+                };
+                edges.extend(resolve_reexport_fact_edge(
                     project_root,
                     file_name,
-                    &namespace_export,
-                    module_entry,
-                    line,
+                    &module_entry,
+                    raw.kind.as_str(),
+                    raw.imported.as_deref(),
+                    raw.exported.as_deref(),
+                    raw.line,
                     exported_symbols_by_file,
                     default_export_symbols_by_file,
-                    false,
                 ));
             }
-        } else {
-            edges.extend(reexport_edges_for_all_target_symbols(
-                project_root,
-                file_name,
-                "",
-                module_entry,
-                line,
-                exported_symbols_by_file,
-                default_export_symbols_by_file,
-                true,
-            ));
+            "rust" => {
+                let module_path = raw
+                    .source
+                    .split("::")
+                    .filter(|segment| !segment.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                let Some(module_entry) =
+                    rust_module_entry_from_file(project_root, file_name, &module_path)
+                else {
+                    continue;
+                };
+                edges.extend(resolve_reexport_fact_edge(
+                    project_root,
+                    file_name,
+                    &module_entry,
+                    raw.kind.as_str(),
+                    raw.imported.as_deref(),
+                    raw.exported.as_deref(),
+                    raw.line,
+                    exported_symbols_by_file,
+                    default_export_symbols_by_file,
+                ));
+            }
+            _ => {}
         }
     }
 
     edges
+}
+
+fn resolve_oxc_reexport_liveness_edges(
+    project_root: &Path,
+    file_name: &str,
+    oxc_facts: &OxcFactsContribution,
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    default_export_symbols_by_file: &BTreeMap<String, String>,
+) -> Vec<InternalCall> {
+    let file = project_root.join(file_name);
+    let from_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let mut edges = Vec::new();
+    for fact in &oxc_facts.re_exports {
+        let Some(module_entry) = resolve_import_module_path(from_dir, &fact.source) else {
+            continue;
+        };
+        let kind = match fact.kind {
+            ReExportKind::Named => "named",
+            ReExportKind::Star => "star",
+            ReExportKind::Namespace => "namespace",
+        };
+        edges.extend(resolve_reexport_fact_edge(
+            project_root,
+            file_name,
+            &module_entry,
+            kind,
+            fact.imported_name.as_deref(),
+            fact.exported_name.as_deref(),
+            fact.line,
+            exported_symbols_by_file,
+            default_export_symbols_by_file,
+        ));
+    }
+    edges
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_reexport_fact_edge(
+    project_root: &Path,
+    file_name: &str,
+    module_entry: &Path,
+    kind: &str,
+    imported: Option<&str>,
+    exported: Option<&str>,
+    line: u32,
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    default_export_symbols_by_file: &BTreeMap<String, String>,
+) -> Vec<InternalCall> {
+    match kind {
+        "star" => reexport_edges_for_all_target_symbols(
+            project_root,
+            file_name,
+            "",
+            module_entry,
+            line,
+            exported_symbols_by_file,
+            default_export_symbols_by_file,
+            true,
+        ),
+        "namespace" => {
+            let namespace_export = exported.unwrap_or_default();
+            if namespace_export.is_empty()
+                || !file_exports_symbol(file_name, namespace_export, exported_symbols_by_file)
+            {
+                return Vec::new();
+            }
+            reexport_edges_for_all_target_symbols(
+                project_root,
+                file_name,
+                namespace_export,
+                module_entry,
+                line,
+                exported_symbols_by_file,
+                default_export_symbols_by_file,
+                false,
+            )
+        }
+        _ => {
+            let imported = imported.unwrap_or_default();
+            let exported = exported.unwrap_or(imported);
+            if imported.is_empty()
+                || exported.is_empty()
+                || !file_exports_symbol(file_name, exported, exported_symbols_by_file)
+            {
+                return Vec::new();
+            }
+            resolve_imported_export_liveness_root(
+                project_root,
+                module_entry,
+                imported,
+                exported_symbols_by_file,
+                default_export_symbols_by_file,
+            )
+            .map(|(target_file, target_symbol)| {
+                vec![InternalCall {
+                    caller_symbol: exported.to_string(),
+                    file: target_file,
+                    symbol: target_symbol,
+                    line,
+                    provenance: CALLGRAPH_PROVENANCE_REEXPORT.to_string(),
+                }]
+            })
+            .unwrap_or_default()
+        }
+    }
+}
+
+fn rust_module_entry_from_file(
+    project_root: &Path,
+    file_name: &str,
+    module_path: &[String],
+) -> Option<PathBuf> {
+    let first = module_path.first()?;
+    let file = project_root.join(file_name);
+    let base_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    resolve_rust_module_file(base_dir, first)
+}
+
+fn resolve_raw_imported_export_liveness_roots(
+    project_root: &Path,
+    file_name: &str,
+    raw_imports: &[RawImportContribution],
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    default_export_symbols_by_file: &BTreeMap<String, String>,
+) -> ImportedExportLiveness {
+    let file = project_root.join(file_name);
+    let from_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let mut root_exports: BTreeSet<ExportNode> = BTreeSet::new();
+    let mut namespace_exports: BTreeSet<ExportNode> = BTreeSet::new();
+
+    for import in raw_imports {
+        if import.namespace_import.is_some() {
+            if let Some(module_entry) = resolve_import_module_path(from_dir, &import.source) {
+                namespace_exports.extend(resolve_namespace_import_liveness_roots(
+                    project_root,
+                    &module_entry,
+                    exported_symbols_by_file,
+                    default_export_symbols_by_file,
+                ));
+            }
+        }
+
+        let Some(module_entry) = resolve_import_module_path(from_dir, &import.source) else {
+            continue;
+        };
+
+        for imported_name in import
+            .names
+            .iter()
+            .map(|name| specifier_imported_name(name))
+        {
+            if let Some(root) = resolve_imported_export_liveness_root(
+                project_root,
+                &module_entry,
+                imported_name,
+                exported_symbols_by_file,
+                default_export_symbols_by_file,
+            ) {
+                root_exports.insert(root);
+            }
+        }
+
+        if import.default_import.is_some() {
+            if let Some(root) = resolve_imported_export_liveness_root(
+                project_root,
+                &module_entry,
+                "default",
+                exported_symbols_by_file,
+                default_export_symbols_by_file,
+            ) {
+                root_exports.insert(root);
+            }
+        }
+    }
+
+    ImportedExportLiveness {
+        root_exports: root_exports
+            .into_iter()
+            .map(|(file, symbol)| ImportedExportContribution { file, symbol })
+            .collect(),
+        namespace_exports: namespace_exports
+            .into_iter()
+            .map(|(file, symbol)| ImportedExportContribution { file, symbol })
+            .collect(),
+    }
 }
 
 fn ts_reexport_specifiers(raw_export: &str) -> Vec<ReexportSpecifier> {
@@ -1064,62 +1384,6 @@ fn ts_namespace_reexport_name(raw_export: &str) -> Option<String> {
         .next()?
         .trim_matches(|ch: char| ch == '{' || ch == '}' || ch == ';' || ch == ',');
     (!name.is_empty()).then(|| name.to_string())
-}
-
-fn rust_reexport_liveness_edges(
-    project_root: &Path,
-    file: &Path,
-    file_name: &str,
-    source: &str,
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
-    default_export_symbols_by_file: &BTreeMap<String, String>,
-) -> Vec<InternalCall> {
-    let module_files = rust_module_files(file, source);
-    let mut edges = Vec::new();
-
-    for (statement, line) in rust_pub_use_statements(source) {
-        for specifier in rust_reexport_specifiers(&statement) {
-            let Some(module_entry) = rust_module_entry(&module_files, &specifier.module_path)
-            else {
-                continue;
-            };
-
-            if specifier.imported == "*" {
-                edges.extend(reexport_edges_for_all_target_symbols(
-                    project_root,
-                    file_name,
-                    "",
-                    &module_entry,
-                    line,
-                    exported_symbols_by_file,
-                    default_export_symbols_by_file,
-                    true,
-                ));
-                continue;
-            }
-
-            if !file_exports_symbol(file_name, &specifier.exported, exported_symbols_by_file) {
-                continue;
-            }
-            if let Some((target_file, target_symbol)) = resolve_imported_export_liveness_root(
-                project_root,
-                &module_entry,
-                &specifier.imported,
-                exported_symbols_by_file,
-                default_export_symbols_by_file,
-            ) {
-                edges.push(InternalCall {
-                    caller_symbol: specifier.exported,
-                    file: target_file,
-                    symbol: target_symbol,
-                    line,
-                    provenance: CALLGRAPH_PROVENANCE_REEXPORT.to_string(),
-                });
-            }
-        }
-    }
-
-    edges
 }
 
 fn reexport_edges_for_all_target_symbols(
@@ -1167,36 +1431,6 @@ fn reexport_edges_for_all_target_symbols(
     }
 
     edges
-}
-
-fn rust_module_files(file: &Path, source: &str) -> BTreeMap<String, PathBuf> {
-    let base_dir = file.parent().unwrap_or_else(|| Path::new("."));
-    let mut modules = BTreeMap::new();
-    for line in source.lines() {
-        let trimmed = line.trim();
-        let after_visibility = trimmed
-            .strip_prefix("pub ")
-            .or_else(|| trimmed.strip_prefix("pub(crate) "))
-            .or_else(|| trimmed.strip_prefix("pub(super) "))
-            .unwrap_or(trimmed)
-            .trim_start();
-        let Some(after_mod) = after_visibility.strip_prefix("mod ") else {
-            continue;
-        };
-        let module = after_mod
-            .trim_end_matches(';')
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .trim();
-        if module.is_empty() || module.contains('{') {
-            continue;
-        }
-        if let Some(path) = resolve_rust_module_file(base_dir, module) {
-            modules.insert(module.to_string(), path);
-        }
-    }
-    modules
 }
 
 fn resolve_rust_module_file(base_dir: &Path, module: &str) -> Option<PathBuf> {
@@ -1296,14 +1530,6 @@ fn rust_normalize_module_path(module_path: &str) -> Vec<String> {
             }
         })
         .collect()
-}
-
-fn rust_module_entry(
-    module_files: &BTreeMap<String, PathBuf>,
-    module_path: &[String],
-) -> Option<PathBuf> {
-    let first = module_path.first()?;
-    module_files.get(first).cloned()
 }
 
 fn file_exports_symbol(
@@ -1410,77 +1636,6 @@ struct RustReexportSpecifier {
     module_path: Vec<String>,
     imported: String,
     exported: String,
-}
-
-fn imported_export_liveness_roots(
-    project_root: &Path,
-    file: &Path,
-    source: &str,
-    tree: &tree_sitter::Tree,
-    lang: LangId,
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
-    default_export_symbols_by_file: &BTreeMap<String, String>,
-) -> ImportedExportLiveness {
-    let import_block = parse_imports(source, tree, lang);
-    let from_dir = file.parent().unwrap_or_else(|| Path::new("."));
-    let mut root_exports: BTreeSet<ExportNode> = BTreeSet::new();
-    let mut namespace_exports: BTreeSet<ExportNode> = BTreeSet::new();
-
-    for import in &import_block.imports {
-        if import.namespace_import.is_some() {
-            if let Some(module_entry) = resolve_import_module_path(from_dir, &import.module_path) {
-                namespace_exports.extend(resolve_namespace_import_liveness_roots(
-                    project_root,
-                    &module_entry,
-                    exported_symbols_by_file,
-                    default_export_symbols_by_file,
-                ));
-            }
-        }
-
-        let Some(module_entry) = resolve_import_module_path(from_dir, &import.module_path) else {
-            continue;
-        };
-
-        for imported_name in import
-            .names
-            .iter()
-            .map(|name| specifier_imported_name(name))
-        {
-            if let Some(root) = resolve_imported_export_liveness_root(
-                project_root,
-                &module_entry,
-                imported_name,
-                exported_symbols_by_file,
-                default_export_symbols_by_file,
-            ) {
-                root_exports.insert(root);
-            }
-        }
-
-        if import.default_import.is_some() {
-            if let Some(root) = resolve_imported_export_liveness_root(
-                project_root,
-                &module_entry,
-                "default",
-                exported_symbols_by_file,
-                default_export_symbols_by_file,
-            ) {
-                root_exports.insert(root);
-            }
-        }
-    }
-
-    ImportedExportLiveness {
-        root_exports: root_exports
-            .into_iter()
-            .map(|(file, symbol)| ImportedExportContribution { file, symbol })
-            .collect(),
-        namespace_exports: namespace_exports
-            .into_iter()
-            .map(|(file, symbol)| ImportedExportContribution { file, symbol })
-            .collect(),
-    }
 }
 
 fn resolve_workspace_package_import(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
@@ -1923,6 +2078,15 @@ fn normalize_path(path: &Path) -> PathBuf {
 struct DeadCodeContribution {
     file: String,
     exports: Vec<ExportContribution>,
+    #[serde(default)]
+    facts_format_version: Option<u32>,
+    #[serde(default)]
+    raw_imports: Vec<RawImportContribution>,
+    #[serde(default)]
+    raw_reexports: Vec<RawReexportContribution>,
+    #[serde(default)]
+    oxc_facts: Option<OxcFactsContribution>,
+    #[serde(default)]
     internal_calls: Vec<InternalCallContribution>,
     #[serde(default)]
     liveness_roots: Vec<String>,
@@ -1938,6 +2102,45 @@ struct DeadCodeContribution {
     parse_errors: Vec<Value>,
     #[serde(default)]
     skipped_files: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawImportContribution {
+    source: String,
+    #[serde(default)]
+    names: Vec<String>,
+    #[serde(default)]
+    default_import: Option<String>,
+    #[serde(default)]
+    namespace_import: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawReexportContribution {
+    language: String,
+    source: String,
+    kind: String,
+    #[serde(default)]
+    imported: Option<String>,
+    #[serde(default)]
+    exported: Option<String>,
+    line: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OxcFactsContribution {
+    format_version: u32,
+    content_hash: String,
+    exports: Vec<ExportFact>,
+    imports: Vec<ImportFact>,
+    re_exports: Vec<ReExportFact>,
+    dynamic_imports: Vec<DynamicImportFact>,
+    same_file_value_references: BTreeSet<String>,
+    used_import_bindings: BTreeSet<String>,
+    type_referenced_import_bindings: BTreeSet<String>,
+    value_referenced_import_bindings: BTreeSet<String>,
+    #[serde(default)]
+    parse_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1969,6 +2172,16 @@ struct InternalCallContribution {
     caller_symbol: String,
     file: String,
     symbol: String,
+}
+
+impl From<InternalCall> for InternalCallContribution {
+    fn from(call: InternalCall) -> Self {
+        Self {
+            caller_symbol: call.caller_symbol,
+            file: call.file,
+            symbol: call.symbol,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

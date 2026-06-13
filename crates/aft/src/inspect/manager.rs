@@ -773,9 +773,6 @@ impl InspectManager {
         let mut scan_files = scan_by_relative.into_values().collect::<Vec<_>>();
         let force_reparse_files = scan_files.clone();
         if !scan_files.is_empty() {
-            if job.category == InspectCategory::DeadCode {
-                scan_files = current_by_relative.values().cloned().collect::<Vec<_>>();
-            }
             let mut scan_job = job.clone();
             scan_job.job_id = self.next_job_id.fetch_add(1, Ordering::Relaxed);
             scan_job.scope_files = scan_files.clone();
@@ -851,20 +848,21 @@ impl InspectManager {
             });
         }
 
+        let refresh_dead_code_facts = if job.category == InspectCategory::DeadCode {
+            dead_code_contributions_need_fact_refresh(cache, job)?
+        } else {
+            false
+        };
         let refresh_unused_exports_facts = if job.category == InspectCategory::UnusedExports {
             unused_exports_contributions_need_fact_refresh(cache, job)?
         } else {
             false
         };
-        if category_contributions_depend_on_entry_points(job.category)
-            || refresh_unused_exports_facts
-        {
-            // Manifest edits can change dead-code entry/public roots without
-            // touching any source file. Dead-code contributions still embed
-            // those roots, so an aggregate hash miss must refresh every current
-            // contribution before rolling up again. Unused-exports contributions
-            // store raw oxc facts; only pre-facts/version-mismatched caches need
-            // this one-time full refresh before verdicts can be recomputed.
+        if refresh_dead_code_facts || refresh_unused_exports_facts {
+            // Raw-facts contributions can be rolled up after manifest/resolver
+            // edits without re-reading source. Only legacy verdict-bearing or
+            // facts-version-mismatched caches need a one-time full refresh before
+            // verdicts/roots can be recomputed globally.
             let full_scan_files = current_by_relative.into_values().collect::<Vec<_>>();
             if !full_scan_files.is_empty() {
                 let mut rescan_job = job.clone();
@@ -1536,6 +1534,35 @@ fn load_contributions(
         })
 }
 
+fn dead_code_contributions_need_fact_refresh(
+    cache: &InspectCache,
+    job: &InspectJob,
+) -> Result<bool, String> {
+    let contributions = load_contributions(cache, job)?;
+    Ok(contributions
+        .iter()
+        .any(dead_code_contribution_needs_fact_refresh))
+}
+
+fn dead_code_contribution_needs_fact_refresh(contribution: &FileContribution) -> bool {
+    let Ok(parsed) =
+        serde_json::from_value::<DeadCodeRefreshContribution>(contribution.contribution.clone())
+    else {
+        return true;
+    };
+
+    if parsed.facts_format_version
+        != Some(super::scanners::dead_code::DEAD_CODE_FACTS_FORMAT_VERSION)
+    {
+        return true;
+    }
+
+    matches!(
+        parsed.oxc_facts,
+        Some(facts) if facts.format_version != FACTS_FORMAT_VERSION
+    )
+}
+
 fn unused_exports_contributions_need_fact_refresh(
     cache: &InspectCache,
     job: &InspectJob,
@@ -1671,13 +1698,15 @@ fn roll_up_dead_code_contributions(
     contributions: &[FileContribution],
     drill_down_limit: Option<usize>,
 ) -> Value {
-    if job.callgraph_snapshot.is_none() {
+    let Some(snapshot) = job.callgraph_snapshot.as_deref() else {
         return super::scanners::dead_code::callgraph_unavailable_aggregate(job.scope_files.len());
-    }
+    };
 
     let public_api_files = super::scanners::dead_code::collect_public_api_files(&job.project_root);
     let roles = super::entry_points::resolve_project_roles(&job.project_root);
-    super::scanners::dead_code::aggregate_dead_code_contributions_with_limit(
+    super::scanners::dead_code::aggregate_dead_code_contributions_with_snapshot(
+        &job.project_root,
+        snapshot,
         contributions,
         &public_api_files,
         &roles,
@@ -2025,6 +2054,14 @@ fn export_uses_oxc(export: &ExportContribution) -> bool {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct DeadCodeRefreshContribution {
+    #[serde(default)]
+    facts_format_version: Option<u32>,
+    #[serde(default)]
+    oxc_facts: Option<OxcFactsContribution>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct UnusedExportsContribution {
     file: String,
     exports: Vec<ExportContribution>,
@@ -2071,10 +2108,6 @@ fn category_uses_oxc(category: InspectCategory) -> bool {
         category,
         InspectCategory::DeadCode | InspectCategory::UnusedExports
     )
-}
-
-fn category_contributions_depend_on_entry_points(category: InspectCategory) -> bool {
-    matches!(category, InspectCategory::DeadCode)
 }
 
 fn skipped_languages(files: &[PathBuf], mode: LanguageSkipMode) -> Vec<String> {

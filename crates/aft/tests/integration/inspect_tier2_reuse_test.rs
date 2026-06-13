@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use aft::callgraph_store::CallGraphStore;
 use aft::config::Config;
 use aft::inspect::{InspectCategory, InspectManager, InspectScanSuccess, InspectSnapshot};
 use aft::parser::SymbolCache;
@@ -103,6 +104,92 @@ fn relative_paths(project_root: &Path, files: &[PathBuf]) -> Vec<String> {
                 .replace('\\', "/")
         })
         .collect()
+}
+
+fn project_source_files(project_root: &Path) -> Vec<PathBuf> {
+    fn visit(dir: &Path, files: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("."))
+            {
+                continue;
+            }
+            if path.is_dir() {
+                visit(&path, files);
+            } else if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| {
+                    matches!(
+                        ext,
+                        "ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs" | "rs"
+                    )
+                })
+            {
+                files.push(path);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    visit(project_root, &mut files);
+    files.sort();
+    files
+}
+
+fn rebuild_dead_code_callgraph_store(project_root: &Path, inspect_dir: &Path) {
+    let store_dir = inspect_dir
+        .parent()
+        .expect("inspect dir has parent")
+        .join("callgraph");
+    let store = CallGraphStore::open(store_dir, project_root.to_path_buf()).expect("open store");
+    let files = project_source_files(project_root);
+    store
+        .cold_build(&files)
+        .expect("cold build callgraph store");
+}
+
+fn contribution_payloads(
+    project_root: &Path,
+    success: &InspectScanSuccess,
+) -> Vec<(String, Value)> {
+    let mut payloads = success
+        .contributions
+        .iter()
+        .map(|contribution| {
+            let relative = contribution
+                .file_path
+                .strip_prefix(project_root)
+                .unwrap_or(&contribution.file_path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            (relative, contribution.contribution.clone())
+        })
+        .collect::<Vec<_>>();
+    payloads.sort_by(|left, right| left.0.cmp(&right.0));
+    payloads
+}
+
+fn aggregate_item_symbols(success: &InspectScanSuccess) -> Vec<(String, String)> {
+    let mut symbols = success.aggregate["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            Some((
+                item.get("file")?.as_str()?.to_string(),
+                item.get("symbol")?.as_str()?.to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    symbols.sort();
+    symbols
 }
 
 #[test]
@@ -235,6 +322,333 @@ where
         unused_contribution_payloads(&root, &warm),
         unused_contribution_payloads(&root, &cold),
         "{name}: per-file contribution payload mismatch"
+    );
+}
+
+fn assert_dead_code_incremental_matches_cold<S, E>(
+    name: &str,
+    setup: S,
+    edit: E,
+    expected_scanned_after_edit: &[&str],
+) where
+    S: FnOnce(&Path),
+    E: FnOnce(&Path),
+{
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root = temp_dir.path().join(format!("dead-code-project-{name}"));
+    fs::create_dir_all(&root).expect("create project");
+    setup(&root);
+
+    let warm_inspect_dir = temp_dir.path().join(format!("warm-{name}/inspect"));
+    rebuild_dead_code_callgraph_store(&root, &warm_inspect_dir);
+    let warm_manager = InspectManager::new();
+    let (first, _first_elapsed) = run_reuse_category(
+        &warm_manager,
+        snapshot(&root, &warm_inspect_dir),
+        InspectCategory::DeadCode,
+    );
+    assert_eq!(
+        first.aggregate["callgraph_available"], true,
+        "{name}: callgraph store should be available"
+    );
+    assert!(
+        !first.contributions.is_empty(),
+        "{name}: initial cold scan should populate contributions"
+    );
+
+    edit(&root);
+    rebuild_dead_code_callgraph_store(&root, &warm_inspect_dir);
+
+    let (warm, _warm_elapsed) = run_reuse_category(
+        &warm_manager,
+        snapshot(&root, &warm_inspect_dir),
+        InspectCategory::DeadCode,
+    );
+    let cold_inspect_dir = temp_dir.path().join(format!("cold-{name}/inspect"));
+    rebuild_dead_code_callgraph_store(&root, &cold_inspect_dir);
+    let cold_manager = InspectManager::new();
+    let (cold, _cold_elapsed) = run_reuse_category(
+        &cold_manager,
+        snapshot(&root, &cold_inspect_dir),
+        InspectCategory::DeadCode,
+    );
+
+    assert_eq!(
+        relative_paths(&root, &warm.scanned_files),
+        expected_scanned_after_edit,
+        "{name}: edited source reparses should stay minimal"
+    );
+    assert_eq!(warm.aggregate, cold.aggregate, "{name}: aggregate mismatch");
+    assert_eq!(
+        contribution_payloads(&root, &warm),
+        contribution_payloads(&root, &cold),
+        "{name}: raw per-file contribution payload mismatch"
+    );
+}
+
+#[test]
+fn inspect_dead_code_incremental_facts_invariants_match_cold() {
+    assert_dead_code_incremental_matches_cold(
+        "ts_last_importer_removed",
+        |root| {
+            write_file(root, "package.json", r#"{"main":"src/main.ts"}"#);
+            write_file(
+                root,
+                "src/exported.ts",
+                "export const used = 1;\nexport const dead = 2;\n",
+            );
+            write_file(
+                root,
+                "src/main.ts",
+                "import { used } from './exported';\nexport function main() { console.log(used); }\n",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "src/main.ts",
+                "export function main() { console.log('removed'); }\n",
+            );
+        },
+        &["src/main.ts"],
+    );
+
+    assert_dead_code_incremental_matches_cold(
+        "ts_importer_deleted",
+        |root| {
+            write_file(root, "package.json", r#"{"main":"src/main.ts"}"#);
+            write_file(root, "src/exported.ts", "export const used = 1;\n");
+            write_file(
+                root,
+                "src/main.ts",
+                "import { used } from './exported';\nconsole.log(used);\n",
+            );
+        },
+        |root| {
+            fs::remove_file(root.join("src/main.ts")).expect("delete importer");
+        },
+        &[],
+    );
+
+    assert_dead_code_incremental_matches_cold(
+        "ts_file_renamed",
+        |root| {
+            write_file(root, "package.json", r#"{"main":"src/main.ts"}"#);
+            write_file(root, "src/exported.ts", "export const used = 1;\n");
+            write_file(
+                root,
+                "src/main.ts",
+                "import { used } from './exported';\nconsole.log(used);\n",
+            );
+        },
+        |root| {
+            fs::create_dir_all(root.join("src/moved")).expect("create moved dir");
+            fs::rename(
+                root.join("src/exported.ts"),
+                root.join("src/moved/exported.ts"),
+            )
+            .expect("rename exported file");
+        },
+        &["src/moved/exported.ts"],
+    );
+
+    assert_dead_code_incremental_matches_cold(
+        "tsconfig_alias_change",
+        |root| {
+            write_file(root, "package.json", r#"{"main":"src/main.ts"}"#);
+            write_file(
+                root,
+                "tsconfig.json",
+                r#"{"compilerOptions":{"baseUrl":".","paths":{"@lib":["src/a.ts"]}}}"#,
+            );
+            write_file(root, "src/a.ts", "export const x = 'a';\n");
+            write_file(root, "src/b.ts", "export const x = 'b';\n");
+            write_file(
+                root,
+                "src/main.ts",
+                "import { x } from '@lib';\nexport function main() { console.log(x); }\n",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "tsconfig.json",
+                r#"{"compilerOptions":{"baseUrl":".","paths":{"@lib":["src/b.ts"]}}}"#,
+            );
+        },
+        &["tsconfig.json"],
+    );
+
+    assert_dead_code_incremental_matches_cold(
+        "ts_barrel_target_changed",
+        |root| {
+            write_file(root, "package.json", r#"{"main":"src/barrel.ts"}"#);
+            write_file(
+                root,
+                "src/target.ts",
+                "export const named = 1;\nexport default function def() { return named; }\n",
+            );
+            write_file(root, "src/extra.ts", "export const star = 1;\n");
+            write_file(
+                root,
+                "src/barrel.ts",
+                "export { named } from './target';\nexport { default } from './target';\nexport * from './extra';\nexport * as ns from './target';\n",
+            );
+        },
+        |root| {
+            write_file(
+                root,
+                "src/target.ts",
+                "export const named = 1;\nexport const added = 2;\nexport default function def() { return named + added; }\n",
+            );
+        },
+        &["src/target.ts"],
+    );
+
+    assert_dead_code_incremental_matches_cold(
+        "rust_last_importer_removed",
+        |root| {
+            write_file(
+                root,
+                "Cargo.toml",
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+            );
+            write_file(
+                root,
+                "src/main.rs",
+                "mod helper;\nfn main() { helper::used(); }\n",
+            );
+            write_file(
+                root,
+                "src/helper.rs",
+                "pub fn used() {}\npub fn dead() {}\n",
+            );
+        },
+        |root| {
+            write_file(root, "src/main.rs", "mod helper;\nfn main() {}\n");
+        },
+        &["src/main.rs"],
+    );
+
+    assert_dead_code_incremental_matches_cold(
+        "rust_importer_deleted",
+        |root| {
+            write_file(
+                root,
+                "Cargo.toml",
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+            );
+            write_file(
+                root,
+                "src/main.rs",
+                "mod helper;\nfn main() { helper::used(); }\n",
+            );
+            write_file(root, "src/helper.rs", "pub fn used() {}\n");
+        },
+        |root| {
+            fs::remove_file(root.join("src/main.rs")).expect("delete rust importer");
+        },
+        &[],
+    );
+
+    assert_dead_code_incremental_matches_cold(
+        "rust_pub_use_target_changed",
+        |root| {
+            write_file(
+                root,
+                "Cargo.toml",
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+            );
+            write_file(root, "src/lib.rs", "pub use foo::Foo;\nmod foo;\n");
+            write_file(root, "src/foo.rs", "pub struct Foo;\npub struct Dead;\n");
+        },
+        |root| {
+            write_file(
+                root,
+                "src/foo.rs",
+                "pub struct Foo;\npub struct Dead;\npub struct Added;\n",
+            );
+        },
+        &["src/foo.rs"],
+    );
+
+    assert_dead_code_incremental_matches_cold(
+        "cross_file_type_ref_removed",
+        |root| {
+            write_file(
+                root,
+                "src/types.ts",
+                "export interface Widget { id: string }\n",
+            );
+            write_file(
+                root,
+                "src/use.ts",
+                "import type { Widget } from './types';\ntype Box = Widget;\n",
+            );
+        },
+        |root| {
+            write_file(root, "src/use.ts", "type Box = string;\n");
+        },
+        &["src/use.ts"],
+    );
+
+    assert_dead_code_incremental_matches_cold(
+        "manifest_entry_point_changed",
+        |root| {
+            write_file(root, "package.json", r#"{"main":"src/a.ts"}"#);
+            write_file(root, "src/a.ts", "export function a() {}\n");
+            write_file(root, "src/b.ts", "export function b() {}\n");
+        },
+        |root| {
+            write_file(root, "package.json", r#"{"main":"src/b.ts"}"#);
+        },
+        &["package.json"],
+    );
+}
+
+#[test]
+fn inspect_dead_code_twice_cold_is_deterministic() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root = temp_dir.path().join("dead-code-twice-cold");
+    fs::create_dir_all(&root).expect("create project");
+    write_file(root.as_path(), "package.json", r#"{"main":"src/main.ts"}"#);
+    write_file(
+        root.as_path(),
+        "src/main.ts",
+        "import { live } from './live';\nexport function main() { live(); }\n",
+    );
+    write_file(
+        root.as_path(),
+        "src/live.ts",
+        "export function live() {}\nexport function unused() {}\n",
+    );
+
+    let inspect_a = temp_dir.path().join("dead-cold-a/inspect");
+    rebuild_dead_code_callgraph_store(&root, &inspect_a);
+    let manager_a = InspectManager::new();
+    let (cold_a, _elapsed_a) = run_reuse_category(
+        &manager_a,
+        snapshot(&root, &inspect_a),
+        InspectCategory::DeadCode,
+    );
+
+    let inspect_b = temp_dir.path().join("dead-cold-b/inspect");
+    rebuild_dead_code_callgraph_store(&root, &inspect_b);
+    let manager_b = InspectManager::new();
+    let (cold_b, _elapsed_b) = run_reuse_category(
+        &manager_b,
+        snapshot(&root, &inspect_b),
+        InspectCategory::DeadCode,
+    );
+
+    assert_eq!(cold_a.aggregate, cold_b.aggregate);
+    assert_eq!(
+        contribution_payloads(&root, &cold_a),
+        contribution_payloads(&root, &cold_b)
+    );
+    assert_eq!(
+        aggregate_item_symbols(&cold_a),
+        aggregate_item_symbols(&cold_b)
     );
 }
 

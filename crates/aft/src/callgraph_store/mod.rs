@@ -1189,6 +1189,14 @@ impl CallGraphStore {
             .as_deref()
             .map(|signature| callgraph::extract_parameters(signature, callers.target.lang))
             .unwrap_or_default();
+        let mut source_lines_by_file: HashMap<String, Option<Vec<String>>> = HashMap::new();
+        for site in &callers.callers {
+            source_lines_by_file
+                .entry(site.caller.file.clone())
+                .or_insert_with(|| {
+                    read_trimmed_source_lines(&self.project_root.join(&site.caller.file))
+                });
+        }
         let enriched = callers
             .callers
             .iter()
@@ -1196,10 +1204,11 @@ impl CallGraphStore {
                 site: site.clone(),
                 signature: site.caller.signature.clone(),
                 is_entry_point: site.caller.is_entry_point,
-                call_expression: read_source_line(
-                    &self.project_root.join(&site.caller.file),
-                    site.line,
-                ),
+                call_expression: source_lines_by_file
+                    .get(&site.caller.file)
+                    .and_then(|lines| lines.as_ref())
+                    .and_then(|lines| lines.get(site.line.saturating_sub(1) as usize))
+                    .cloned(),
                 parameters: site
                     .caller
                     .signature
@@ -1546,36 +1555,38 @@ fn nodes_matching_symbol(conn: &Connection, symbol: &str) -> Result<Vec<StoreNod
         .map_err(Into::into)
 }
 
-fn load_node_by_id(conn: &Connection, node_id: &str) -> Result<Option<StoreNode>> {
-    conn.query_row(
-        "SELECT n.id, n.file_path, n.scoped_name, n.name, n.kind, n.start_line, n.end_line,
-                n.signature, n.exported, n.is_callgraph_entry_point, f.lang
-         FROM nodes n JOIN files f ON f.path = n.file_path
-         WHERE n.id = ?1",
-        params![node_id],
-        store_node_from_row,
-    )
-    .optional()
-    .map_err(Into::into)
+fn store_node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreNode> {
+    store_node_from_row_at(row, 0)
 }
 
-fn store_node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreNode> {
-    let start_line: u32 = row.get::<_, i64>(5)?.max(0) as u32;
-    let end_line: u32 = row.get::<_, i64>(6)?.max(0) as u32;
-    let lang_label_value: String = row.get(10)?;
+fn store_node_from_row_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<StoreNode> {
+    let start_line: u32 = row.get::<_, i64>(offset + 5)?.max(0) as u32;
+    let end_line: u32 = row.get::<_, i64>(offset + 6)?.max(0) as u32;
+    let lang_label_value: String = row.get(offset + 10)?;
     Ok(StoreNode {
-        node_id: row.get(0)?,
-        file: row.get(1)?,
-        symbol: row.get(2)?,
-        name: row.get(3)?,
-        kind: row.get(4)?,
+        node_id: row.get(offset)?,
+        file: row.get(offset + 1)?,
+        symbol: row.get(offset + 2)?,
+        name: row.get(offset + 3)?,
+        kind: row.get(offset + 4)?,
         line: start_line.saturating_add(1),
         end_line: end_line.saturating_add(1),
-        signature: row.get(7)?,
-        exported: row.get::<_, i64>(8)? != 0,
-        is_entry_point: row.get::<_, i64>(9)? != 0,
+        signature: row.get(offset + 7)?,
+        exported: row.get::<_, i64>(offset + 8)? != 0,
+        is_entry_point: row.get::<_, i64>(offset + 9)? != 0,
         lang: lang_from_label(&lang_label_value).unwrap_or(LangId::TypeScript),
     })
+}
+
+fn optional_store_node_from_row_at(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<Option<StoreNode>> {
+    if row.get::<_, Option<String>>(offset)?.is_some() {
+        store_node_from_row_at(row, offset).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1636,120 +1647,84 @@ fn direct_callers_for_tuple(
     target_symbol: &str,
 ) -> Result<Vec<StoreCallSite>> {
     let mut stmt = conn.prepare(
-        "SELECT e.source_node, e.target_node, e.target_file, e.target_symbol, e.line,
-                r.byte_start, r.byte_end, r.status, e.provenance
-         FROM edges e JOIN refs r ON r.ref_id = e.ref_id
+        "SELECT e.target_file, e.target_symbol, e.line,
+                r.byte_start, r.byte_end, r.status, e.provenance,
+                src.id, src.file_path, src.scoped_name, src.name, src.kind, src.start_line,
+                src.end_line, src.signature, src.exported, src.is_callgraph_entry_point,
+                src_file.lang,
+                tgt.id, tgt.file_path, tgt.scoped_name, tgt.name, tgt.kind, tgt.start_line,
+                tgt.end_line, tgt.signature, tgt.exported, tgt.is_callgraph_entry_point,
+                tgt_file.lang
+         FROM edges e
+         JOIN refs r ON r.ref_id = e.ref_id
+         JOIN nodes src ON src.id = e.source_node
+         JOIN files src_file ON src_file.path = src.file_path
+         LEFT JOIN (nodes tgt JOIN files tgt_file ON tgt_file.path = tgt.file_path)
+             ON tgt.id = e.target_node
          WHERE e.kind = 'call' AND e.target_file = ?1 AND e.target_symbol = ?2
          ORDER BY e.source_node, r.byte_start, r.line, r.ref_id",
     )?;
     let rows = stmt.query_map(params![target_file, target_symbol], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, i64>(5)?,
-            row.get::<_, i64>(6)?,
-            row.get::<_, String>(7)?,
-            row.get::<_, String>(8)?,
-        ))
-    })?;
-
-    let mut sites = Vec::new();
-    for row in rows {
-        let (
-            source_node,
-            target_node,
-            target_file,
-            target_symbol,
-            line,
-            byte_start,
-            byte_end,
-            status,
-            provenance,
-        ) = row?;
-        let Some(caller) = load_node_by_id(conn, &source_node)? else {
-            continue;
-        };
-        let target = target_node
-            .as_deref()
-            .map(|node_id| load_node_by_id(conn, node_id))
-            .transpose()?
-            .flatten();
-        sites.push(StoreCallSite {
+        let caller = store_node_from_row_at(row, 7)?;
+        let target = optional_store_node_from_row_at(row, 18)?;
+        Ok(StoreCallSite {
             caller,
-            target_file,
-            target_symbol,
+            target_file: row.get(0)?,
+            target_symbol: row.get(1)?,
             target,
-            line: line.max(0) as u32,
-            byte_start: byte_start.max(0) as usize,
-            byte_end: byte_end.max(0) as usize,
-            resolved: status == "resolved",
-            provenance,
-        });
-    }
-    Ok(sites)
+            line: row.get::<_, i64>(2)?.max(0) as u32,
+            byte_start: row.get::<_, i64>(3)?.max(0) as usize,
+            byte_end: row.get::<_, i64>(4)?.max(0) as usize,
+            resolved: row.get::<_, String>(5)? == "resolved",
+            provenance: row.get(6)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 fn outgoing_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
     let mut stmt = conn.prepare(
-        "SELECT e.target_node, e.target_file, e.target_symbol, e.line,
-                r.byte_start, r.byte_end, r.status, e.provenance
-         FROM edges e JOIN refs r ON r.ref_id = e.ref_id
+        "SELECT e.target_file, e.target_symbol, e.line,
+                r.byte_start, r.byte_end, r.status, e.provenance,
+                tgt.id, tgt.file_path, tgt.scoped_name, tgt.name, tgt.kind, tgt.start_line,
+                tgt.end_line, tgt.signature, tgt.exported, tgt.is_callgraph_entry_point,
+                tgt_file.lang
+         FROM edges e
+         JOIN refs r ON r.ref_id = e.ref_id
+         LEFT JOIN (nodes tgt JOIN files tgt_file ON tgt_file.path = tgt.file_path)
+             ON tgt.id = e.target_node
          WHERE e.kind = 'call' AND e.source_node = ?1
          ORDER BY r.byte_start, r.line, r.ref_id",
     )?;
     let rows = stmt.query_map(params![node.node_id], |row| {
-        Ok((
-            row.get::<_, Option<String>>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, i64>(5)?,
-            row.get::<_, String>(6)?,
-            row.get::<_, String>(7)?,
-        ))
-    })?;
-
-    let mut calls = Vec::new();
-    for row in rows {
-        let (
-            target_node,
-            target_file,
-            target_symbol,
-            line,
-            byte_start,
-            byte_end,
-            status,
-            provenance,
-        ) = row?;
-        let target = target_node
-            .as_deref()
-            .map(|node_id| load_node_by_id(conn, node_id))
-            .transpose()?
-            .flatten();
-        calls.push(StoreCallSite {
+        let target = optional_store_node_from_row_at(row, 7)?;
+        Ok(StoreCallSite {
             caller: node.clone(),
-            target_file,
-            target_symbol,
+            target_file: row.get(0)?,
+            target_symbol: row.get(1)?,
             target,
-            line: line.max(0) as u32,
-            byte_start: byte_start.max(0) as usize,
-            byte_end: byte_end.max(0) as usize,
-            resolved: status == "resolved",
-            provenance,
-        });
-    }
-    Ok(calls)
+            line: row.get::<_, i64>(2)?.max(0) as u32,
+            byte_start: row.get::<_, i64>(3)?.max(0) as usize,
+            byte_end: row.get::<_, i64>(4)?.max(0) as usize,
+            resolved: row.get::<_, String>(5)? == "resolved",
+            provenance: row.get(6)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 fn resolved_self_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
     let mut stmt = conn.prepare(
-        "SELECT r.target_node, r.target_file, r.target_symbol, r.line,
-                r.byte_start, r.byte_end, r.status, r.provenance
+        "SELECT r.target_file, r.target_symbol, r.line,
+                r.byte_start, r.byte_end, r.status, r.provenance,
+                tgt.id, tgt.file_path, tgt.scoped_name, tgt.name, tgt.kind, tgt.start_line,
+                tgt.end_line, tgt.signature, tgt.exported, tgt.is_callgraph_entry_point,
+                tgt_file.lang
          FROM refs r
+         LEFT JOIN (nodes tgt JOIN files tgt_file ON tgt_file.path = tgt.file_path)
+             ON tgt.id = r.target_node
          WHERE r.caller_node = ?1
            AND r.kind = 'call'
            AND r.status <> 'unresolved'
@@ -1769,49 +1744,22 @@ fn resolved_self_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<V
             PROVENANCE_TREESITTER
         ],
         |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-            ))
+            let target = optional_store_node_from_row_at(row, 7)?;
+            Ok(StoreCallSite {
+                caller: node.clone(),
+                target_file: row.get(0)?,
+                target_symbol: row.get(1)?,
+                target,
+                line: row.get::<_, i64>(2)?.max(0) as u32,
+                byte_start: row.get::<_, i64>(3)?.max(0) as usize,
+                byte_end: row.get::<_, i64>(4)?.max(0) as usize,
+                resolved: row.get::<_, String>(5)? == "resolved",
+                provenance: row.get(6)?,
+            })
         },
     )?;
-
-    let mut calls = Vec::new();
-    for row in rows {
-        let (
-            target_node,
-            target_file,
-            target_symbol,
-            line,
-            byte_start,
-            byte_end,
-            status,
-            provenance,
-        ) = row?;
-        let target = target_node
-            .as_deref()
-            .map(|node_id| load_node_by_id(conn, node_id))
-            .transpose()?
-            .flatten();
-        calls.push(StoreCallSite {
-            caller: node.clone(),
-            target_file,
-            target_symbol,
-            target,
-            line: line.max(0) as u32,
-            byte_start: byte_start.max(0) as usize,
-            byte_end: byte_end.max(0) as usize,
-            resolved: status == "resolved",
-            provenance,
-        });
-    }
-    Ok(calls)
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 fn unresolved_calls_for_node(
@@ -1971,12 +1919,9 @@ fn symbol_query_matches(symbol: &str, query: &str) -> bool {
     symbol == query || unqualified_name(symbol) == query
 }
 
-fn read_source_line(path: &Path, line: u32) -> Option<String> {
+fn read_trimmed_source_lines(path: &Path) -> Option<Vec<String>> {
     let source = std::fs::read_to_string(path).ok()?;
-    source
-        .lines()
-        .nth(line.saturating_sub(1) as usize)
-        .map(|line| line.trim().to_string())
+    Some(source.lines().map(|line| line.trim().to_string()).collect())
 }
 
 #[doc(hidden)]
@@ -2696,7 +2641,7 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
     let rel_path = relative_path(project_root, &abs_path);
     let source = std::fs::read_to_string(&abs_path)?;
     let freshness = collect_source_freshness(&abs_path, &source)?;
-    let data = callgraph::build_file_data(&abs_path)?;
+    let data = callgraph::build_file_data_from_source(&abs_path, &source)?;
     let lang = data.lang;
     let mut nodes = build_node_records(&rel_path, &source, &data)?;
     let node_by_scoped: HashMap<String, String> = nodes
@@ -2714,11 +2659,13 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
         &node_by_scoped,
         &import_dependencies,
     ));
+    let line_index = LineIndex::new(&source);
     raw_refs.extend(build_import_refs(
         project_root,
         &abs_path,
         &rel_path,
         &data.import_block.imports,
+        &line_index,
     ));
     let mut surface_parts = reexports.surface_parts;
     surface_parts.extend(source_less_exports.surface_parts);
@@ -2896,6 +2843,7 @@ fn build_import_refs(
     abs_path: &Path,
     rel_path: &str,
     imports: &[ImportStatement],
+    line_index: &LineIndex,
 ) -> Vec<RawRef> {
     let mut refs = Vec::new();
     for (index, import) in imports.iter().enumerate() {
@@ -2924,7 +2872,7 @@ fn build_import_refs(
             requested_name: empty_to_none(requested_name),
             namespace_alias: import.namespace_import.clone(),
             wildcard: import_is_wildcard(import),
-            line: byte_to_line(abs_path, import.byte_range.start).unwrap_or(1),
+            line: line_index.byte_to_line(import.byte_range.start),
             byte_start: import.byte_range.start,
             byte_end: import.byte_range.end,
             dependencies: module_dependencies(project_root, abs_path, &import.module_path),
@@ -6507,15 +6455,30 @@ fn hex_to_bytes(value: &str) -> Option<[u8; 32]> {
     Some(bytes)
 }
 
-fn byte_to_line(path: &Path, byte_offset: usize) -> Option<u32> {
-    let source = std::fs::read_to_string(path).ok()?;
-    Some(
-        source[..byte_offset.min(source.len())]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count() as u32
-            + 1,
-    )
+#[derive(Debug, Clone)]
+struct LineIndex {
+    newline_offsets: Vec<usize>,
+    source_len: usize,
+}
+
+impl LineIndex {
+    fn new(source: &str) -> Self {
+        Self {
+            newline_offsets: source
+                .bytes()
+                .enumerate()
+                .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset))
+                .collect(),
+            source_len: source.len(),
+        }
+    }
+
+    fn byte_to_line(&self, byte_offset: usize) -> u32 {
+        let byte_offset = byte_offset.min(self.source_len);
+        self.newline_offsets
+            .partition_point(|offset| *offset < byte_offset) as u32
+            + 1
+    }
 }
 
 fn empty_to_none(value: String) -> Option<String> {

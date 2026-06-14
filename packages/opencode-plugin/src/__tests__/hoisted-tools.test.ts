@@ -1007,6 +1007,126 @@ describe("Hoisted tool execute handlers", () => {
     );
   });
 
+  test("apply_patch metadata collapses delete+add on the same path into one net diff", async () => {
+    tmpDir = await makeTempDir();
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const targetFile = resolve(tmpDir, "replace.ts");
+    await writeFile(targetFile, "export const value = 1;\n");
+
+    const patchText = [
+      "*** Begin Patch",
+      "*** Delete File: replace.ts",
+      "*** Add File: replace.ts",
+      "+export const value = 2;",
+      "*** End Patch",
+    ].join("\n");
+
+    const { tools } = createMockHoistedHarness(async (command, params) => {
+      if (command === "checkpoint") return { success: true };
+      if (command === "delete_file") {
+        await rm(params.file as string, { force: true });
+        return { success: true };
+      }
+      if (command === "write") {
+        await writeFile(params.file as string, params.content as string);
+        return { success: true };
+      }
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const result = (await tools.apply_patch.execute({ patchText }, sdkCtx)) as {
+      output: string;
+      title: string;
+      metadata: {
+        diff: string;
+        files: Array<{
+          relativePath: string;
+          type: string;
+          additions: number;
+          deletions: number;
+          patch: string;
+        }>;
+      };
+    };
+
+    expect(result.output).toContain("Deleted replace.ts");
+    expect(result.output).toContain("Created replace.ts");
+    expect(result.metadata.files).toHaveLength(1);
+    const file = result.metadata.files[0];
+    expect(file.relativePath).toBe("replace.ts");
+    expect(file.type).toBe("update");
+    expect(file.additions).toBe(1);
+    expect(file.deletions).toBe(1);
+    expect(file.patch).toContain("-export const value = 1;");
+    expect(file.patch).toContain("+export const value = 2;");
+    expect(result.metadata.diff).toBe(file.patch);
+    expect(result.title).toContain("M replace.ts");
+    expect(result.title).not.toContain("D replace.ts");
+    expect(result.title).not.toContain("A replace.ts");
+  });
+
+  test("apply_patch metadata keeps an earlier same-path delete when a later add fails", async () => {
+    tmpDir = await makeTempDir();
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const targetFile = resolve(tmpDir, "replace.ts");
+    await writeFile(targetFile, "export const value = 1;\n");
+
+    const patchText = [
+      "*** Begin Patch",
+      "*** Delete File: replace.ts",
+      "*** Add File: replace.ts",
+      "+export const value = 2;",
+      "*** End Patch",
+    ].join("\n");
+
+    const { tools } = createMockHoistedHarness(async (command, params) => {
+      if (command === "checkpoint") return { success: true };
+      if (command === "delete_file") {
+        await rm(params.file as string, { force: true });
+        return { success: true };
+      }
+      if (command === "write") {
+        return { success: false, message: "simulated write failure" };
+      }
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const result = (await tools.apply_patch.execute({ patchText }, sdkCtx)) as {
+      output: string;
+      title: string;
+      metadata: {
+        diff: string;
+        files: Array<{
+          relativePath: string;
+          type: string;
+          additions: number;
+          deletions: number;
+          patch: string;
+        }>;
+      };
+    };
+
+    expect(result.output).toContain("Deleted replace.ts");
+    expect(result.output).toContain("Failed to create replace.ts: simulated write failure");
+    expect(result.output).toContain("Patch partially applied");
+    expect(result.output).toContain("1 of 2 hunk(s) succeeded");
+    expect(existsSync(targetFile)).toBe(false);
+
+    expect(result.metadata.files).toHaveLength(1);
+    const file = result.metadata.files[0];
+    expect(file.relativePath).toBe("replace.ts");
+    expect(file.type).toBe("delete");
+    expect(file.additions).toBe(0);
+    expect(file.deletions).toBe(1);
+    expect(file.patch).toContain("-export const value = 1;");
+    expect(file.patch).not.toContain("+export const value = 2;");
+    expect(result.metadata.diff).toBe(file.patch);
+    expect(result.title).toContain("Partially applied (1 of 2)");
+    expect(result.title).toContain("D replace.ts");
+  });
+
   test("apply_patch restores checkpoint when move source delete fails", async () => {
     tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);

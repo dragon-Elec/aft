@@ -1216,16 +1216,20 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
       // the per-file commit semantics, just done by hand. The ergonomic
       // fix is to give them per-file commit out of the box.
       const results: string[] = [];
-      const failures: string[] = [];
-      const perFileDiffs: Array<{
+      const failures: Array<{ index: number; path: string }> = [];
+      const appliedHunkResults: Array<{
+        index: number;
+        hunk: PatchHunk;
         filePath: string;
+        displayPath: string;
+        movePath?: string;
         before: string;
         after: string;
         additions: number;
         deletions: number;
       }> = [];
 
-      for (const hunk of hunks) {
+      for (const [hunkIndex, hunk] of hunks.entries()) {
         const filePath = resolvePathFromProjectRoot(projectRoot, hunk.path);
 
         switch (hunk.type) {
@@ -1240,7 +1244,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
             if (fs.existsSync(filePath)) {
               const msg = `Failed to create ${hunk.path}: file already exists. Use *** Update File: to modify, or *** Delete File: first if you want to replace it entirely.`;
               results.push(msg);
-              failures.push(hunk.path);
+              failures.push({ index: hunkIndex, path: hunk.path });
               break;
             }
             try {
@@ -1268,10 +1272,13 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
               const wrDiff = writeResult.diff as
                 | { before?: string; after?: string; additions?: number; deletions?: number }
                 | undefined;
-              perFileDiffs.push({
+              appliedHunkResults.push({
+                index: hunkIndex,
+                hunk,
                 filePath,
+                displayPath: filePath,
                 before: "",
-                after: hunk.contents,
+                after: content,
                 // For a brand-new file, additions = total lines, deletions = 0.
                 // Prefer Rust counts; fall back to a content line count if the
                 // bridge didn't include a diff (e.g. older binary).
@@ -1282,7 +1289,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
             } catch (e) {
               const msg = `Failed to create ${hunk.path}: ${e instanceof Error ? e.message : e}`;
               results.push(msg);
-              failures.push(hunk.path);
+              failures.push({ index: hunkIndex, path: hunk.path });
               // The write may have left a partial file on disk for an `add`
               // hunk. Best-effort cleanup so we don't leave orphan partials.
               // (Failures here are tolerated: the agent will see the
@@ -1310,8 +1317,11 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
               }
               // delete_file doesn't return a diff. The counts are unambiguous:
               // every prior line is a deletion; nothing is added.
-              perFileDiffs.push({
+              appliedHunkResults.push({
+                index: hunkIndex,
+                hunk,
                 filePath,
+                displayPath: filePath,
                 before,
                 after: "",
                 additions: 0,
@@ -1320,7 +1330,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
               results.push(`Deleted ${hunk.path}`);
             } catch (e) {
               results.push(`Failed to delete ${hunk.path}: ${e instanceof Error ? e.message : e}`);
-              failures.push(hunk.path);
+              failures.push({ index: hunkIndex, path: hunk.path });
             }
             break;
           }
@@ -1393,13 +1403,17 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
                       additions: wrDiff.additions,
                       deletions: wrDiff.deletions,
                     };
-              perFileDiffs.push({
+              const appliedHunkResult = {
+                index: hunkIndex,
+                hunk,
                 filePath,
+                displayPath: targetPath,
+                ...(hunk.move_path ? { movePath: targetPath } : {}),
                 before: original,
                 after: newContent,
                 additions,
                 deletions,
-              });
+              };
 
               if (hunk.move_path) {
                 try {
@@ -1445,13 +1459,15 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
                     `source delete failed after writing move destination; restored pre-patch checkpoint ${checkpointName}: ${formatError(deleteError)}`,
                   );
                 }
+                appliedHunkResults.push(appliedHunkResult);
                 results.push(`Updated and moved ${hunk.path} → ${hunk.move_path}`);
               } else {
+                appliedHunkResults.push(appliedHunkResult);
                 results.push(`Updated ${hunk.path}`);
               }
             } catch (e) {
               results.push(`Failed to update ${hunk.path}: ${e instanceof Error ? e.message : e}`);
-              failures.push(hunk.path);
+              failures.push({ index: hunkIndex, path: hunk.path });
               break;
             }
             break;
@@ -1479,9 +1495,10 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
       // scanning the per-hunk lines.
       if (failures.length > 0) {
         const partial = failures.length < hunks.length;
+        const failedList = failures.map((failure) => failure.path).join(", ");
         const summary = partial
-          ? `Patch partially applied — ${hunks.length - failures.length} of ${hunks.length} hunk(s) succeeded. Failed: ${failures.join(", ")}. Successful changes are kept; use \`aft_safety\` to revert if you want to abort.`
-          : `Patch failed — none of the ${hunks.length} hunk(s) applied: ${failures.join(", ")}.`;
+          ? `Patch partially applied — ${hunks.length - failures.length} of ${hunks.length} hunk(s) succeeded. Failed: ${failedList}. Successful changes are kept; use \`aft_safety\` to revert if you want to abort.`
+          : `Patch failed — none of the ${hunks.length} hunk(s) applied: ${failedList}.`;
         results.push(summary);
         // Total-failure case: throw so OpenCode marks the tool call as errored
         // in the UI (state.status = "error") and the agent's retry loop sees
@@ -1505,71 +1522,96 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
       // apply_patch shape). Replaces the old metadata-store + after-hook merge
       // that intermittently lost diffs under duplicate plugin loads (#96).
       {
-        // Index per-file diffs by absolute filePath for fast lookup when
-        // building the metadata.files array. Each entry NEEDS to carry the
-        // per-file `patch` string plus `additions`/`deletions` counts —
-        // OpenCode's UI patchFile() at packages/ui/src/components/apply-patch-file.ts
-        // returns undefined for any file metadata that lacks all of `patch`,
-        // `before`, and `after`. Without this enrichment, the UI silently
-        // dropped every file entry and rendered no diffs (v0.15.2 fix for
-        // the "apply_patch shows no diff in TUI/UI" report).
-        const diffByPath = new Map(perFileDiffs.map((d) => [d.filePath, d]));
+        // Build one UI row per reported file path, but keep success/failure
+        // accounting per hunk. Same-path multi-hunk patches (for example
+        // delete+add replacement) should render the net before→after diff, not
+        // whichever per-hunk diff happened to be last for that path. Failures
+        // are tracked by hunk index above, so a later failed hunk on the same
+        // path cannot erase an earlier successful hunk's metadata.
+        const diffByReportKey = new Map<
+          string,
+          {
+            filePath: string;
+            displayPath: string;
+            movePath?: string;
+            lastHunk: PatchHunk;
+            before: string;
+            after: string;
+            additions: number;
+            deletions: number;
+            hunkCount: number;
+          }
+        >();
+
+        for (const applied of appliedHunkResults) {
+          // Non-move operations with the same source path are one logical file
+          // replacement and should be collapsed. Move hunks keep source and
+          // destination in the key so a later add back at the source path is not
+          // folded into the move row.
+          const reportKey = applied.movePath
+            ? `${applied.filePath}\0${applied.displayPath}`
+            : applied.filePath;
+          const existing = diffByReportKey.get(reportKey);
+          if (!existing) {
+            diffByReportKey.set(reportKey, {
+              filePath: applied.filePath,
+              displayPath: applied.displayPath,
+              ...(applied.movePath ? { movePath: applied.movePath } : {}),
+              lastHunk: applied.hunk,
+              before: applied.before,
+              after: applied.after,
+              additions: applied.additions,
+              deletions: applied.deletions,
+              hunkCount: 1,
+            });
+            continue;
+          }
+
+          existing.displayPath = applied.displayPath;
+          existing.movePath = applied.movePath ?? existing.movePath;
+          existing.lastHunk = applied.hunk;
+          existing.after = applied.after;
+          existing.hunkCount += 1;
+          const netCounts = countDiffLines(existing.before, existing.after);
+          existing.additions = netCounts.additions;
+          existing.deletions = netCounts.deletions;
+        }
 
         // Build per-file metadata. OpenCode's apply_patch shape (see
         // packages/opencode/src/tool/apply_patch.ts:188) per file:
         //   { filePath, relativePath, type, patch, additions, deletions, movePath? }
         // `type` is normalised to "move" when an update hunk has a move target,
-        // so the UI can label the row correctly.
+        // and to "update" for multi-hunk same-path replacements with a net
+        // before→after diff.
         //
-        // additions/deletions come from perFileDiffs, which were populated
-        // from the Rust-side `similar`-crate diff (via include_diff:true on
-        // each write call). This matches edit/write tool counts exactly.
-        // The TS-side LCS via buildUnifiedDiff is still used to build the
-        // *display* `patch` text — the diff is correct visually; only the
-        // line-count derivation through countAddDel was producing wrong
-        // numbers (e.g. +399/-400 for a single-line removal). See
-        // perFileDiffs population above for how counts are derived per
-        // hunk type.
-        // Only successfully-applied hunks belong in the UI metadata. A failed
-        // hunk has no diff entry (its catch pushed to `failures`, not
-        // perFileDiffs), so including it would emit an empty-patch row the UI
-        // drops anyway AND list it under the "Success" title below. Scope to
-        // the hunks that actually landed. (Total failure throws earlier, so
-        // here we're at full or partial success.)
-        const failedPaths = new Set(failures);
-        const appliedHunks = hunks.filter((h) => !failedPaths.has(h.path));
-        const files = appliedHunks.map((h) => {
-          const filePath = resolvePathFromProjectRoot(projectRoot, h.path);
-          // `move_path` only exists on UpdateHunk variants — narrow first.
-          const rawMovePath = h.type === "update" ? h.move_path : undefined;
-          const movePath = rawMovePath
-            ? resolvePathFromProjectRoot(projectRoot, rawMovePath)
-            : undefined;
-          // For moved files, render the destination path as the visible
-          // location (matches OpenCode's apply_patch behaviour).
-          const displayPath = movePath ?? filePath;
-          const relPath = path.relative(projectRoot, displayPath);
+        // additions/deletions come from per-hunk Rust-side counts when there is
+        // only one successful hunk for a report row. Collapsed same-path rows
+        // use net before→after counts so metadata matches the displayed patch.
+        const files = Array.from(diffByReportKey.values()).map((entry) => {
+          const relPath = path.relative(projectRoot, entry.displayPath);
+          const patch = buildUnifiedDiff(entry.displayPath, entry.before, entry.after);
 
-          const diffEntry = diffByPath.get(filePath);
-          const patch = diffEntry
-            ? buildUnifiedDiff(displayPath, diffEntry.before, diffEntry.after)
-            : "";
-          const additions = diffEntry?.additions ?? 0;
-          const deletions = diffEntry?.deletions ?? 0;
-
-          // Normalise type for UI: an "update" hunk with a move target is a
-          // move, otherwise keep the parsed type as-is.
-          const uiType: "add" | "update" | "delete" | "move" =
-            h.type === "update" && rawMovePath ? "move" : h.type;
+          let uiType: "add" | "update" | "delete" | "move";
+          if (entry.movePath) {
+            uiType = "move";
+          } else if (entry.hunkCount === 1) {
+            uiType = entry.lastHunk.type;
+          } else if (entry.before.length === 0 && entry.after.length > 0) {
+            uiType = "add";
+          } else if (entry.before.length > 0 && entry.after.length === 0) {
+            uiType = "delete";
+          } else {
+            uiType = "update";
+          }
 
           return {
-            filePath,
+            filePath: entry.filePath,
             relativePath: relPath,
             type: uiType,
             patch,
-            additions,
-            deletions,
-            ...(movePath ? { movePath } : {}),
+            additions: entry.additions,
+            deletions: entry.deletions,
+            ...(entry.movePath ? { movePath: entry.movePath } : {}),
           };
         });
 
@@ -1584,7 +1626,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
           .join("\n");
         const title =
           failures.length > 0
-            ? `Partially applied (${files.length} of ${hunks.length}). Updated:\n${fileList}`
+            ? `Partially applied (${hunks.length - failures.length} of ${hunks.length}). Updated:\n${fileList}`
             : `Success. Updated the following files:\n${fileList}`;
 
         // Aggregate unified diff for the top-level metadata.diff field

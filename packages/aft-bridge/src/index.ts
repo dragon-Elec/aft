@@ -11,6 +11,13 @@
 export { setActiveLogger } from "./active-logger.js";
 // --- bash output hints (shared by both plugin hosts) ---
 export {
+  appendPipeStripNote,
+  formatForegroundResult,
+  formatSeconds,
+  isTerminalStatus,
+  sleep,
+} from "./bash-format.js";
+export {
   commandInvokesCodeSearch,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
@@ -27,7 +34,7 @@ export type {
 } from "./bridge.js";
 // --- transport ---
 export { BinaryBridge, compareSemver, tagStderrLine } from "./bridge.js";
-export { coerceStringArray } from "./coerce.js";
+export { coerceOptionalInt, coerceStringArray, isEmptyParam } from "./coerce.js";
 export { LONG_RUNNING_COMMAND_TIMEOUT_MS, timeoutForCommand } from "./command-timeouts.js";
 // --- binary resolution ---
 export {

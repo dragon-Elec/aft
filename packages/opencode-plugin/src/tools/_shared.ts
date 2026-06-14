@@ -59,73 +59,18 @@ const z = tool.schema;
 export const optionalInt = (min: number, max: number): any =>
   z.number().int().min(min).max(max).optional();
 
-/**
- * Runtime coercion for agent-friendly sentinel handling.
- *
- * Some agents emit null / "" / 0 when they mean "param not provided".
- * Use this inside tool handlers BEFORE relying on the value. Returns
- * `undefined` for all empty sentinels; rejects out-of-bounds with a
- * clear message.
- *
- * Tool handlers that want sentinel tolerance must pass args through
- * this AFTER Zod validation has accepted the value (or for fields
- * declared as `z.unknown().optional()` that bypass type validation).
- * With `optionalInt`'s bounded `z.number().int()` schema, Zod already
- * rejects the sentinels — call this for defense in depth or for fields
- * declared more permissively.
- */
-export function coerceOptionalInt(
-  v: unknown,
-  paramName: string,
-  min: number,
-  max: number,
-): number | undefined {
-  if (v === undefined || v === null || v === "") return undefined;
-  // 0 is an empty-param sentinel ONLY when 0 is out of bounds anyway. For
-  // 0-indexed params (edit's `occurrence`, min=0) it is the most common legal
-  // value — dropping it sent agents into an ambiguous_match loop that told
-  // them to pass the param they had just passed.
-  if (typeof v === "number" && (!Number.isFinite(v) || (v === 0 && min > 0))) return undefined;
-  const n = typeof v === "string" ? Number(v) : v;
-  if (typeof n !== "number" || !Number.isInteger(n)) {
-    throw new Error(`${paramName} must be an integer between ${min} and ${max}`);
-  }
-  if (n < min || n > max) {
-    throw new Error(`${paramName} must be between ${min} and ${max}`);
-  }
-  return n;
-}
-
-/**
- * True when a value represents "agent did not provide this param".
- *
- * GPT-family models send empty strings / empty arrays / null instead of
- * omitting optional params entirely. Use this BEFORE mutual-exclusion
- * checks so an empty `targets: []` or `url: ""` doesn't get counted as
- * present and trigger a misleading "X is mutually exclusive with Y" error.
- *
- * Treats undefined / null / "" / [] / {} as empty. Booleans and numbers
- * (including 0 and false) are NOT empty by themselves — only string and
- * collection sentinels qualify.
- */
-export function isEmptyParam(value: unknown): boolean {
-  if (value === undefined || value === null) return true;
-  if (typeof value === "string") return value.length === 0;
-  if (Array.isArray(value)) return value.length === 0;
-  if (typeof value === "object") return Object.keys(value as object).length === 0;
-  return false;
-}
-
 // Bridge transport budget for bash-family calls. Rust bash returns `running`
 // promptly and plugin-side polling handles task lifetime, so transport only
 // covers spawn/control RPC round-trips. Keep this centralized so every
 // bash-family RPC also keeps the shared bridge alive on transport timeout.
 export const BASH_TRANSPORT_TIMEOUT_MS = 30_000;
 
-// Re-exported from @cortexkit/aft-bridge — the table lives next to the
-// bridge's semantic-timeout clamp so the two can never drift apart.
+// Re-exported from @cortexkit/aft-bridge — shared runtime coercion,
+// formatting, and timeout tables live in the host-neutral bridge package.
 export {
+  coerceOptionalInt,
   formatBridgeErrorMessage,
+  isEmptyParam,
   LONG_RUNNING_COMMAND_TIMEOUT_MS,
   timeoutForCommand,
 } from "@cortexkit/aft-bridge";

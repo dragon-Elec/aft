@@ -1,11 +1,16 @@
 import * as fs from "node:fs/promises";
 import {
+  appendPipeStripNote,
   type BinaryBridge,
   type BridgeRequestOptions,
+  formatForegroundResult,
+  formatSeconds,
+  isTerminalStatus,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
   maybeStripCompressorPipe,
   resolveBashKillTimeout,
+  sleep,
 } from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
@@ -519,10 +524,6 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
   pi.registerTool<typeof BashTaskParams, BashKillDetails>(createBashKillTool(ctx));
 }
 
-function appendPipeStripNote(output: string, note: string | undefined): string {
-  return note ? `${output}\n\n${note}` : output;
-}
-
 function formatBackgroundLaunch(taskId: string, isPty: boolean): string {
   if (isPty) {
     // PTY tasks are inherently interactive — the agent MUST poll bash_status
@@ -545,11 +546,6 @@ function formatPromotionMessage(
   return `Foreground bash didn't finish within ${formatSeconds(waited)} and was promoted to background: ${taskId}. A completion reminder will be delivered automatically; use bash_status({ task_id: "${taskId}" }) to inspect output or bash_kill({ task_id: "${taskId}" }) to terminate.`;
 }
 
-/** Render a millisecond duration as a compact seconds string (8000 -> "8s", 5500 -> "5.5s"). */
-function formatSeconds(ms: number): string {
-  return `${Number((ms / 1000).toFixed(1))}s`;
-}
-
 /**
  * Append AFT bash-output hints (conflicts / grep) to a foreground bash result.
  * Pi knows the exact command, so the grep hint is matched against it directly
@@ -559,29 +555,6 @@ function formatSeconds(ms: number): string {
  */
 function withBashHints(output: string, command: string, aftSearchRegistered: boolean): string {
   return maybeAppendGrepSearchHint(maybeAppendConflictsHint(output), command, aftSearchRegistered);
-}
-
-function formatForegroundResult(data: Record<string, unknown>): string {
-  const output = (data.output_preview as string | undefined) ?? "";
-  const outputPath = data.output_path as string | undefined;
-  const truncated = data.output_truncated === true;
-  const status = data.status as string | undefined;
-  const exit = data.exit_code as number | undefined;
-  let rendered = output;
-  if (truncated && outputPath) {
-    rendered += `\n[output truncated; full output at ${outputPath}]`;
-  }
-  if (status === "timed_out") {
-    rendered += `\n[command timed out]`;
-  }
-  if (typeof exit === "number" && exit !== 0) {
-    rendered += `\n[exit code: ${exit}]`;
-  }
-  return rendered;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export function createBashStatusTool(ctx: PluginContext) {
@@ -1168,14 +1141,6 @@ function ptyCacheKey(extCtx: ExtensionContext, taskId: string): string {
 }
 function watchPtyCacheKey(extCtx: ExtensionContext, taskId: string): string {
   return `${ptyCacheKey(extCtx, taskId)}::watch`;
-}
-
-function isTerminalStatus(status: unknown): boolean {
-  // Explicit allowlist (parity with opencode-plugin) so an unexpected status
-  // string from Rust doesn't accidentally end the foreground polling loop.
-  return (
-    status === "completed" || status === "failed" || status === "killed" || status === "timed_out"
-  );
 }
 
 function renderBashCall(

@@ -1602,7 +1602,7 @@ fn collect_callers_recursive(
     truncated: &mut usize,
 ) -> Result<()> {
     if current_depth >= max_depth {
-        let omitted = direct_callers_for_tuple(conn, file, symbol)?.len();
+        let omitted = direct_caller_count_for_tuple(conn, file, symbol)?;
         if omitted > 0 {
             *depth_limited = true;
             *truncated += omitted;
@@ -1631,7 +1631,7 @@ fn collect_callers_recursive(
             )?;
         } else {
             let omitted =
-                direct_callers_for_tuple(conn, &site.caller.file, &site.caller.symbol)?.len();
+                direct_caller_count_for_tuple(conn, &site.caller.file, &site.caller.symbol)?;
             if omitted > 0 {
                 *depth_limited = true;
                 *truncated += omitted;
@@ -1639,6 +1639,24 @@ fn collect_callers_recursive(
         }
     }
     Ok(())
+}
+
+fn direct_caller_count_for_tuple(
+    conn: &Connection,
+    target_file: &str,
+    target_symbol: &str,
+) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM edges e
+         JOIN refs r ON r.ref_id = e.ref_id
+         JOIN nodes src ON src.id = e.source_node
+         JOIN files src_file ON src_file.path = src.file_path
+         WHERE e.kind = 'call' AND e.target_file = ?1 AND e.target_symbol = ?2",
+        params![target_file, target_symbol],
+        |row| row.get(0),
+    )?;
+    Ok(usize::try_from(count).unwrap_or(usize::MAX))
 }
 
 fn direct_callers_for_tuple(
@@ -1811,6 +1829,31 @@ fn forward_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<Sto
     Ok(calls)
 }
 
+fn forward_call_count_for_node(conn: &Connection, node: &StoreNode) -> Result<usize> {
+    let resolved_count: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM edges e
+         JOIN refs r ON r.ref_id = e.ref_id
+         WHERE e.kind = 'call' AND e.source_node = ?1",
+        params![&node.node_id],
+        |row| row.get(0),
+    )?;
+    let unresolved_count: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM refs
+         WHERE caller_node = ?1
+           AND kind = 'call'
+           AND status = 'unresolved'
+           AND NOT EXISTS (
+               SELECT 1 FROM edges e WHERE e.ref_id = refs.ref_id AND e.kind = 'call'
+           )",
+        params![&node.node_id],
+        |row| row.get(0),
+    )?;
+    let total = resolved_count.saturating_add(unresolved_count);
+    Ok(usize::try_from(total).unwrap_or(usize::MAX))
+}
+
 fn call_tree_inner(
     conn: &Connection,
     node: &StoreNode,
@@ -1833,12 +1876,12 @@ fn call_tree_inner(
     }
     visited.insert(visit_key.clone());
 
-    let calls = forward_calls_for_node(conn, node)?;
     let mut children = Vec::new();
     let mut depth_limited = false;
     let mut truncated = 0usize;
 
     if current_depth < max_depth {
+        let calls = forward_calls_for_node(conn, node)?;
         for call in calls {
             match call {
                 StoreForwardCall::Resolved(site) => {
@@ -1875,9 +1918,9 @@ fn call_tree_inner(
                 }
             }
         }
-    } else if !calls.is_empty() {
-        depth_limited = true;
-        truncated = calls.len();
+    } else {
+        truncated = forward_call_count_for_node(conn, node)?;
+        depth_limited = truncated > 0;
     }
 
     visited.remove(&visit_key);
@@ -6521,6 +6564,135 @@ mod cold_build_insert_tests {
     use crate::imports::ImportBlock;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn depth_boundary_counts_match_full_fetch_lengths_with_dangling_edges() {
+        let dir = tempdir().expect("temp dir");
+        let file = dir.path().join("main.ts");
+        fs::write(
+            &file,
+            r#"export function topA() {
+  root();
+}
+
+export function topB() {
+  root();
+}
+
+export function root() {
+  leaf();
+  missing();
+}
+
+export function leaf() {}
+"#,
+        )
+        .expect("write fixture");
+
+        let store = CallGraphStore::open(
+            dir.path().join(".store-depth-boundary-counts"),
+            dir.path().to_path_buf(),
+        )
+        .expect("open store");
+        store
+            .cold_build(std::slice::from_ref(&file))
+            .expect("cold build");
+
+        let root = store
+            .node_for(Path::new("main.ts"), "root")
+            .expect("root node");
+        let leaf = store
+            .node_for(Path::new("main.ts"), "leaf")
+            .expect("leaf node");
+
+        let (full_forward_len, full_direct_len) = {
+            let conn = store.conn.lock().expect("callgraph store mutex poisoned");
+            conn.execute(
+                "INSERT INTO edges (
+                    edge_id, ref_id, source_node, target_node, target_file,
+                    target_symbol, kind, line, provenance
+                 ) VALUES (
+                    'dangling-forward-boundary', 'missing-forward-ref', ?1, NULL,
+                    ?2, ?3, 'call', 98, ?4
+                 )",
+                rusqlite::params![
+                    &root.node_id,
+                    &leaf.file,
+                    &leaf.symbol,
+                    PROVENANCE_TREESITTER
+                ],
+            )
+            .expect("insert dangling forward edge");
+            conn.execute(
+                "INSERT INTO edges (
+                    edge_id, ref_id, source_node, target_node, target_file,
+                    target_symbol, kind, line, provenance
+                 ) VALUES (
+                    'dangling-direct-boundary', 'missing-direct-ref', 'missing-source-node',
+                    ?1, ?2, ?3, 'call', 99, ?4
+                 )",
+                rusqlite::params![
+                    &root.node_id,
+                    &root.file,
+                    &root.symbol,
+                    PROVENANCE_TREESITTER
+                ],
+            )
+            .expect("insert dangling direct-caller edge");
+
+            let full_forward_len = forward_calls_for_node(&conn, &root)
+                .expect("full forward calls")
+                .len();
+            let counted_forward_len =
+                forward_call_count_for_node(&conn, &root).expect("counted forward calls");
+            assert_eq!(
+                counted_forward_len, full_forward_len,
+                "forward boundary COUNT must mirror outgoing_calls_for_node + unresolved_calls_for_node"
+            );
+
+            let full_direct_len = direct_callers_for_tuple(&conn, &root.file, &root.symbol)
+                .expect("full direct callers")
+                .len();
+            let counted_direct_len = direct_caller_count_for_tuple(&conn, &root.file, &root.symbol)
+                .expect("counted direct callers");
+            assert_eq!(
+                counted_direct_len, full_direct_len,
+                "direct-caller boundary COUNT must mirror direct_callers_for_tuple"
+            );
+
+            (full_forward_len, full_direct_len)
+        };
+
+        assert_eq!(
+            full_forward_len, 2,
+            "fixture root should have one resolved and one unresolved outgoing call"
+        );
+        assert_eq!(
+            full_direct_len, 2,
+            "fixture root should have two real direct callers"
+        );
+
+        let tree = store
+            .call_tree(Path::new("main.ts"), "root", 0)
+            .expect("call tree");
+        assert!(tree.depth_limited);
+        assert_eq!(tree.children.len(), 0);
+        assert_eq!(
+            tree.truncated, full_forward_len,
+            "call_tree depth boundary must report the full forward-call list length"
+        );
+
+        let callers = store
+            .callers_of(Path::new("main.ts"), "leaf", 0)
+            .expect("callers");
+        assert!(callers.depth_limited);
+        assert_eq!(callers.callers.len(), 1);
+        assert_eq!(callers.callers[0].caller.symbol, "root");
+        assert_eq!(
+            callers.truncated, full_direct_len,
+            "callers depth boundary must report the full direct-caller list length"
+        );
+    }
 
     #[test]
     fn source_freshness_matches_cache_collect_for_same_bytes() {

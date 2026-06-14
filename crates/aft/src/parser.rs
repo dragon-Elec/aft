@@ -6504,12 +6504,21 @@ impl TreeSitterProvider {
     }
 
     fn read_parsed_file(&self, file: &Path) -> Result<(String, Tree, LangId), AftError> {
+        let current_mtime = std::fs::metadata(file)
+            .and_then(|m| m.modified())
+            .map_err(|e| AftError::FileNotFound {
+                path: format!("{}: {}", file.display(), e),
+            })?;
         let source = std::fs::read_to_string(file).map_err(|e| AftError::FileNotFound {
             path: format!("{}: {}", file.display(), e),
         })?;
+        let size = source.len() as u64;
+        let content_hash = content_hash_for_source(&source);
         let (tree, lang) = {
             let mut parser = self.parser.borrow_mut();
-            parser.parse_cloned(file)?
+            let (tree, lang) =
+                parser.parse_with_source(file, &source, current_mtime, size, content_hash)?;
+            (tree.clone(), lang)
         };
         Ok((source, tree, lang))
     }

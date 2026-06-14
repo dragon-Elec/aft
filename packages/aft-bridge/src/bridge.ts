@@ -70,6 +70,22 @@ export function tagStderrLine(line: string): string {
   return /^\[aft(-\w+)?\] /.test(line) ? line : `[aft] ${line}`;
 }
 
+const BENIGN_CPUINFO_PROC_CPUINFO_PARSE_FAILURE =
+  "failed to parse processor information from /proc/cpuinfo";
+
+/**
+ * Return false only for the known benign third-party cpuinfo line emitted by
+ * ONNX Runtime's bundled pytorch/cpuinfo library in restricted Linux sandboxes.
+ * This line is not an AFT failure; all other child stderr must still surface.
+ */
+export function shouldSurfaceStderrLine(line: string): boolean {
+  const normalized = line.trim();
+  return !(
+    normalized === `Error in cpuinfo: ${BENIGN_CPUINFO_PROC_CPUINFO_PARSE_FAILURE}` ||
+    normalized === BENIGN_CPUINFO_PROC_CPUINFO_PARSE_FAILURE
+  );
+}
+
 export function compareSemver(a: string, b: string): number {
   const [aMain, aPre] = a.split("-", 2);
   const [bMain, bPre] = b.split("-", 2);
@@ -1129,7 +1145,7 @@ export class BinaryBridge {
     while ((newlineIdx = this.stderrBuffer.indexOf("\n")) !== -1) {
       const line = this.stderrBuffer.slice(0, newlineIdx).replace(/\r$/, "");
       this.stderrBuffer = this.stderrBuffer.slice(newlineIdx + 1);
-      if (!line) continue;
+      if (!line || !shouldSurfaceStderrLine(line)) continue;
       const tagged = tagStderrLine(line);
       this.logVia(tagged);
       this.pushStderrLine(tagged);
@@ -1139,7 +1155,7 @@ export class BinaryBridge {
   private flushStderrBuffer(): void {
     const line = this.stderrBuffer.replace(/\r$/, "");
     this.stderrBuffer = "";
-    if (!line) return;
+    if (!line || !shouldSurfaceStderrLine(line)) return;
     const tagged = tagStderrLine(line);
     this.logVia(tagged);
     this.pushStderrLine(tagged);

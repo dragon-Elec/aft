@@ -1377,7 +1377,10 @@ fn drain_watcher_events(ctx: &AppContext) {
     } else if let Some(error) = watcher_failed {
         ctx.stop_watcher_runtime();
         let _ = ctx.add_degraded_reason("watcher_unavailable".to_string());
-        aft::slog_warn!("watcher unavailable: {}", error);
+        aft::slog_warn!(
+            "file watcher unavailable; continuing without live external-change invalidation: {}",
+            error
+        );
         watcher_status_changed = true;
         rescan_required = false;
     }
@@ -2740,6 +2743,7 @@ mod watcher_filter_tests {
         let tmp = TempDir::new().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
         let ctx = make_ctx_with_root(&root);
+        *ctx.callgraph().borrow_mut() = Some(aft::callgraph::CallGraph::new(root.clone()));
         let watcher_tx = install_watcher_rx(&ctx);
         watcher_tx
             .send(WatcherDispatchEvent::Error(
@@ -2753,6 +2757,16 @@ mod watcher_filter_tests {
         assert!(ctx
             .degraded_reasons()
             .contains(&"watcher_unavailable".to_string()));
+        let status = ctx.build_status_snapshot();
+        assert!(status["degraded"].as_bool().unwrap_or(false));
+        assert_eq!(
+            status["degraded_reasons"],
+            serde_json::json!(["watcher_unavailable"])
+        );
+        assert!(
+            ctx.callgraph().borrow().is_some(),
+            "callgraph remains usable"
+        );
     }
 
     #[test]

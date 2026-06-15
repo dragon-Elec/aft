@@ -747,6 +747,8 @@ const SOURCE_EXTENSIONS: &[&str] = &[
     "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "py", "pyi", "rs", "go",
 ];
 
+const WATCHER_BATCH_INLINE_CAP: usize = 256;
+
 /// A `tsconfig.json` / `jsconfig.json` (including variant names like
 /// `tsconfig.base.json`). A change to any of these can shift TypeScript build
 /// membership (which files `tsc` checks), so the status-bar membership cache
@@ -1389,13 +1391,16 @@ fn drain_watcher_events(ctx: &AppContext) {
     }
 
     let mut status_changed = watcher_status_changed;
+    let mut project_corpus_refresh_requested = false;
     if rescan_required {
         aft::slog_warn!("watcher overflow: forcing project rescan");
         ctx.rebuild_gitignore();
         status_changed |= refresh_project_after_watcher_rescan(ctx);
+        project_corpus_refresh_requested = true;
         changed.clear();
     } else if ignore_file_changed {
         status_changed |= refresh_corpus_after_ignore_change(ctx);
+        project_corpus_refresh_requested = true;
     }
 
     let scheduler_changed_path_count = if rescan_required {
@@ -1429,7 +1434,19 @@ fn drain_watcher_events(ctx: &AppContext) {
         status_changed = true;
     }
 
-    if ctx.search_index_rx().borrow().is_some() {
+    let oversized_inline_batch = changed.len() > WATCHER_BATCH_INLINE_CAP;
+    if oversized_inline_batch {
+        aft::slog_warn!(
+            "watcher batch of {} paths exceeds inline cap {}; scheduling corpus refresh",
+            changed.len(),
+            WATCHER_BATCH_INLINE_CAP
+        );
+        if !project_corpus_refresh_requested {
+            status_changed |= refresh_project_corpus(ctx, "oversized watcher batch", false);
+        }
+    }
+
+    if !oversized_inline_batch && ctx.search_index_rx().borrow().is_some() {
         ctx.add_pending_search_index_paths(changed.iter().cloned());
     }
     let semantic_source_paths = changed
@@ -1439,7 +1456,8 @@ fn drain_watcher_events(ctx: &AppContext) {
         .collect::<Vec<_>>();
     let semantic_build_in_progress = ctx.semantic_index_rx().borrow().is_some();
     let semantic_corpus_refresh_in_progress = semantic_corpus_refresh_in_progress(ctx);
-    if (semantic_build_in_progress || semantic_corpus_refresh_in_progress)
+    if !oversized_inline_batch
+        && (semantic_build_in_progress || semantic_corpus_refresh_in_progress)
         && !semantic_source_paths.is_empty()
     {
         ctx.add_pending_semantic_index_paths(semantic_source_paths.clone());
@@ -1461,41 +1479,41 @@ fn drain_watcher_events(ctx: &AppContext) {
         }
     }
     drop(graph_ref);
-    refresh_callgraph_store_for_watcher(ctx, &changed);
 
-    let mut index_ref = ctx.search_index().borrow_mut();
-    if let Some(index) = index_ref.as_mut() {
-        for path in &changed {
-            if path.exists() {
-                index.update_file(path);
-            } else {
-                index.remove_file(path);
-            }
-        }
-    }
-
-    let mut semantic_index_ref = ctx.semantic_index().borrow_mut();
     let mut semantic_refresh_paths = Vec::new();
-    if let Some(index) = semantic_index_ref.as_mut() {
-        let mut stale_paths = Vec::new();
-        for path in &semantic_source_paths {
-            index.invalidate_file(path);
-            stale_paths.push(path.clone());
-        }
-        if !stale_paths.is_empty() {
-            let mut status = ctx.semantic_index_status().borrow_mut();
-            if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
-                for path in &stale_paths {
-                    status.add_refreshing_file(path.clone());
+    if !oversized_inline_batch {
+        refresh_callgraph_store_for_watcher(ctx, &changed);
+
+        let mut index_ref = ctx.search_index().borrow_mut();
+        if let Some(index) = index_ref.as_mut() {
+            for path in &changed {
+                if path.exists() {
+                    index.update_file(path);
+                } else {
+                    index.remove_file(path);
                 }
-                semantic_refresh_paths = stale_paths;
-                status_changed = true;
+            }
+        }
+
+        let mut semantic_index_ref = ctx.semantic_index().borrow_mut();
+        if let Some(index) = semantic_index_ref.as_mut() {
+            let mut stale_paths = Vec::new();
+            for path in &semantic_source_paths {
+                index.invalidate_file(path);
+                stale_paths.push(path.clone());
+            }
+            if !stale_paths.is_empty() {
+                let mut status = ctx.semantic_index_status().borrow_mut();
+                if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
+                    for path in &stale_paths {
+                        status.add_refreshing_file(path.clone());
+                    }
+                    semantic_refresh_paths = stale_paths;
+                    status_changed = true;
+                }
             }
         }
     }
-
-    drop(semantic_index_ref);
-    drop(index_ref);
 
     // A vanished file's LSP diagnostics would otherwise linger in the warm set
     // forever (no server republishes for a path that no longer exists),
@@ -2082,11 +2100,12 @@ mod watcher_filter_tests {
         semantic_refresh_probe_is_scheduled_for_test,
         semantic_refresh_transient_failure_count_for_test, watcher_path_is_callgraph_indexed,
         write_push_frame_or_request_shutdown, BREAKER_TRIP_THRESHOLD, MAX_RETRY_ATTEMPTS,
+        WATCHER_BATCH_INLINE_CAP,
     };
     use aft::config::Config;
     use aft::context::{
-        AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent,
-        SemanticRefreshRequest, SemanticRefreshWorkerSlot,
+        AppContext, CallgraphStoreAccess, SemanticIndexEvent, SemanticIndexStatus,
+        SemanticRefreshEvent, SemanticRefreshRequest, SemanticRefreshWorkerSlot,
     };
     use aft::harness::Harness;
     use aft::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
@@ -2384,7 +2403,9 @@ mod watcher_filter_tests {
             "export function entry() { newLeaf(); }\nfunction oldLeaf() {}\nfunction newLeaf() {}\n",
         )
         .unwrap();
-        tx.send(watcher_paths_event(source)).unwrap();
+        let mut paths = vec![source];
+        paths.extend((1..WATCHER_BATCH_INLINE_CAP).map(|i| root.join(format!("note-{i}.txt"))));
+        tx.send(WatcherDispatchEvent::Paths(paths)).unwrap();
         drain_watcher_events(&ctx);
 
         let store_ref = ctx.callgraph_store().borrow();
@@ -2793,6 +2814,94 @@ mod watcher_filter_tests {
             "drain must not start a synchronous/inline callgraph build"
         );
         // The next callgraph op will see the force flag and background-build.
+    }
+
+    #[test]
+    fn watcher_large_batch_reschedules_indexes_instead_of_inline_refresh() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::write(
+            root.join("main.ts"),
+            "export function entry() { oldLeaf(); }\nfunction oldLeaf() {}\n",
+        )
+        .unwrap();
+
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(tmp.path().join("storage")),
+                callgraph_store: true,
+                search_index: true,
+                semantic_search: true,
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.clone());
+        ctx.rebuild_gitignore();
+
+        let resident = ctx
+            .ensure_callgraph_store()
+            .expect("ensure callgraph store")
+            .expect("callgraph store should build on demand");
+        drop(resident);
+        assert!(ctx.callgraph_store().borrow().is_some());
+
+        let mut search_index = aft::search_index::SearchIndex::new();
+        search_index.ready = true;
+        *ctx.search_index().borrow_mut() = Some(search_index);
+
+        *ctx.semantic_index().borrow_mut() = Some(SemanticIndex::new(root.clone(), 3));
+        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+        let (request_rx, _event_tx) = install_semantic_refresh_channels(&ctx);
+
+        let watcher_tx = install_watcher_rx(&ctx);
+        let paths = (0..=WATCHER_BATCH_INLINE_CAP)
+            .map(|i| root.join(format!("changed-{i}.ts")))
+            .collect::<Vec<_>>();
+        watcher_tx.send(WatcherDispatchEvent::Paths(paths)).unwrap();
+
+        drain_watcher_events(&ctx);
+
+        assert!(
+            ctx.callgraph_store().borrow().is_none(),
+            "oversized watcher batch must drop the resident store instead of refreshing inline"
+        );
+        assert!(
+            ctx.callgraph_store_rx().borrow().is_none(),
+            "drain must not start a callgraph cold build on the dispatch thread"
+        );
+        assert!(
+            matches!(
+                ctx.callgraph_store_for_ops(),
+                CallgraphStoreAccess::Building
+            ),
+            "next callgraph op should start the forced background rebuild and return Building"
+        );
+        assert!(
+            ctx.search_index_rx().borrow().is_some(),
+            "oversized watcher batch should spawn a background search corpus refresh"
+        );
+        assert!(
+            !ctx.search_index()
+                .borrow()
+                .as_ref()
+                .expect("resident search index")
+                .ready,
+            "resident search index should be marked not-ready while the corpus refresh runs"
+        );
+        match request_rx
+            .recv_timeout(RECV_DISPATCH_TIMEOUT)
+            .expect("semantic corpus refresh request")
+        {
+            SemanticRefreshRequest::Corpus => {}
+            SemanticRefreshRequest::Files { paths } => {
+                panic!("expected semantic corpus refresh for oversized batch, got {paths:?}")
+            }
+        }
+        assert!(request_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
     }
 
     #[test]

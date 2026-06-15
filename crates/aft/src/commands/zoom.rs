@@ -248,7 +248,7 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         return Response::error(
             &req.id,
             "invalid_request",
-            "zoom: missing required param 'symbol' (or use 'start_line' and 'end_line')",
+            "zoom: missing required param 'symbol'",
         );
     }
 

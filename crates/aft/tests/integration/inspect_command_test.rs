@@ -115,7 +115,13 @@ fn drain_callgraph_store_for_test(ctx: &AppContext) {
 }
 
 fn ensure_callgraph_store_ready(ctx: &AppContext) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Generous hang-catch deadline: this only guards against a wedged cold
+    // build, it is NOT a correctness assertion (those come after readiness).
+    // The callgraph cold build is a heavy tree-sitter parse that can take far
+    // longer than the happy-path <1s on a loaded Windows CI runner during a
+    // release with parallel jobs — 10s flaked there. 90s matches the
+    // callgraph_test.rs precedent.
+    let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         match ctx.callgraph_store_for_ops() {
             CallgraphStoreAccess::Ready(_) => return,
@@ -165,7 +171,10 @@ fn tier2_run(ctx: &AppContext, categories: &[&str]) {
 }
 
 fn wait_for_tier2(ctx: &AppContext, categories: &[&str]) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Hang-catch deadline only (real assertions are the response checks below);
+    // 10s flaked on loaded Windows CI release runners where the Tier-2 scan
+    // sits behind the callgraph cold build. 90s matches the cold-build guard.
+    let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         ctx.inspect_manager().drain_completions();
         let response = inspect(

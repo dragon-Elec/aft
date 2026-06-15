@@ -532,7 +532,23 @@ async function triggerWakeIfPending(
         const promptContext = await resolvePromptContext(client, drainContext.sessionID);
         const body: Record<string, unknown> = {
           noReply: false,
-          parts: [{ type: "text", text: reminder }],
+          // `synthetic: true` (NOT `ignored`): this is an AGENT-DIRECTED wake —
+          // the model should resume and act on the finished background task.
+          // synthetic keeps it model-visible (OpenCode's toModelMessagesEffect
+          // serializes parts on `!ignored && text!==""`, and createUserMessage →
+          // loop still wakes the idle run) while:
+          //  1. dropping it out of the TUI user-message render (it's a steer,
+          //     not a real user turn), and
+          //  2. exempting it from OpenCode's prompt.ts mid-turn `<system-reminder>`
+          //     wrapper, whose `id > lastFinished.id` condition flips wrapped→
+          //     unwrapped as lastFinished advances — re-serializing the same
+          //     mid-tail message differently across passes and busting the
+          //     prefix cache once per injection (anomalyco/opencode#129). A
+          //     synthetic part is skipped by that wrapper, so it stays
+          //     byte-stable and never busts the cache.
+          // NEVER pair synthetic with `ignored` — `ignored` strips it from the
+          // model call entirely, so the wake would not reach the agent.
+          parts: [{ type: "text", text: reminder, synthetic: true }],
         };
         if (promptContext?.agent) body.agent = promptContext.agent;
         if (promptContext?.model) {

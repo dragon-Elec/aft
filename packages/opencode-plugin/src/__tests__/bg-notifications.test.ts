@@ -440,11 +440,19 @@ describe("OpenCode background notifications", () => {
 
     expect(promptAsync).toHaveBeenCalledTimes(1);
     const payload = promptAsync.mock.calls[0][0] as {
-      body: { noReply: boolean; parts: Array<{ text: string }> };
+      body: {
+        noReply: boolean;
+        parts: Array<{ text: string; synthetic?: boolean; ignored?: boolean }>;
+      };
     };
     expect(payload.body.noReply).toBe(false);
     expect(payload.body.parts[0].text).toContain("- task task-1 (exit 0)");
     expect(payload.body.parts[0].text).not.toContain(": npm test");
+    // #129: the agent-directed wake part MUST be synthetic (model-visible,
+    // not a user turn, byte-stable across OpenCode's mid-turn wrapper flip)
+    // and MUST NOT be `ignored` (which would strip it from the model call).
+    expect(payload.body.parts[0].synthetic).toBe(true);
+    expect(payload.body.parts[0].ignored).toBeUndefined();
     // Live-server factory was called with the URL + directory we provided.
     expect(getLastLiveServerArgs()).toEqual({
       serverUrl: TEST_SERVER_URL,

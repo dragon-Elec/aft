@@ -21,7 +21,7 @@ use super::oxc_engine::{
     FileFacts, FileId, ImportFact, OxcEngineResult, OxcFactsCache, ReExportFact,
     FACTS_FORMAT_VERSION, OXC_PROVENANCE,
 };
-use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
+use crate::cache_freshness::{self, FileFreshness};
 use crate::callgraph_store::{project_dead_code_snapshot, CallGraphStore, CallGraphStoreError};
 
 const DEFAULT_SOFT_DEADLINE: Duration = Duration::from_secs(1);
@@ -558,34 +558,38 @@ impl InspectManager {
         cache: &InspectCache,
     ) -> Result<bool, String> {
         let cached_records = load_contribution_freshness(cache, category)?;
-        let project_scope = JobScope::for_project(snapshot.project_root.clone());
-        let project_files = scope_files(&snapshot.project_root, &project_scope);
-        let current_by_relative = current_project_files(&snapshot.project_root, &project_files);
         let cached_relative = cached_records
             .iter()
             .map(freshness_record_relative_key)
             .collect::<BTreeSet<_>>();
 
         for record in &cached_records {
-            let relative = freshness_record_relative_key(record);
-            if !current_by_relative.contains_key(&relative) {
-                return Ok(false);
-            }
-
             let absolute = if record.file_path.is_absolute() {
                 record.file_path.clone()
             } else {
                 snapshot.project_root.join(&record.file_path)
             };
-            match verify_contribution_file_strict(&absolute, &record.freshness) {
+            match verify_contribution_file(&absolute, &record.freshness) {
                 ContributionFreshness::Fresh { .. } => {}
                 ContributionFreshness::Stale | ContributionFreshness::Deleted => return Ok(false),
             }
         }
 
-        Ok(current_by_relative
-            .keys()
-            .all(|relative| cached_relative.contains(relative)))
+        // Detect files added since the cached aggregate was generated (and files
+        // that still exist but are no longer in the gitignore-aware project
+        // scope). This walk remains on the read path because the current API does
+        // not provide a watcher-maintained project file set, and additions cannot
+        // be detected from cached contribution records alone. Existing cached
+        // files are checked above first so ordinary edits/deletes can return stale
+        // without walking the project.
+        let project_scope = JobScope::for_project(snapshot.project_root.clone());
+        let project_files = scope_files(&snapshot.project_root, &project_scope);
+        let current_by_relative = current_project_files(&snapshot.project_root, &project_files);
+
+        Ok(current_by_relative.len() == cached_relative.len()
+            && current_by_relative
+                .keys()
+                .all(|relative| cached_relative.contains(relative)))
     }
 
     #[doc(hidden)]
@@ -1402,28 +1406,6 @@ fn callgraph_store_dir_from_inspect_dir(inspect_dir: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 fn canonicalize_for_snapshot(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
-}
-
-fn verify_contribution_file_strict(path: &Path, cached: &FileFreshness) -> ContributionFreshness {
-    match cache_freshness::verify_file_strict(path, cached) {
-        FreshnessVerdict::HotFresh => ContributionFreshness::Fresh {
-            metadata_changed: false,
-            freshness: *cached,
-        },
-        FreshnessVerdict::ContentFresh {
-            new_mtime,
-            new_size,
-        } => ContributionFreshness::Fresh {
-            metadata_changed: true,
-            freshness: FileFreshness {
-                mtime: new_mtime,
-                size: new_size,
-                content_hash: cached.content_hash,
-            },
-        },
-        FreshnessVerdict::Stale => ContributionFreshness::Stale,
-        FreshnessVerdict::Deleted => ContributionFreshness::Deleted,
-    }
 }
 
 fn load_contribution_freshness(
@@ -2536,6 +2518,210 @@ mod guard_tests {
         );
         // Count is recomputed to the in-scope items (only x.rs under src/a).
         assert_eq!(filtered.get("count").and_then(|v| v.as_u64()), Some(1));
+    }
+    #[cfg(debug_assertions)]
+    #[test]
+    fn tier2_read_cached_freshness_does_not_hash_unchanged_contributions() {
+        let (_dir, manager, snapshot, scope, _files) = duplicate_cache_fixture();
+
+        crate::cache_freshness::reset_hash_file_if_small_count_for_debug();
+        crate::cache_freshness::reset_verify_file_strict_count_for_debug();
+        assert_fresh(manager.tier2_read_cached(snapshot, InspectCategory::Duplicates, scope));
+
+        assert_eq!(
+            crate::cache_freshness::verify_file_strict_count_for_debug(),
+            0,
+            "dispatch-thread inspect freshness must not use strict verification"
+        );
+        assert_eq!(
+            crate::cache_freshness::hash_file_if_small_count_for_debug(),
+            0,
+            "unchanged contribution files must stay on the stat-only fast path"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn tier2_read_cached_freshness_returns_byte_identical_cold_scan_aggregate() {
+        let (_dir, manager, snapshot, scope, _files) = duplicate_uncached_fixture();
+        let cold_payload = fresh_payload(manager.tier2_run_with_reuse(
+            snapshot.clone(),
+            InspectCategory::Duplicates,
+            scope.clone(),
+            None,
+        ));
+
+        crate::cache_freshness::reset_hash_file_if_small_count_for_debug();
+        crate::cache_freshness::reset_verify_file_strict_count_for_debug();
+        let warm_payload =
+            fresh_payload(manager.tier2_read_cached(snapshot, InspectCategory::Duplicates, scope));
+
+        let cold_bytes = serde_json::to_vec(&cold_payload).expect("serialize cold aggregate");
+        let warm_bytes = serde_json::to_vec(&warm_payload).expect("serialize warm aggregate");
+        assert_eq!(
+            warm_bytes, cold_bytes,
+            "warm unchanged read must return the byte-identical aggregate as the cold scan"
+        );
+        assert_eq!(
+            crate::cache_freshness::verify_file_strict_count_for_debug(),
+            0,
+            "dispatch-thread warm read must not use strict verification"
+        );
+        assert_eq!(
+            crate::cache_freshness::hash_file_if_small_count_for_debug(),
+            0,
+            "warm unchanged read must not content-hash cached contribution files"
+        );
+    }
+
+    #[test]
+    fn tier2_read_cached_freshness_detects_changed_added_and_deleted_files() {
+        let (_dir, manager, snapshot, scope, _files) = duplicate_cache_fixture();
+        write_fixture_file(
+            &snapshot.project_root,
+            "src/foo.ts",
+            "export const foo = 101;\nexport const changed = true;\n",
+            3_000_000_001,
+        );
+        assert_stale(manager.tier2_read_cached(snapshot, InspectCategory::Duplicates, scope));
+
+        let (_dir, manager, snapshot, scope, _files) = duplicate_cache_fixture();
+        write_fixture_file(
+            &snapshot.project_root,
+            "src/added.ts",
+            "export const added = 3;\n",
+            3_000_000_002,
+        );
+        assert_stale(manager.tier2_read_cached(snapshot, InspectCategory::Duplicates, scope));
+
+        let (_dir, manager, snapshot, scope, files) = duplicate_cache_fixture();
+        std::fs::remove_file(&files[0]).expect("delete cached contribution file");
+        assert_stale(manager.tier2_read_cached(snapshot, InspectCategory::Duplicates, scope));
+    }
+
+    fn duplicate_cache_fixture() -> (
+        tempfile::TempDir,
+        InspectManager,
+        InspectSnapshot,
+        JobScope,
+        Vec<PathBuf>,
+    ) {
+        let (dir, manager, snapshot, scope, files) = duplicate_uncached_fixture();
+        store_duplicate_cache(&manager, &snapshot, &files);
+        (dir, manager, snapshot, scope, files)
+    }
+
+    fn duplicate_uncached_fixture() -> (
+        tempfile::TempDir,
+        InspectManager,
+        InspectSnapshot,
+        JobScope,
+        Vec<PathBuf>,
+    ) {
+        use crate::config::Config;
+        use crate::parser::SymbolCache;
+        use std::sync::RwLock;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical fixture root");
+        let files = vec![
+            write_fixture_file(
+                &root,
+                "src/foo.ts",
+                "export const fixture = () => 1;
+export const shared = 1;
+",
+                3_000_000_000,
+            ),
+            write_fixture_file(
+                &root,
+                "src/bar.ts",
+                "export const fixture = () => 1;
+export const shared = 1;
+",
+                3_000_000_000,
+            ),
+        ];
+        let inspect_dir = root.join(".aft-cache").join("inspect");
+        let snapshot = InspectSnapshot::new(
+            root.clone(),
+            inspect_dir,
+            Arc::new(Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            }),
+            Arc::new(RwLock::new(SymbolCache::new())),
+        );
+        let scope = JobScope::for_project(root);
+        let manager = InspectManager::new();
+        (dir, manager, snapshot, scope, files)
+    }
+
+    fn write_fixture_file(root: &Path, relative: &str, content: &str, mtime_secs: i64) -> PathBuf {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create fixture parent");
+        }
+        std::fs::write(&path, content).expect("write fixture file");
+        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(mtime_secs, 0))
+            .expect("set fixture mtime");
+        path
+    }
+
+    fn store_duplicate_cache(
+        manager: &InspectManager,
+        snapshot: &InspectSnapshot,
+        files: &[PathBuf],
+    ) {
+        let cache = manager
+            .cache_for_snapshot(snapshot)
+            .expect("open inspect cache");
+        let contributions = files
+            .iter()
+            .map(|file| {
+                let freshness = crate::cache_freshness::collect(file).expect("collect freshness");
+                FileContribution::new(
+                    InspectCategory::Duplicates,
+                    file.clone(),
+                    freshness,
+                    serde_json::json!({
+                        "file": relative_cache_key(&snapshot.project_root, file),
+                        "fragments": [],
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        cache
+            .store_tier2_result(
+                JobKey::for_project_category(InspectCategory::Duplicates),
+                files,
+                &contributions,
+                serde_json::json!({
+                    "count": 0,
+                    "groups": [],
+                    "scanned_files": files.len(),
+                    "total_groups": 0,
+                }),
+            )
+            .expect("store tier2 cache fixture");
+    }
+
+    fn assert_fresh(outcome: JobOutcome) {
+        let _ = fresh_payload(outcome);
+    }
+
+    fn fresh_payload(outcome: JobOutcome) -> Value {
+        match outcome {
+            JobOutcome::Fresh { payload } => payload,
+            other => panic!("expected fresh cached Tier-2 outcome, got {other:?}"),
+        }
+    }
+
+    fn assert_stale(outcome: JobOutcome) {
+        match outcome {
+            JobOutcome::Stale { .. } => {}
+            other => panic!("expected stale cached Tier-2 outcome, got {other:?}"),
+        }
     }
 }
 

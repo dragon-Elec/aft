@@ -497,7 +497,7 @@ impl CallGraphStore {
                 drop(store);
                 let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
                 let (store, _stats) =
-                    Self::cold_build_with_lease(callgraph_dir, project_root, &files, 100)?;
+                    Self::cold_build_with_lease(callgraph_dir, project_root, &files)?;
                 Ok(store)
             }
             OpenRootRepair::None | OpenRootRepair::ReRooted => Ok(store),
@@ -551,7 +551,7 @@ impl CallGraphStore {
                 drop(store);
                 let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
                 let (store, _stats) =
-                    Self::cold_build_with_lease(callgraph_dir, project_root, &files, 100)?;
+                    Self::cold_build_with_lease(callgraph_dir, project_root, &files)?;
                 Ok(Some(store))
             }
             OpenRootRepair::None | OpenRootRepair::ReRooted => Ok(Some(store)),
@@ -559,6 +559,14 @@ impl CallGraphStore {
     }
 
     pub fn cold_build_with_lease(
+        callgraph_dir: PathBuf,
+        project_root: PathBuf,
+        files: &[PathBuf],
+    ) -> Result<(Self, ColdBuildStats)> {
+        Self::cold_build_with_lease_chunked(callgraph_dir, project_root, files, 0)
+    }
+
+    pub fn cold_build_with_lease_chunked(
         callgraph_dir: PathBuf,
         project_root: PathBuf,
         files: &[PathBuf],
@@ -575,6 +583,14 @@ impl CallGraphStore {
     }
 
     pub fn ensure_built_with_lease(
+        callgraph_dir: PathBuf,
+        project_root: PathBuf,
+        files: &[PathBuf],
+    ) -> Result<(Self, Option<ColdBuildStats>)> {
+        Self::ensure_built_with_lease_chunked(callgraph_dir, project_root, files, 0)
+    }
+
+    pub fn ensure_built_with_lease_chunked(
         callgraph_dir: PathBuf,
         project_root: PathBuf,
         files: &[PathBuf],
@@ -664,7 +680,7 @@ impl CallGraphStore {
                 false,
             )?
             .store;
-            let stats = temp_store.cold_build(files, chunk_size)?;
+            let stats = temp_store.cold_build_chunked(files, chunk_size)?;
             temp_store.prepare_for_atomic_swap()?;
             stats
         };
@@ -777,7 +793,11 @@ impl CallGraphStore {
         }
     }
 
-    pub fn cold_build(&self, files: &[PathBuf], chunk_size: usize) -> Result<ColdBuildStats> {
+    pub fn cold_build(&self, files: &[PathBuf]) -> Result<ColdBuildStats> {
+        self.cold_build_chunked(files, 0)
+    }
+
+    pub fn cold_build_chunked(&self, files: &[PathBuf], chunk_size: usize) -> Result<ColdBuildStats> {
         let started = Instant::now();
         let bench = std::env::var("AFT_BENCH_COLD").is_ok();
         macro_rules! phase {
@@ -1156,7 +1176,7 @@ impl CallGraphStore {
     }
 
     pub fn refresh_corpus(&self, current_files: &[PathBuf]) -> Result<ColdBuildStats> {
-        self.cold_build(current_files, 0)
+        self.cold_build(current_files)
     }
 
     pub fn mark_files_stale(&self, files: &[PathBuf]) -> Result<Vec<String>> {
@@ -6747,7 +6767,7 @@ export function leaf() {}
         )
         .expect("open store");
         store
-            .cold_build(std::slice::from_ref(&file), 0)
+            .cold_build(std::slice::from_ref(&file))
             .expect("cold build");
 
         let root = store
@@ -6901,7 +6921,7 @@ export function leaf() {}
             project_root.to_path_buf(),
         )
         .expect("open incremental store");
-        store.cold_build(&files, 0).expect("initial cold build");
+        store.cold_build(&files).expect("initial cold build");
 
         {
             let mut conn = store.conn.lock().expect("callgraph store mutex poisoned");
@@ -6956,7 +6976,7 @@ export function leaf() {}
         )
         .expect("open cold rebuild store");
         cold_store
-            .cold_build(&files, 0)
+            .cold_build(&files)
             .expect("comparison cold build");
 
         for table in [

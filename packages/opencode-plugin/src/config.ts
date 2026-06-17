@@ -457,7 +457,8 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (config.search_index !== undefined) overrides.search_index = config.search_index;
   if (config.semantic_search !== undefined) overrides.semantic_search = config.semantic_search;
   if (config.callgraph_store !== undefined) overrides.callgraph_store = config.callgraph_store;
-  if (config.callgraph_chunk_size !== undefined) overrides.callgraph_chunk_size = config.callgraph_chunk_size;
+  if (config.callgraph_chunk_size !== undefined)
+    overrides.callgraph_chunk_size = config.callgraph_chunk_size;
 
   // Bash / LSP / semantic / max_callgraph_files — all flow through dedicated
   // resolvers because they have their own merge / project-safety rules.
